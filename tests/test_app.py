@@ -117,6 +117,23 @@ class IntegrationTests(unittest.TestCase):
         self.cookie = member_cookie
         self.request('state', status=401)
 
+    def test_short_and_long_passwords_and_reusing_current_password(self):
+        admin_cookie = self.cookie
+        account = {'name': '口令测试', 'email': 'password@example.test', 'password': '甲'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': '甲', 'password': '甲'})
+        self.assertFalse(self.request('auth/status')['user']['must_change'])
+        self.request('account/password', 'POST', {'current_password': '错', 'password': '甲'}, 400)
+        self.request('account/password', 'POST', {'current_password': '甲', 'password': ''}, 400)
+        self.cookie = admin_cookie
+        long_password = '乙' * 300
+        self.request('reset-password/' + member, 'POST', {'password': long_password})
+        self.request('auth/login', 'POST', {**account, 'password': long_password})
+        self.request('account/password', 'POST', {'current_password': long_password, 'password': long_password})
+        self.assertEqual(self.request('auth/status')['user']['id'], member)
+        self.request('state')
+
     def test_zip_restore_validates_and_restores_attachments_and_revokes_sessions(self):
         fid = self.upload('test.txt', b'backup contents')['ids'][0]
         archive = self.request('backup', raw=True)

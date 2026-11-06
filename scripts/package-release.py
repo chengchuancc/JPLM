@@ -3,7 +3,7 @@
 import argparse, tarfile
 from pathlib import Path
 root=Path(__file__).resolve().parent.parent
-parser=argparse.ArgumentParser();parser.add_argument('--output',default=str(root.parent/'releases'/'jiecheng-plm-1.5.1.tar.gz'));args=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('--output',default=str(root.parent/'releases'/'jiecheng-plm-1.5.2.tar.gz'));args=parser.parse_args()
 if not (root/'dist/index.html').is_file():raise SystemExit('请先执行 npm run build')
 out=Path(args.output).resolve();out.parent.mkdir(parents=True,exist_ok=True)
 with tarfile.open(out,'w:gz') as archive:

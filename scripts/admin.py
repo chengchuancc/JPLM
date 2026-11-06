@@ -23,7 +23,7 @@ if args.command == 'cleanup-files':
     raise SystemExit(0)
 if not args.email:
     parser.error('重置密码需要 --email')
-password = getpass.getpass('临时密码（至少 10 个字符）：')
+password = getpass.getpass('临时密码：')
 if password != getpass.getpass('再次输入：'):
     raise SystemExit('两次密码不一致')
 try:

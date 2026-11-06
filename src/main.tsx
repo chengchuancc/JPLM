@@ -515,7 +515,7 @@ function Login({
               type: "password",
               required: true,
               wide: true,
-              placeholder: initialized ? "输入密码" : "至少 10 个字符",
+              placeholder: "输入密码",
             },
           ]}
           submit={async (d) => {
@@ -596,7 +596,6 @@ function PasswordForm({ onSaved }: { onSaved: () => Promise<void> }) {
           name: "password",
           label: "新密码",
           type: "password",
-          placeholder: "至少 10 个字符",
           required: true,
           wide: true,
         },
@@ -810,7 +809,6 @@ function UserAdmin({
                       name: "password",
                       label: "临时密码",
                       type: "password",
-                      placeholder: "至少 10 个字符",
                       required: true,
                       wide: true,
                     },

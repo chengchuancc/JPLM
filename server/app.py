@@ -294,13 +294,13 @@ def account_name(value):
     return name
 
 def password_record(value):
-    if not isinstance(value, str) or not 10 <= len(value) <= 256:
-        raise Problem('密码长度应为 10 至 256 个字符')
+    if not isinstance(value, str) or not value:
+        raise Problem('请输入密码')
     salt = secrets.token_hex(16)
     return json.dumps({'salt': salt, 'hash': password_hash(value, salt)})
 
 def check_password(value, stored):
-    if not isinstance(value, str) or len(value) > 256:
+    if not isinstance(value, str) or not value:
         return False
     stored = json.loads(stored)
     return hmac.compare_digest(stored['hash'], password_hash(value, stored['salt']))
@@ -809,8 +809,6 @@ class Handler(BaseHTTPRequestHandler):
                 password = data.get('password')
                 if not check_password(current, user['password']):
                     raise Problem('当前密码不正确')
-                if password == current:
-                    raise Problem('新密码需与当前密码不同')
                 db.execute('UPDATE users SET password=?,must_change=0 WHERE id=?',
                            (password_record(password), actor['id']))
                 db.execute('DELETE FROM sessions WHERE user_id=? AND token<>?',
