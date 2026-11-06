@@ -10,6 +10,7 @@ export type Product = {
   updated_at: string;
 };
 export type Part = {
+  deleted_at: string | null;
   custodian_id: string | null;
   external_code: string;
   brand: string;
@@ -134,6 +135,7 @@ export type State = {
   material_code_aliases: CodeAlias[];
   products: Product[];
   parts: Part[];
+  deleted_parts: Part[];
   suppliers: Supplier[];
   bom_versions: Version[];
   bom_lines: BomLine[];
@@ -149,6 +151,7 @@ export const emptyState: State = {
   material_code_aliases: [],
   products: [],
   parts: [],
+  deleted_parts: [],
   suppliers: [],
   bom_versions: [],
   bom_lines: [],

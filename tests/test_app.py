@@ -163,9 +163,9 @@ class IntegrationTests(unittest.TestCase):
         self.request('bom-versions', 'POST', {'product_id': product, 'copy_from': versions[product]})
         line = self.request('bom-lines', 'POST', {'version_id': versions[other], 'part_id': part, 'qty': 2})['id']
         self.request('movements', 'POST', {'type': '入库', 'part_id': part, 'qty': 3})
-        self.request('products/' + product, 'DELETE', {}, 409)
+        self.request('products/' + product, 'DELETE', {'password': 'test-password-1234'}, 409)
         self.assertEqual(len(self.state()['bom_lines']), 3)
-        self.request('products/' + product, 'DELETE', {'delete_bom': True})
+        self.request('products/' + product, 'DELETE', {'delete_bom': True, 'password': 'test-password-1234'})
         state = self.state()
         self.assertEqual([p['id'] for p in state['products']], [other])
         self.assertEqual([v['id'] for v in state['bom_versions']], [versions[other]])
@@ -173,11 +173,31 @@ class IntegrationTests(unittest.TestCase):
         material = next(p for p in state['parts'] if p['id'] == part)
         self.assertEqual((material['code'], material['stock'], material['numbering_product_id']), (code, 3, None))
 
+    def test_product_deletion_requires_the_signed_in_administrators_password(self):
+        product = self.product()
+        self.request('products/' + product, 'DELETE', {}, 400)
+        self.request('products/' + product, 'DELETE', {'password': 'wrong'}, 403)
+        admin_cookie = self.cookie
+        member = {'name': '成员', 'email': 'member@example.test', 'password': 'member-pass'}
+        self.request('users', 'POST', member)
+        self.request('auth/login', 'POST', member)
+        self.request('account/password', 'POST', {'current_password': member['password'], 'password': member['password']})
+        self.request('products/' + product, 'DELETE', {'password': 'test-password-1234'}, 403)
+        self.assertEqual([p['id'] for p in self.state()['products']], [product])
+        own_logins = self.request('activity?kind=login')['items']
+        self.assertEqual([(row['actor_name'], row['action']) for row in own_logins], [('成员', '登录')])
+        self.assertFalse(any(row['action'] == '登录' for row in self.request('activity')['items']))
+        self.request('auth/logout', 'POST', {})
+        self.cookie = admin_cookie
+        self.assertEqual([row['action'] for row in self.request('activity?kind=login')['items']],
+                         ['退出登录', '登录', '登录'])
+        self.request('products/' + product, 'DELETE', {'password': 'test-password-1234'})
+
     def test_product_with_stock_history_must_be_archived(self):
         product = self.product()
         self.move('入库', 2)
         movement = self.move('出库', 1, product_id=product)['id']
-        self.request('products/' + product, 'DELETE', {'delete_bom': True}, 409)
+        self.request('products/' + product, 'DELETE', {'delete_bom': True, 'password': 'test-password-1234'}, 409)
         self.assertEqual(self.state()['products'][0]['id'], product)
         self.assertEqual(self.state()['movements'][-1]['id'], movement)
 
@@ -324,9 +344,23 @@ class IntegrationTests(unittest.TestCase):
         self.request('auth/login','POST',{'email':'admin@localhost','password':'wrong'},401)
         self.request('auth/login','POST',{'email':'admin@localhost','password':'test-password-1234'})
         self.request('state')
-    def test_existing_records_cannot_be_deleted(self):
-        self.move('入库',1);self.request('parts/'+self.part,'DELETE',{},400)
-        self.assertEqual(self.stock(),1)
+    def test_material_with_stock_and_references_can_be_deleted_and_restored(self):
+        self.product()
+        version = self.state()['bom_versions'][0]['id']
+        self.request('bom-lines', 'POST', {'part_id': self.part, 'version_id': version, 'qty': 2})
+        self.request('purchases', 'POST', {'supplier_id': self.supplier(), 'date': '2026-11-06',
+                     'lines': [{'part_id': self.part, 'qty': 2, 'price': 1}]})
+        self.move('入库', 1)
+        self.request('parts/' + self.part, 'DELETE', {})
+        state = self.state()
+        self.assertEqual(state['parts'], [])
+        self.assertEqual(state['deleted_parts'][0]['stock'], 1)
+        for table in ('movements', 'bom_lines', 'purchase_lines'):
+            self.assertEqual(state[table][0]['part_id'], self.part)
+        self.request('movements', 'POST', {'type': '出库', 'part_id': self.part, 'qty': 1}, 409)
+        self.request('deleted-parts/' + self.part, 'PUT', {})
+        self.assertEqual(self.state()['deleted_parts'], [])
+        self.assertEqual(self.stock(), 1)
     def test_demo_is_explicit_and_only_empty_db(self):
         self.request('demo','POST',{},400)
         with app.transaction() as db:db.execute('DELETE FROM parts')
@@ -360,7 +394,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertTrue(all(p['sub_product_id'] is None for p in materials.values()))
                     self.assertEqual(materials['screw']['stock'],5)
                     self.assertEqual(db.execute("SELECT qty FROM bom_lines WHERE id='legacy-line'").fetchone()[0],4)
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],7)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],8)
                     self.assertTrue(all(len(p['code'])==8 and p['code'][:2].isalpha() and p['code'][2:].isdigit() for p in materials.values()))
                     self.assertEqual(db.execute("SELECT part_id FROM material_code_aliases WHERE code='screw'").fetchone()[0],'screw')
             finally: app.DATA=previous
@@ -429,7 +463,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.state()['material_links']),1)
         self.assertEqual(len(self.state()['parts']),4)
         self.request('parts/'+parent,'DELETE',{})
-        self.assertEqual(len(self.state()['material_links']),0)
+        self.assertEqual(len(self.state()['material_links']),1)
         self.assertTrue(any(p['id']==b for p in self.state()['parts']))
     def test_optional_fields_survive_creation_inside_bom(self):
         parent=self.request('parts','POST',{'name':'电路板'})['id']

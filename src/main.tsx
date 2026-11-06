@@ -467,12 +467,18 @@ function EntityForm({
     </form>
   );
 }
+function BrandWordmark() {
+  return (
+    <span className="brand-wordmark">
+      <img src={appBase + "brand-wordmark.png"} alt="MakaGiC" />
+    </span>
+  );
+}
+
 function LoginBrand() {
   return (
     <div className="login-brand">
-      <span className="brand-wordmark">
-        <img src={appBase + "brand-wordmark.png"} alt="MakaGiC" />
-      </span>
+      <BrandWordmark />
       <strong>捷程未来PLM</strong>
     </div>
   );
@@ -834,7 +840,13 @@ function UserAdmin({
   );
 }
 
-function ActivityPanel({ part }: { part?: string }) {
+function ActivityPanel({
+  part,
+  kind = "operation",
+}: {
+  part?: string;
+  kind?: "operation" | "login";
+}) {
   const [items, setItems] = useState<Activity[]>([]);
   const [more, setMore] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -845,7 +857,11 @@ function ActivityPanel({ part }: { part?: string }) {
     try {
       const result = await api(
         "activity?" +
-          new URLSearchParams({ before: String(before), part: part || "" }),
+          new URLSearchParams({
+            before: String(before),
+            part: part || "",
+            kind,
+          }),
       );
       setItems((previous) =>
         before ? [...previous, ...result.items] : result.items,
@@ -859,11 +875,11 @@ function ActivityPanel({ part }: { part?: string }) {
   }
   useEffect(() => {
     void loadActivity();
-  }, [part]);
+  }, [part, kind]);
   return (
     <>
       <div className="section-toolbar">
-        <h3>操作日志</h3>
+        <h3>{kind === "login" ? "登录记录" : "操作记录"}</h3>
         <Button small disabled={busy} onClick={() => loadActivity()}>
           <RefreshCw size={14} />
           刷新
@@ -879,10 +895,14 @@ function ActivityPanel({ part }: { part?: string }) {
           <thead>
             <tr>
               <th>时间</th>
-              <th>操作人</th>
+              <th>用户</th>
               <th>操作</th>
-              <th>记录</th>
-              <th>详情</th>
+              {kind !== "login" && (
+                <>
+                  <th>记录</th>
+                  <th>详情</th>
+                </>
+              )}
             </tr>
           </thead>
           <tbody>
@@ -891,13 +911,19 @@ function ActivityPanel({ part }: { part?: string }) {
                 <td className="nowrap">{datetime(item.created_at)}</td>
                 <td>{item.actor_name}</td>
                 <td>{item.action}</td>
-                <td>{item.subject}</td>
-                <td>{item.detail || "—"}</td>
+                {kind !== "login" && (
+                  <>
+                    <td>{item.subject}</td>
+                    <td>{item.detail || "—"}</td>
+                  </>
+                )}
               </tr>
             ))}
           </tbody>
         </table>
-        {!busy && !items.length && <Empty title="暂无操作日志" />}
+        {!busy && !items.length && (
+          <Empty title={kind === "login" ? "暂无登录记录" : "暂无操作记录"} />
+        )}
       </div>
       {more && (
         <Button
@@ -1139,7 +1165,9 @@ function App() {
     setModal(null);
     notify(message);
   }
-  const findPart = (id: string) => state.parts.find((x) => x.id === id);
+  const findPart = (id: string) =>
+    state.parts.find((x) => x.id === id) ||
+    state.deleted_parts.find((x) => x.id === id);
   const findProduct = (id: string | null) =>
     state.products.find((x) => x.id === id);
   const findSupplier = (id: string) => state.suppliers.find((x) => x.id === id);
@@ -1176,7 +1204,7 @@ function App() {
   const product = state.products.find((p) => p.id === detail);
   const productHasMovements =
     !!product && state.movements.some((row) => row.product_id === product.id);
-  const part = state.parts.find((p) => p.id === detail);
+  const part = findPart(detail);
   const purchase = state.purchases.find((p) => p.id === detail);
   const supplier = findSupplier(detail);
   const suppliedMaterials = supplier
@@ -1310,6 +1338,7 @@ function App() {
     setModal({ kind: "part", item: p });
   }
   function materialEditButton(p: Part) {
+    if (p.deleted_at) return null;
     return (
       <button
         title="编辑物料"
@@ -1336,6 +1365,7 @@ function App() {
     label: string,
     options?: Field["options"],
   ) {
+    if (p.deleted_at) return p[field] || "—";
     return (
       <InlineCell
         label={p.name + " " + label}
@@ -1361,9 +1391,10 @@ function App() {
           onClick={() => openMaterial(p.id)}
         >
           {p.name}
+          {p.deleted_at && "（已删除）"}
         </button>
       ),
-      parents: p.material_level === 2 ? parentsCell(p) : null,
+      parents: p.material_level === 2 && !p.deleted_at ? parentsCell(p) : null,
       spec: materialCell(p, "spec", "规格型号"),
       external_code: materialCell(p, "external_code", "外部料号"),
       brand: materialCell(p, "brand", "品牌"),
@@ -1773,10 +1804,10 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobile ? "mobile-open" : ""}`}>
         <a className="brand" href="#products" onClick={() => go("products")}>
-          <BrandMark />
-          <div>
-            <strong>捷程未来PLM</strong>
-          </div>
+          <span className="sidebar-brand-logo">
+            <BrandWordmark />
+          </span>
+          <strong>捷程未来PLM</strong>
         </a>
         <nav>
           {navs.map((n) => (
@@ -2264,7 +2295,9 @@ function App() {
                         id: line.id,
                         cells: {
                           ...baseMaterialCells(material),
-                          qty: (
+                          qty: material.deleted_at ? (
+                            line.qty
+                          ) : (
                             <InlineCell
                               label={material.name + " 用量"}
                               value={line.qty}
@@ -2274,7 +2307,9 @@ function App() {
                             />
                           ),
                           subtotal: money(material.price * line.qty),
-                          reference: (
+                          reference: material.deleted_at ? (
+                            line.reference
+                          ) : (
                             <InlineCell
                               label={material.name + " 位号"}
                               value={line.reference}
@@ -2283,7 +2318,9 @@ function App() {
                               }
                             />
                           ),
-                          notes: (
+                          notes: material.deleted_at ? (
+                            line.notes
+                          ) : (
                             <InlineCell
                               label={material.name + " 备注"}
                               value={line.notes}
@@ -2340,7 +2377,9 @@ function App() {
               <div className="danger-footer">
                 <Button
                   small
-                  disabled={productHasMovements}
+                  disabled={
+                    productHasMovements || currentUser?.role !== "admin"
+                  }
                   onClick={() =>
                     setModal({ kind: "delete-product", item: product })
                   }
@@ -2348,10 +2387,14 @@ function App() {
                   <Trash2 size={14} />
                   删除产品
                 </Button>
-                {productHasMovements && (
+                {productHasMovements ? (
                   <span>
                     此产品有关联的库存流水，可在编辑产品中设为已归档。
                   </span>
+                ) : (
+                  currentUser?.role !== "admin" && (
+                    <span>只有管理员可以删除产品。</span>
+                  )
                 )}
               </div>
             </>
@@ -2366,10 +2409,20 @@ function App() {
                   </h1>
                 </div>
                 {view === "parts" ? (
-                  <Button primary onClick={() => setModal({ kind: "part" })}>
-                    <Plus size={17} />
-                    新建物料
-                  </Button>
+                  <div className="toolbar-controls">
+                    {!!state.deleted_parts.length && (
+                      <Button
+                        onClick={() => setModal({ kind: "deleted-parts" })}
+                      >
+                        <Archive size={15} />
+                        已删除物料
+                      </Button>
+                    )}
+                    <Button primary onClick={() => setModal({ kind: "part" })}>
+                      <Plus size={17} />
+                      新建物料
+                    </Button>
+                  </div>
                 ) : (
                   <div className="toolbar-controls">
                     <Button onClick={() => startInventory("出库")}>
@@ -2551,7 +2604,39 @@ function App() {
               />
             </>
           )}
-          {view === "parts" && detail && part && (
+          {view === "parts" && detail && part?.deleted_at && (
+            <>
+              <div className="detail-heading">
+                <button
+                  className="back-btn"
+                  aria-label="返回物料库"
+                  onClick={() => go("parts")}
+                >
+                  <ArrowLeft size={18} />
+                </button>
+                <div className="detail-title">
+                  <h1>
+                    {part.name} <Badge>已删除</Badge>
+                  </h1>
+                  <p>
+                    {part.code} · 库存 {amount(part.stock)} {part.unit}
+                  </p>
+                </div>
+                <Button
+                  onClick={() =>
+                    mutate("deleted-parts/" + part.id, "PUT", {}, "物料已恢复")
+                  }
+                >
+                  恢复物料
+                </Button>
+              </div>
+              <ActivityPanel key={part.id} part={part.id} />
+              {movementTable(
+                state.movements.filter((row) => row.part_id === part.id),
+              )}
+            </>
+          )}
+          {view === "parts" && detail && part && !part.deleted_at && (
             <>
               <div className="detail-heading">
                 <button className="back-btn" onClick={() => go("parts")}>
@@ -2630,7 +2715,7 @@ function App() {
                   ["boms", "关联 BOM"],
                   ["purchases", "采购记录"],
                   ["history", "库存流水"],
-                  ["activity", "操作日志"],
+                  ["activity", "操作记录"],
                 ].map(([id, name]) => (
                   <button
                     key={id}
@@ -2709,7 +2794,9 @@ function App() {
                         id: link.id,
                         cells: {
                           ...baseMaterialCells(child),
-                          qty: (
+                          qty: child.deleted_at ? (
+                            link.qty
+                          ) : (
                             <InlineCell
                               label={child.name + " 关联用量"}
                               value={link.qty}
@@ -2719,14 +2806,18 @@ function App() {
                             />
                           ),
                           price: money(child.price),
-                          reference: (
+                          reference: child.deleted_at ? (
+                            link.reference
+                          ) : (
                             <InlineCell
                               label={child.name + " 关联位号"}
                               value={link.reference}
                               save={(value) => saveLink("reference", value)}
                             />
                           ),
-                          notes: (
+                          notes: child.deleted_at ? (
+                            link.notes
+                          ) : (
                             <InlineCell
                               label={child.name + " 关联备注"}
                               value={link.notes}
@@ -3033,7 +3124,7 @@ function App() {
                   删除物料
                 </Button>
                 <span>
-                  有 BOM、采购或库存记录的物料会保留，避免破坏历史数据。
+                  删除后可在「已删除物料」恢复。库存和历史记录会保留。
                 </span>
               </div>
             </>
@@ -3366,23 +3457,24 @@ function App() {
                                     {money(l.price * l.qty)}
                                   </td>
                                   <td>
-                                    {l.received < l.qty && (
-                                      <Button
-                                        small
-                                        onClick={() =>
-                                          startInventory("入库", part, {
-                                            purchase_line_id: l.id,
-                                            qty: Math.max(
-                                              0,
-                                              l.qty - l.received,
-                                            ),
-                                          })
-                                        }
-                                      >
-                                        办理入库
-                                        <ChevronRight size={13} />
-                                      </Button>
-                                    )}
+                                    {l.received < l.qty &&
+                                      !part?.deleted_at && (
+                                        <Button
+                                          small
+                                          onClick={() =>
+                                            startInventory("入库", part, {
+                                              purchase_line_id: l.id,
+                                              qty: Math.max(
+                                                0,
+                                                l.qty - l.received,
+                                              ),
+                                            })
+                                          }
+                                        >
+                                          办理入库
+                                          <ChevronRight size={13} />
+                                        </Button>
+                                      )}
                                   </td>
                                 </tr>
                               );
@@ -3499,7 +3591,9 @@ function App() {
                               {amount(Math.max(0, l.qty - l.received))}
                             </td>
                             <td>
-                              {l.received < l.qty ? (
+                              {p?.deleted_at ? (
+                                <span className="muted">物料已删除</span>
+                              ) : l.received < l.qty ? (
                                 <Button
                                   small
                                   onClick={() =>
@@ -3630,7 +3724,8 @@ function App() {
               <div className="tabs page-tabs">
                 {[
                   ["profile", "个人资料"],
-                  ["activity", "操作日志"],
+                  ["activity", "操作记录"],
+                  ["login-activity", "登录记录"],
                   ...(currentUser?.role === "admin"
                     ? [
                         ["users", "用户管理"],
@@ -3659,6 +3754,9 @@ function App() {
                 />
               )}
               {accountView === "activity" && <ActivityPanel />}
+              {accountView === "login-activity" && (
+                <ActivityPanel key="login" kind="login" />
+              )}
               {currentUser?.role === "admin" && accountView === "users" && (
                 <UserAdmin
                   actorId={currentUser.id}
@@ -4194,47 +4292,140 @@ function App() {
               </div>
             </Dialog>
           )}
-          {modal.kind.startsWith("delete-") && (
-            <Dialog title="确认删除" onClose={() => setModal(null)}>
+          {modal.kind === "deleted-parts" && (
+            <Dialog title="已删除物料" onClose={() => setModal(null)}>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>料号</th>
+                      <th>名称</th>
+                      <th>库存</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {state.deleted_parts.map((material) => (
+                      <tr key={material.id}>
+                        <td className="mono">{material.code}</td>
+                        <td>
+                          <button
+                            className="text-link"
+                            onClick={() => {
+                              setModal(null);
+                              openMaterial(material.id);
+                            }}
+                          >
+                            {material.name}
+                          </button>
+                        </td>
+                        <td>
+                          {amount(material.stock)} {material.unit}
+                        </td>
+                        <td>
+                          <Button
+                            small
+                            onClick={() =>
+                              setModal({ kind: "restore-part", item: material })
+                            }
+                          >
+                            恢复
+                          </Button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </Dialog>
+          )}
+          {modal.kind === "restore-part" && (
+            <Dialog title="恢复物料" onClose={() => setModal(null)}>
               <p className="confirm-copy">
-                {modal.kind === "delete-product"
-                  ? `确定删除「${modal.item.name}」？该产品的所有 BOM 版本、图片和附件将一并删除。物料库记录和料号会保留。`
-                  : modal.kind === "delete-line"
-                    ? "将从当前 BOM 版本移除此物料，其他版本不会受影响。"
-                    : modal.kind === "delete-quote"
-                      ? "将解除此物料与供应商的关联。"
-                      : modal.kind === "delete-file"
-                        ? "将删除该图片或附件。"
-                        : "确定删除「" +
-                          modal.item.name +
-                          "」？已有业务关联的记录将无法删除。"}
+                恢复「{modal.item.name}」到物料库。
               </p>
               <AsyncAction
+                label="确认恢复"
                 onCancel={() => setModal(null)}
+                action={() =>
+                  mutate(
+                    "deleted-parts/" + modal.item.id,
+                    "PUT",
+                    {},
+                    "物料已恢复",
+                  )
+                }
+              />
+            </Dialog>
+          )}
+          {modal.kind === "delete-product" && (
+            <Dialog title="删除产品" onClose={() => setModal(null)}>
+              <p className="confirm-copy">
+                确定删除「{modal.item.name}」？该产品的
+                BOM、图片和附件将一并删除。物料库记录和料号会保留。
+              </p>
+              <EntityForm
+                fields={[
+                  {
+                    name: "password",
+                    label: "当前管理员密码",
+                    type: "password",
+                    required: true,
+                    wide: true,
+                  },
+                ]}
                 label="确认删除"
-                action={async () => {
-                  const map: any = {
-                    "delete-line": "bom-lines",
-                    "delete-part": "parts",
-                    "delete-supplier": "suppliers",
-                    "delete-product": "products",
-                    "delete-file": "files",
-                    "delete-quote": "quotes",
-                  };
+                onCancel={() => setModal(null)}
+                submit={async ({ password }) => {
                   await mutate(
-                    map[modal.kind] + "/" + modal.item.id,
+                    "products/" + modal.item.id,
                     "DELETE",
-                    modal.kind === "delete-product"
-                      ? { delete_bom: true }
-                      : undefined,
+                    { delete_bom: true, password },
                     "已删除",
                   );
-                  if (modal.kind === "delete-part") go("parts");
-                  if (modal.kind === "delete-product") go("products");
+                  go("products");
                 }}
               />
             </Dialog>
           )}
+          {modal.kind.startsWith("delete-") &&
+            modal.kind !== "delete-product" && (
+              <Dialog title="确认删除" onClose={() => setModal(null)}>
+                <p className="confirm-copy">
+                  {modal.kind === "delete-part"
+                    ? `删除「${modal.item.name}」？物料将从常用列表移除，可在「已删除物料」恢复。库存和原有记录会保留。`
+                    : modal.kind === "delete-line"
+                      ? "将从当前 BOM 版本移除此物料，其他版本不会受影响。"
+                      : modal.kind === "delete-quote"
+                        ? "将解除此物料与供应商的关联。"
+                        : modal.kind === "delete-file"
+                          ? "将删除该图片或附件。"
+                          : "确定删除「" +
+                            modal.item.name +
+                            "」？已有业务关联的记录将无法删除。"}
+                </p>
+                <AsyncAction
+                  onCancel={() => setModal(null)}
+                  label="确认删除"
+                  action={async () => {
+                    const map: any = {
+                      "delete-line": "bom-lines",
+                      "delete-part": "parts",
+                      "delete-supplier": "suppliers",
+                      "delete-file": "files",
+                      "delete-quote": "quotes",
+                    };
+                    await mutate(
+                      map[modal.kind] + "/" + modal.item.id,
+                      "DELETE",
+                      undefined,
+                      "已删除",
+                    );
+                    if (modal.kind === "delete-part") go("parts");
+                  }}
+                />
+              </Dialog>
+            )}
           {modal.kind === "demo" && (
             <Dialog title="载入示例工作空间" onClose={() => setModal(null)}>
               <p className="confirm-copy">

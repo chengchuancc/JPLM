@@ -93,7 +93,7 @@ def init_db(directory=None, bootstrap=None):
         columns={r[1] for r in db.execute('PRAGMA table_info(parts)')}
         product_columns={r[1] for r in db.execute('PRAGMA table_info(products)')}
         version=db.execute('PRAGMA user_version').fetchone()[0]
-        if version>7: raise RuntimeError('数据库版本高于当前程序版本')
+        if version>8: raise RuntimeError('数据库版本高于当前程序版本')
         if version<5 and (db.execute('SELECT 1 FROM parts LIMIT 1').fetchone() or db.execute('SELECT 1 FROM products LIMIT 1').fetchone()):
             backup_path=directory/'plm.before-v5.sqlite3'
             if not backup_path.exists():
@@ -111,7 +111,12 @@ def init_db(directory=None, bootstrap=None):
         if version == 6 and not (directory / 'plm.before-v7.sqlite3').exists():
             with sqlite3.connect(directory / 'plm.before-v7.sqlite3', factory=ClosingConnection) as target:
                 db.backup(target)
+        if version == 7 and not (directory / 'plm.before-v8.sqlite3').exists():
+            with sqlite3.connect(directory / 'plm.before-v8.sqlite3', factory=ClosingConnection) as target:
+                db.backup(target)
         db.execute('BEGIN IMMEDIATE')
+        if 'deleted_at' not in columns:
+            db.execute('ALTER TABLE parts ADD COLUMN deleted_at TEXT')
         if 'material_level' not in columns:
             db.execute('ALTER TABLE parts ADD COLUMN material_level INTEGER NOT NULL DEFAULT 1 CHECK(material_level IN (1,2))')
             db.execute("UPDATE parts SET material_level=CASE WHEN category='电子物料' AND sub_product_id IS NULL THEN 2 ELSE 1 END")
@@ -170,7 +175,7 @@ def init_db(directory=None, bootstrap=None):
                 create_account(db, identity, 'admin', legacy_password=legacy[0] if legacy and not bootstrap else None,
                                must_change=bool(bootstrap))
             db.execute("DELETE FROM settings WHERE key='password'")
-        db.execute('PRAGMA user_version=7')
+        db.execute('PRAGMA user_version=8')
 
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
@@ -200,6 +205,12 @@ def exists(db, table, id):
     r = db.execute(f'SELECT * FROM {table} WHERE id=?', (id,)).fetchone()
     if not r: raise Problem('关联记录不存在', 404)
     return dict(r)
+
+def active_part(db, id):
+    part = exists(db, 'parts', id)
+    if part['deleted_at']:
+        raise Problem('物料已删除，请先恢复物料', 409)
+    return part
 
 def image_mime(header):
     if header.startswith(b'\x89PNG\r\n\x1a\n'):
@@ -328,7 +339,7 @@ def log_activity(db, actor, action, subject_id, subject, detail=''):
 def record_movement(db, data, actor=None):
     kind = data.get('type')
     if kind not in ('入库','出库','退库','报废'): raise Problem('无效的库存操作')
-    part = exists(db, 'parts', data.get('part_id'))
+    part = active_part(db, data.get('part_id'))
     qty = num(data.get('qty'), True)
     purchase_line = data.get('purchase_line_id') or None
     original_id = data.get('original_id') or None
@@ -408,7 +419,7 @@ def material_code(db,category,level,product_id,serial):
     return f'{material_prefix(category,level,product_prefix(db,product_id))}{serial:04d}'
 
 def link_material(db,parent_id,child_id,qty=1):
-    parent=exists(db,'parts',parent_id);child=exists(db,'parts',child_id)
+    parent=active_part(db,parent_id);child=active_part(db,child_id)
     if parent['material_level']!=1 or child['material_level']!=2: raise Problem('只能将一级物料关联到二级物料')
     quantity=num(qty,True);id=uid()
     db.execute('INSERT INTO material_links(id,parent_id,child_id,qty,created_at) VALUES(?,?,?,?,?) ON CONFLICT(parent_id,child_id) DO UPDATE SET qty=excluded.qty',(id,parent_id,child_id,quantity,now()))
@@ -416,7 +427,7 @@ def link_material(db,parent_id,child_id,qty=1):
     return db.execute('SELECT id FROM material_links WHERE parent_id=? AND child_id=?',(parent_id,child_id)).fetchone()[0]
 
 def set_material_parents(db,child_id,parent_ids):
-    child=exists(db,'parts',child_id)
+    child=active_part(db,child_id)
     if child['material_level']!=2: raise Problem('关联一级物料仅适用于二级物料')
     if not isinstance(parent_ids,list) or len(parent_ids)>1000 or any(not isinstance(p,str) for p in parent_ids): raise Problem('关联记录格式错误')
     selected=list(dict.fromkeys(parent_ids))
@@ -424,20 +435,20 @@ def set_material_parents(db,child_id,parent_ids):
         if exists(db,'parts',parent_id)['material_level']!=1: raise Problem('请选择一级物料')
     existing={r['parent_id']:dict(r) for r in db.execute('SELECT * FROM material_links WHERE child_id=?',(child_id,))}
     for parent_id,link in existing.items():
-        if parent_id not in selected: db.execute('DELETE FROM material_links WHERE id=?',(link['id'],))
+        if parent_id not in selected and not exists(db, 'parts', parent_id)['deleted_at']: db.execute('DELETE FROM material_links WHERE id=?',(link['id'],))
     for parent_id in selected:
         if parent_id not in existing: link_material(db,parent_id,child_id)
     db.execute('UPDATE parts SET updated_at=? WHERE id=?',(now(),child_id))
 
 def set_material_children(db,parent_id,child_ids):
-    if exists(db,'parts',parent_id)['material_level']!=1: raise Problem('二级物料列表仅适用于一级物料')
+    if active_part(db,parent_id)['material_level']!=1: raise Problem('二级物料列表仅适用于一级物料')
     if not isinstance(child_ids,list) or len(child_ids)>1000 or any(not isinstance(c,str) for c in child_ids): raise Problem('关联记录格式错误')
     selected=list(dict.fromkeys(child_ids))
     for child_id in selected:
         if exists(db,'parts',child_id)['material_level']!=2: raise Problem('请选择二级物料')
     existing={r['child_id']:dict(r) for r in db.execute('SELECT * FROM material_links WHERE parent_id=?',(parent_id,))}
     for child_id,link in existing.items():
-        if child_id not in selected: db.execute('DELETE FROM material_links WHERE id=?',(link['id'],))
+        if child_id not in selected and not exists(db, 'parts', child_id)['deleted_at']: db.execute('DELETE FROM material_links WHERE id=?',(link['id'],))
     for child_id in selected:
         if child_id not in existing: link_material(db,parent_id,child_id)
     db.execute('UPDATE parts SET updated_at=? WHERE id=?',(now(),parent_id))
@@ -465,6 +476,8 @@ def get_state(db):
         if record:
             file['original_name'] = file['name']
             file['name'] = owner_file_name(file['name'], record['code'], record['name'], positions[owner])
+    state['deleted_parts'] = [p for p in state['parts'] if p['deleted_at']]
+    state['parts'] = [p for p in state['parts'] if not p['deleted_at']]
     state['users'] = [dict(row) for row in db.execute('SELECT id,name FROM users ORDER BY name,id')]
     return state
 
@@ -508,14 +521,14 @@ def stage_restore(archive_path, directory):
             source.row_factory = sqlite3.Row
             source.execute('PRAGMA trusted_schema=OFF')
             version = source.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (6, 7):
-                raise Problem('请使用数据库版本 6 或 7 的 JPLM 备份')
+            if version not in (6, 7, 8):
+                raise Problem('请使用数据库版本 6 至 8 的 JPLM 备份')
             if source.execute('PRAGMA quick_check(1)').fetchone()[0] != 'ok':
                 raise Problem('备份数据库已损坏')
             source_tables = {row['name'] for row in source.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'")}
             required_tables = set(TABLES) | {'settings', 'import_runs'}
-            if version == 7:
+            if version >= 7:
                 required_tables |= {'users', 'activity'}
             if not required_tables <= source_tables:
                 raise Problem('备份缺少业务数据表')
@@ -528,13 +541,15 @@ def stage_restore(archive_path, directory):
                     target_columns = [row['name'] for row in db.execute(f'PRAGMA table_info({table})')]
                     source_columns = {row['name'] for row in source.execute(f'PRAGMA table_info({table})')}
                     optional = {RESPONSIBILITIES.get(table)} if version == 6 else set()
+                    if table == 'parts' and version < 8:
+                        optional.add('deleted_at')
                     if not set(target_columns) - optional <= source_columns:
                         raise Problem('备份数据结构不完整')
                     columns = ','.join(name for name in target_columns if name in source_columns)
                     records = source.execute(f'SELECT {columns} FROM {table} ORDER BY rowid')
                     db.executemany(f'INSERT INTO {table}({columns}) VALUES({",".join("?" for _ in columns.split(","))})', records)
                 db.execute("DELETE FROM settings WHERE key='password'")
-                if version == 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
+                if version >= 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                     raise Problem('备份中没有管理员账户')
                 file_ids = {r['id'] for r in db.execute('SELECT id FROM files')}
                 if any(not UPLOAD_ID.fullmatch(id) or 'uploads/' + id not in names for id in file_ids):
@@ -600,6 +615,21 @@ class Handler(BaseHTTPRequestHandler):
         if self.user['role'] != 'admin':
             raise Problem('需要管理员权限', 403)
 
+    def require_admin_password(self, db, password):
+        self.require_admin()
+        if not isinstance(password, str) or not password:
+            raise Problem('请输入当前管理员密码')
+        key = ('delete-product', self.user['id'])
+        current_time = time.time()
+        recent = [stamp for stamp in self.attempts.get(key, []) if stamp > current_time - 600]
+        if len(recent) >= 12:
+            raise Problem('尝试次数过多，请十分钟后重试', 429)
+        stored = db.execute('SELECT password FROM users WHERE id=?', (self.user['id'],)).fetchone()
+        if not stored or not check_password(password, stored['password']):
+            self.attempts[key] = recent + [current_time]
+            raise Problem('管理员密码不正确', 403)
+        self.attempts.pop(key, None)
+
     def cookie(self, token, age=604800):
         secure = '; Secure' if os.environ.get('PLM_SECURE_COOKIE') == '1' else ''
         return f'{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path={BASE_PATH or "/" }; Max-Age={age}{secure}'
@@ -637,7 +667,9 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem('请先修改初始密码', 403)
             if path == '/api/auth/logout' and method == 'POST':
                 with FILE_LOCK, transaction() as db:
-                    db.execute('DELETE FROM sessions WHERE token=?', (self.session_token(),))
+                    result = db.execute('DELETE FROM sessions WHERE token=?', (self.session_token(),))
+                    if result.rowcount:
+                        log_activity(db, self.user, '退出登录', self.user['id'], self.user['name'])
                 return self.send({'ok': True}, extra={'Set-Cookie': self.cookie('', 0)})
             if path == '/api/users' and method == 'GET':
                 self.require_admin()
@@ -726,6 +758,8 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('DELETE FROM sessions WHERE expires<?', (time.time(),))
             db.execute('INSERT INTO sessions(token,expires,user_id) VALUES(?,?,?)',
                        (hashlib.sha256(token.encode()).hexdigest(), time.time() + 604800, id))
+            actor = db.execute('SELECT id,name FROM users WHERE id=?', (id,)).fetchone()
+            log_activity(db, actor, '登录', id, actor['name'])
         self.attempts.pop(ip, None)
         self.send({'ok': True}, extra={'Set-Cookie': self.cookie(token)})
 
@@ -761,10 +795,14 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(urlparse(self.path).query)
         before = int(query.get('before', ['0'])[0])
         subject = query.get('part', [''])[0]
+        logins = query.get('kind', [''])[0] == 'login'
         with connect() as db:
             rows = db.execute(
                 """SELECT * FROM activity WHERE (?=0 OR id<?) AND (?='' OR subject_id=?)
-                   ORDER BY id DESC LIMIT 101""", (before, before, subject, subject)
+                   AND (action IN ('登录','退出登录')) = ?
+                   AND (?=0 OR actor_id=?) ORDER BY id DESC LIMIT 101""",
+                (before, before, subject, subject, logins,
+                 logins and self.user['role'] != 'admin', self.user['id']),
             ).fetchall()
         self.send({'items': [dict(row) for row in rows[:100]], 'more': len(rows) > 100})
 
@@ -868,7 +906,7 @@ class Handler(BaseHTTPRequestHandler):
                 return {'ok':True}
             if method in ('POST','PUT'):
                 if method=='PUT': d={**exists(db,'bom_lines',id),**d}
-                version=exists(db,'bom_versions',d['version_id']); part=exists(db,'parts',d['part_id'])
+                version=exists(db,'bom_versions',d['version_id']); part=active_part(db,d['part_id'])
                 db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
                 values=(d['version_id'],d['part_id'],num(d.get('qty'),True),str(d.get('reference','')),str(d.get('notes','')))
                 if method=='POST':
@@ -886,6 +924,7 @@ class Handler(BaseHTTPRequestHandler):
                 code=str(row.get('code','')).strip()
                 part=db.execute('SELECT id FROM parts WHERE code=? UNION ALL SELECT part_id FROM material_code_aliases WHERE code=?',(code,code)).fetchone()
                 if not part: raise Problem(f'第 {i+1} 行物料编码不存在，请先建立物料：{row.get("code","")}')
+                active_part(db, part[0])
                 db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?) ON CONFLICT(version_id,part_id) DO UPDATE SET qty=excluded.qty,reference=excluded.reference,notes=excluded.notes',(uid(),version['id'],part[0],num(row.get('qty'),True),str(row.get('reference','')),str(row.get('notes','')))); count+=1
             log_activity(db, self.user, '导入 BOM', version['product_id'], version['name'], f'{count} 条明细')
             return {'count':count}
@@ -908,13 +947,13 @@ class Handler(BaseHTTPRequestHandler):
             db.execute('INSERT INTO purchases(id,code,supplier_id,date,notes,created_at,responsible_id) VALUES(?,?,?,?,?,?,?)',
                        (id,code,d['supplier_id'],date,str(d.get('notes','')),now(),responsible))
             for l in d['lines']:
-                exists(db,'parts',l['part_id']); db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',(uid(),id,l['part_id'],num(l['qty'],True),num(l['price']),0))
+                active_part(db,l['part_id']); db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',(uid(),id,l['part_id'],num(l['qty'],True),num(l['price']),0))
             log_activity(db, self.user, '新增采购单', id, code, exists(db, 'users', responsible)['name'])
             return {'id':id}
         if resource == 'quotes' and method == 'POST':
             part_id = d['part_id']
             supplier_id = d['supplier_id']
-            exists(db, 'parts', part_id)
+            active_part(db, part_id)
             exists(db, 'suppliers', supplier_id)
             previous = db.execute('SELECT * FROM quotes WHERE part_id=? AND supplier_id=?',
                                   (part_id, supplier_id)).fetchone()
@@ -935,14 +974,23 @@ class Handler(BaseHTTPRequestHandler):
         if resource=='files' and method=='DELETE':
             f=exists(db,'files',id); db.execute('DELETE FROM files WHERE id=?',(id,))
             return {'ok':True,'_delete_files':[id]}
+        if resource == 'deleted-parts' and method == 'PUT':
+            part = exists(db, 'parts', id)
+            if part['deleted_at']:
+                db.execute('UPDATE parts SET deleted_at=NULL, updated_at=? WHERE id=?', (now(), id))
+                log_activity(db, self.user, '恢复物料', id, f"{part['code']} {part['name']}")
+            return {'id': id}
         if resource in ('products','parts','suppliers'):
             if method=='DELETE':
+                if resource == 'products':
+                    self.require_admin_password(db, d.get('password'))
                 record = exists(db, resource, id)
-                if resource=='parts':
-                    p = record
-                    if p['stock']!=0: raise Problem('仍有库存的物料不能删除')
-                    if db.execute('SELECT 1 FROM bom_lines WHERE part_id=? UNION ALL SELECT 1 FROM purchase_lines WHERE part_id=? UNION ALL SELECT 1 FROM movements WHERE part_id=? LIMIT 1',(id,id,id)).fetchone(): raise Problem('物料已有业务记录，不能删除')
-                    db.execute('DELETE FROM quotes WHERE part_id=?',(id,))
+                if resource == 'parts':
+                    if not record['deleted_at']:
+                        stamp = now()
+                        db.execute('UPDATE parts SET deleted_at=?,updated_at=? WHERE id=?', (stamp, stamp, id))
+                        log_activity(db, self.user, '删除物料', id, f"{record['code']} {record['name']}")
+                    return {'ok': True}
                 if resource == 'products':
                     if db.execute('SELECT 1 FROM movements WHERE product_id=? LIMIT 1', (id,)).fetchone():
                         raise Problem('产品有关联的库存流水，请在编辑产品中将状态设为已归档', 409)
@@ -958,12 +1006,10 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute('UPDATE parts SET numbering_product_id=NULL WHERE numbering_product_id=?', (id,))
                     log_activity(db, self.user, '删除产品', id, f"{record['code']} {record['name']}")
                 db.execute(f'DELETE FROM {resource} WHERE id=?',(id,))
-                if resource == 'parts':
-                    log_activity(db, self.user, '删除物料', id, f"{p['code']} {p['name']}")
                 removed=[r[0] for r in db.execute('SELECT id FROM files WHERE owner_type=? AND owner_id=?',(resource,id))]
                 db.execute('DELETE FROM files WHERE owner_type=? AND owner_id=?',(resource,id)); return {'ok':True,'_delete_files':removed}
             if method not in ('POST','PUT'): raise Problem('不支持的操作',405)
-            old=exists(db,resource,id) if method=='PUT' else None
+            old=(active_part(db,id) if resource == 'parts' else exists(db,resource,id)) if method=='PUT' else None
             parent_ids=d.get('parent_ids')
             if resource=='parts' and old and 'stock' in d and num(d['stock'])!=old['stock']: raise Problem('库存只能通过库存操作更新')
             if old: d={**old,**d}
@@ -1022,7 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
             result=parse_electronic_file(blob,filename,fields.get('sheet',''))
         except (ElectronicBomError,ValueError,KeyError,RuntimeError) as exc: raise Problem(str(exc))
         with connect() as db:
-            candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2')]
+            candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2 AND deleted_at IS NULL')]
             for row in result['rows']:
                 try:
                     material=self.match_electronic_material(db,row,candidates)
@@ -1033,18 +1079,18 @@ class Handler(BaseHTTPRequestHandler):
     def match_electronic_material(self,db,row,candidates=None):
         if row.get('target_part_id')=='__new__': return None
         if row.get('target_part_id'):
-            material=exists(db,'parts',row['target_part_id'])
+            material=active_part(db,row['target_part_id'])
             if material['material_level']!=2: raise Problem('只能复用二级物料')
             return material
         code=str(row.get('internal_code','')).strip()
         if code:
             found=db.execute('SELECT id FROM parts WHERE code=? UNION ALL SELECT part_id FROM material_code_aliases WHERE code=?',(code,code)).fetchone()
             if not found: raise Problem('系统物料编号不存在：'+code)
-            material=exists(db,'parts',found[0])
+            material=active_part(db,found[0])
             if material['material_level']!=2: raise Problem('系统编号对应的不是二级物料')
             return material
         key=lambda r: tuple(str(r.get(k) or '').strip().casefold() for k in ('external_code','name','spec','brand'))
-        if candidates is None: candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2')]
+        if candidates is None: candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2 AND deleted_at IS NULL')]
         matches=[p for p in candidates if key(p)==key(row)]
         if len(matches)>1: raise Problem('有多个匹配物料，请手动选择复用记录')
         return matches[0] if matches else None
@@ -1065,7 +1111,7 @@ class Handler(BaseHTTPRequestHandler):
         version=exists(db,'bom_versions',version_id) if version_id else None
         source=parent['numbering_product_id'] if parent else version['product_id'] if version else d.get('numbering_product_id') or None
         if source: exists(db,'products',source)
-        candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2')]
+        candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2 AND deleted_at IS NULL')]
         groups={};created=0;created_ids=set();reused=set()
         for index,raw in enumerate(rows,1):
             if not isinstance(raw,dict): raise Problem('导入行格式错误')
