@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """捷程未来PLM：仅依赖 Python 3.10+ 标准库。"""
-import argparse, hashlib, hmac, io, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil
+import argparse, hashlib, hmac, io, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil, tempfile, zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.parser import BytesParser
@@ -12,8 +12,12 @@ from urllib.parse import quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
 
 ROOT = Path(__file__).resolve().parent.parent
+BASE_PATH = os.environ.get("PLM_BASE_PATH", "").rstrip("/")
+SESSION_COOKIE = ('plm_session_' + hashlib.sha256(BASE_PATH.encode()).hexdigest()[:8]
+                  if BASE_PATH else 'plm_session')
 DATA = Path(os.environ.get('PLM_DATA_DIR', str(ROOT / 'data'))).resolve()
 MAX_UPLOAD = 20 * 1024 * 1024
+MAX_RESTORE = 1024 ** 3
 FILE_LOCK = threading.RLock()
 IMAGE_MIMES = {
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -33,7 +37,18 @@ QUOTES_SCHEMA = """CREATE TABLE IF NOT EXISTS quotes(
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS import_runs(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,expires REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS users(
+    id TEXT PRIMARY KEY, name TEXT NOT NULL, email TEXT NOT NULL COLLATE NOCASE UNIQUE,
+    role TEXT NOT NULL CHECK(role IN ('admin','member')), phone TEXT NOT NULL DEFAULT '',
+    password TEXT NOT NULL, must_change INTEGER NOT NULL DEFAULT 0 CHECK(must_change IN (0,1)),
+    avatar BLOB, avatar_mime TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS sessions(token TEXT PRIMARY KEY,expires REAL NOT NULL,user_id TEXT REFERENCES users(id));
+CREATE TABLE IF NOT EXISTS activity(
+    id INTEGER PRIMARY KEY, actor_id TEXT, actor_name TEXT NOT NULL,
+    action TEXT NOT NULL, subject_id TEXT NOT NULL, subject TEXT NOT NULL,
+    detail TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS suppliers(id TEXT PRIMARY KEY,name TEXT NOT NULL,contact TEXT NOT NULL DEFAULT '',phone TEXT NOT NULL DEFAULT '',email TEXT NOT NULL DEFAULT '',address TEXT NOT NULL DEFAULT '',notes TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS products(id TEXT PRIMARY KEY,code TEXT UNIQUE NOT NULL,name TEXT NOT NULL,description TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT '研发中',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS parts(id TEXT PRIMARY KEY,code TEXT UNIQUE NOT NULL,name TEXT NOT NULL,category TEXT NOT NULL CHECK(category IN ('结构物料','电子物料')),spec TEXT NOT NULL DEFAULT '',unit TEXT NOT NULL DEFAULT 'PCS',price REAL NOT NULL DEFAULT 0 CHECK(price>=0),stock REAL NOT NULL DEFAULT 0 CHECK(stock>=0),min_stock REAL NOT NULL DEFAULT 0 CHECK(min_stock>=0),location TEXT NOT NULL DEFAULT '',sub_product_id TEXT REFERENCES products(id),notes TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,updated_at TEXT NOT NULL);
@@ -69,29 +84,33 @@ def required(v, label='名称'):
     if len(s) > 1000: raise Problem(f'{label}过长')
     return s
 
-def init_db():
-    DATA.mkdir(parents=True, exist_ok=True)
-    (DATA / 'uploads').mkdir(exist_ok=True)
-    with connect() as db:
+def init_db(directory=None, bootstrap=None):
+    directory = DATA if directory is None else directory
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'uploads').mkdir(exist_ok=True)
+    with connect(directory) as db:
         db.executescript(SCHEMA + QUOTES_SCHEMA)
         columns={r[1] for r in db.execute('PRAGMA table_info(parts)')}
         product_columns={r[1] for r in db.execute('PRAGMA table_info(products)')}
         version=db.execute('PRAGMA user_version').fetchone()[0]
-        if version>6: raise RuntimeError('数据库版本高于当前程序版本')
+        if version>7: raise RuntimeError('数据库版本高于当前程序版本')
         if version<5 and (db.execute('SELECT 1 FROM parts LIMIT 1').fetchone() or db.execute('SELECT 1 FROM products LIMIT 1').fetchone()):
-            backup_path=DATA/'plm.before-v5.sqlite3'
+            backup_path=directory/'plm.before-v5.sqlite3'
             if not backup_path.exists():
                 backup=sqlite3.connect(backup_path)
                 try: db.backup(backup)
                 finally: backup.close()
         if version == 5:
-            backup_path = DATA / 'plm.before-v6.sqlite3'
+            backup_path = directory / 'plm.before-v6.sqlite3'
             if not backup_path.exists():
                 backup = sqlite3.connect(backup_path)
                 try:
                     db.backup(backup)
                 finally:
                     backup.close()
+        if version == 6 and not (directory / 'plm.before-v7.sqlite3').exists():
+            with sqlite3.connect(directory / 'plm.before-v7.sqlite3', factory=ClosingConnection) as target:
+                db.backup(target)
         db.execute('BEGIN IMMEDIATE')
         if 'material_level' not in columns:
             db.execute('ALTER TABLE parts ADD COLUMN material_level INTEGER NOT NULL DEFAULT 1 CHECK(material_level IN (1,2))')
@@ -132,15 +151,34 @@ def init_db():
             db.execute(QUOTES_SCHEMA)
             db.execute('INSERT INTO quotes SELECT id,part_id,supplier_id,price,url FROM quotes_v5')
             db.execute('DROP TABLE quotes_v5')
-        db.execute('PRAGMA user_version=6')
+        for table, column in RESPONSIBILITIES.items():
+            if column not in {r['name'] for r in db.execute(f'PRAGMA table_info({table})')}:
+                db.execute(f'ALTER TABLE {table} ADD COLUMN {column} TEXT REFERENCES users(id)')
+        if 'user_id' not in {r['name'] for r in db.execute('PRAGMA table_info(sessions)')}:
+            db.execute('ALTER TABLE sessions ADD COLUMN user_id TEXT REFERENCES users(id)')
+            db.execute('DELETE FROM sessions')
+        legacy = db.execute("SELECT value FROM settings WHERE key='password'").fetchone()
+        if bootstrap or legacy:
+            if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+                if bootstrap:
+                    raise Problem('管理员已初始化')
+            else:
+                identity = bootstrap or {
+                    'name': os.environ.get('PLM_ADMIN_NAME', '管理员'),
+                    'email': os.environ.get('PLM_ADMIN_EMAIL', 'admin@localhost'),
+                }
+                create_account(db, identity, 'admin', legacy_password=legacy[0] if legacy and not bootstrap else None,
+                               must_change=bool(bootstrap))
+            db.execute("DELETE FROM settings WHERE key='password'")
+        db.execute('PRAGMA user_version=7')
 
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
         try: return super().__exit__(exc_type, exc_value, traceback)
         finally: self.close()
 
-def connect():
-    db = sqlite3.connect(DATA / 'plm.sqlite3', timeout=15, factory=ClosingConnection)
+def connect(directory=None):
+    db = sqlite3.connect((DATA if directory is None else directory) / 'plm.sqlite3', timeout=15, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
     db.execute('PRAGMA foreign_keys=ON')
     db.execute('PRAGMA journal_mode=WAL')
@@ -237,7 +275,57 @@ def next_code(db, prefix):
 
 def password_hash(password, salt): return hashlib.pbkdf2_hmac('sha256', password.encode(), bytes.fromhex(salt), 310000).hex()
 
-def record_movement(db, data):
+RESPONSIBILITIES = {
+    'products': 'manager_id', 'parts': 'custodian_id',
+    'purchases': 'responsible_id', 'movements': 'handler_id',
+}
+PUBLIC_USER = 'id,name,email,role,phone,must_change,(avatar IS NOT NULL) AS has_avatar'
+
+def account_email(value):
+    value = str(value or '').strip().lower()
+    if len(value) > 254 or not re.fullmatch(r'[^\s@]+@[^\s@]+', value):
+        raise Problem('请填写有效邮箱')
+    return value
+
+def account_name(value):
+    name = required(value, '用户名')
+    if len(name) > 80:
+        raise Problem('用户名最多 80 个字符')
+    return name
+
+def password_record(value):
+    if not isinstance(value, str) or not 10 <= len(value) <= 256:
+        raise Problem('密码长度应为 10 至 256 个字符')
+    salt = secrets.token_hex(16)
+    return json.dumps({'salt': salt, 'hash': password_hash(value, salt)})
+
+def check_password(value, stored):
+    if not isinstance(value, str) or len(value) > 256:
+        return False
+    stored = json.loads(stored)
+    return hmac.compare_digest(stored['hash'], password_hash(value, stored['salt']))
+
+def create_account(db, data, role='member', legacy_password=None, must_change=True):
+    email = account_email(data.get('email'))
+    if db.execute('SELECT 1 FROM users WHERE email=?', (email,)).fetchone():
+        raise Problem('邮箱已使用', 409)
+    id = uid()
+    db.execute('INSERT INTO users(id,name,email,role,password,must_change,created_at) VALUES(?,?,?,?,?,?,?)',
+               (id, account_name(data.get('name')), email, role,
+                legacy_password or password_record(data.get('password')), int(must_change), now()))
+    return id
+
+def assign_user(db, id):
+    if id:
+        exists(db, 'users', id)
+    return id or None
+
+def log_activity(db, actor, action, subject_id, subject, detail=''):
+    if actor:
+        db.execute('INSERT INTO activity(actor_id,actor_name,action,subject_id,subject,detail,created_at) VALUES(?,?,?,?,?,?,?)',
+                   (actor['id'], actor['name'], action, subject_id, subject, detail, now()))
+
+def record_movement(db, data, actor=None):
     kind = data.get('type')
     if kind not in ('入库','出库','退库','报废'): raise Problem('无效的库存操作')
     part = exists(db, 'parts', data.get('part_id'))
@@ -267,7 +355,13 @@ def record_movement(db, data):
     if balance < 0: raise Problem('库存不足，无法完成此操作')
     mid = uid()
     db.execute('UPDATE parts SET stock=?,updated_at=? WHERE id=?',(balance,now(),part['id']))
-    db.execute('INSERT INTO movements VALUES(?,?,?,?,?,?,?,?,?,?,?)',(mid,next_code(db,'ST'),kind,part['id'],qty,balance,product_id,purchase_line,original_id,reason,now()))
+    handler = assign_user(db, data.get('handler_id') or (actor['id'] if actor else None))
+    code = next_code(db, 'ST')
+    db.execute('INSERT INTO movements(id,code,type,part_id,qty,balance,product_id,purchase_line_id,original_id,reason,created_at,handler_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+               (mid,code,kind,part['id'],qty,balance,product_id,purchase_line,original_id,reason,now(),handler))
+    handler_name = exists(db, 'users', handler)['name'] if handler else ''
+    log_activity(db, actor, kind, part['id'], f"{part['code']} {part['name']}",
+                 f'{code} · {qty:g} {part["unit"]} · 结余 {balance:g} · 经办人 {handler_name}')
     return mid
 
 def material_level(value):
@@ -357,7 +451,8 @@ def automatic_version(db, product_id):
 TABLES = ('products','parts','suppliers','quotes','bom_versions','bom_lines','purchases','purchase_lines','movements','files','material_links','material_code_aliases')
 
 def get_state(db):
-    db.execute('BEGIN')
+    if not db.in_transaction:
+        db.execute('BEGIN')
     state = {t: [{k:r[k] for k in r.keys() if k != 'sub_product_id'}
                  for r in db.execute(f'SELECT * FROM {t} ORDER BY rowid')] for t in TABLES}
     owners = {(table, row['id']): row
@@ -370,15 +465,96 @@ def get_state(db):
         if record:
             file['original_name'] = file['name']
             file['name'] = owner_file_name(file['name'], record['code'], record['name'], positions[owner])
+    state['users'] = [dict(row) for row in db.execute('SELECT id,name FROM users ORDER BY name,id')]
     return state
 
+
+def write_backup(output):
+    with tempfile.TemporaryDirectory(dir=DATA) as folder:
+        database = Path(folder) / 'plm.sqlite3'
+        with sqlite3.connect(database, factory=ClosingConnection) as target:
+            with connect() as source:
+                source.backup(target)
+            target.execute('DELETE FROM sessions')
+            files = target.execute('SELECT id FROM files').fetchall()
+        with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
+            archive.write(database, 'plm.sqlite3')
+            for (id,) in files:
+                file = DATA / 'uploads' / id
+                if not UPLOAD_ID.fullmatch(id) or not file.is_file():
+                    raise Problem('备份失败：有附件文件缺失，请检查存储', 409)
+                archive.write(file, 'uploads/' + id)
+
+def stage_restore(archive_path, directory):
+    # Import records into our own schema. Uploaded triggers, views and sessions
+    # are never installed, and ZIP paths are never extracted directly.
+    unpacked = directory / 'incoming.sqlite3'
+    staged = directory / 'staged'
+    init_db(staged)
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = archive.infolist()
+        names = {entry.filename for entry in entries}
+        if len(names) != len(entries) or len(names) > 100000 or sum(item.file_size for item in entries) > 2 * MAX_RESTORE:
+            raise Problem('备份内容过大或包含重复文件')
+        if 'plm.sqlite3' not in names or any(
+            name not in ('plm.sqlite3', 'uploads/') and
+            (not name.startswith('uploads/') or not UPLOAD_ID.fullmatch(name[8:]))
+            for name in names
+        ):
+            raise Problem('不是有效的 JPLM ZIP 备份')
+        with archive.open('plm.sqlite3') as source, unpacked.open('wb') as target:
+            shutil.copyfileobj(source, target, 1024 * 1024)
+        with sqlite3.connect(unpacked.as_uri() + '?mode=ro&immutable=1', uri=True, factory=ClosingConnection) as source:
+            source.row_factory = sqlite3.Row
+            source.execute('PRAGMA trusted_schema=OFF')
+            version = source.execute('PRAGMA user_version').fetchone()[0]
+            if version not in (6, 7):
+                raise Problem('请使用数据库版本 6 或 7 的 JPLM 备份')
+            if source.execute('PRAGMA quick_check(1)').fetchone()[0] != 'ok':
+                raise Problem('备份数据库已损坏')
+            source_tables = {row['name'] for row in source.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'")}
+            required_tables = set(TABLES) | {'settings', 'import_runs'}
+            if version == 7:
+                required_tables |= {'users', 'activity'}
+            if not required_tables <= source_tables:
+                raise Problem('备份缺少业务数据表')
+            with connect(staged) as db:
+                db.execute('BEGIN')
+                db.execute('PRAGMA defer_foreign_keys=ON')
+                for table in ('users', *TABLES, 'settings', 'import_runs', 'activity'):
+                    if table not in source_tables or (version == 6 and table in ('users', 'activity')):
+                        continue
+                    target_columns = [row['name'] for row in db.execute(f'PRAGMA table_info({table})')]
+                    source_columns = {row['name'] for row in source.execute(f'PRAGMA table_info({table})')}
+                    optional = {RESPONSIBILITIES.get(table)} if version == 6 else set()
+                    if not set(target_columns) - optional <= source_columns:
+                        raise Problem('备份数据结构不完整')
+                    columns = ','.join(name for name in target_columns if name in source_columns)
+                    records = source.execute(f'SELECT {columns} FROM {table} ORDER BY rowid')
+                    db.executemany(f'INSERT INTO {table}({columns}) VALUES({",".join("?" for _ in columns.split(","))})', records)
+                db.execute("DELETE FROM settings WHERE key='password'")
+                if version == 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
+                    raise Problem('备份中没有管理员账户')
+                file_ids = {r['id'] for r in db.execute('SELECT id FROM files')}
+                if any(not UPLOAD_ID.fullmatch(id) or 'uploads/' + id not in names for id in file_ids):
+                    raise Problem('备份缺少图片或附件')
+                if db.execute('PRAGMA foreign_key_check').fetchone():
+                    raise Problem('备份中的关联数据不完整')
+                for file in db.execute('SELECT id,size FROM files').fetchall():
+                    name = 'uploads/' + file['id']
+                    if archive.getinfo(name).file_size != file['size']:
+                        raise Problem('备份附件大小不匹配')
+                    with archive.open(name) as payload, (staged / name).open('wb') as target:
+                        shutil.copyfileobj(payload, target, 1024 * 1024)
+    return staged, version
 
 class ThreadingHTTPServer(BaseThreadingHTTPServer):
     request_queue_size=64
     daemon_threads=True
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = 'JiechengPLM/1.4'
+    server_version = 'JiechengPLM/1.5'
     attempts = {}
     def setup(self):
         super().setup()
@@ -406,15 +582,28 @@ class Handler(BaseHTTPRequestHandler):
         if 'multipart/form-data' in self.headers.get('Content-Type',''): return raw
         try: return json.loads(raw or b'{}')
         except (ValueError, UnicodeError): raise Problem('请求数据格式错误')
-    def authorized(self, db):
+    def session_token(self):
         try:
-            jar=cookies.SimpleCookie(); jar.load(self.headers.get('Cookie',''))
-            token=jar['plm_session'].value
-        except (KeyError, cookies.CookieError): return False
-        return bool(db.execute('SELECT 1 FROM sessions WHERE token=? AND expires>?',(hashlib.sha256(token.encode()).hexdigest(),time.time())).fetchone())
+            jar = cookies.SimpleCookie()
+            jar.load(self.headers.get('Cookie', ''))
+            return hashlib.sha256(jar[SESSION_COOKIE].value.encode()).hexdigest()
+        except (KeyError, cookies.CookieError):
+            return None
+
+    def authorized(self, db):
+        return db.execute(
+            f'SELECT {PUBLIC_USER} FROM users WHERE id=(SELECT user_id FROM sessions WHERE token=? AND expires>?)',
+            (self.session_token(), time.time()),
+        ).fetchone()
+
+    def require_admin(self):
+        if self.user['role'] != 'admin':
+            raise Problem('需要管理员权限', 403)
+
     def cookie(self, token, age=604800):
         secure = '; Secure' if os.environ.get('PLM_SECURE_COOKIE') == '1' else ''
-        return f'plm_session={token}; HttpOnly; SameSite=Strict; Path=/; Max-Age={age}{secure}'
+        return f'{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path={BASE_PATH or "/" }; Max-Age={age}{secure}'
+
     def do_GET(self): self.handle_request('GET')
     def do_POST(self): self.handle_request('POST')
     def do_PUT(self): self.handle_request('PUT')
@@ -422,36 +611,82 @@ class Handler(BaseHTTPRequestHandler):
     def handle_request(self, method):
         try:
             path = unquote(urlparse(self.path).path)
+            if BASE_PATH:
+                if not path.startswith(BASE_PATH + '/'):
+                    raise Problem('路径不存在', 404)
+                path = path[len(BASE_PATH):]
             if method != 'GET':
                 origin = self.headers.get('Origin')
                 if origin and urlparse(origin).netloc != self.headers.get('Host'): raise Problem('请求来源不被允许',403)
                 if self.headers.get('Sec-Fetch-Site') == 'cross-site': raise Problem('请求来源不被允许',403)
             if path == '/api/health': return self.send({'ok':True})
             if path == '/api/auth/status':
-                with connect() as db: return self.send({'initialized':bool(db.execute("SELECT 1 FROM settings WHERE key='password'").fetchone()),'authenticated':self.authorized(db)})
-            if path in ('/api/auth/setup','/api/auth/login') and method == 'POST': return self.auth(path)
-            if path.startswith('/api/') or path.startswith('/files/'):
                 with connect() as db:
-                    if not self.authorized(db): raise Problem('请先登录',401)
+                    user = self.authorized(db)
+                    initialized = bool(db.execute('SELECT 1 FROM users LIMIT 1').fetchone())
+                return self.send({'initialized': initialized, 'authenticated': bool(user),
+                                  'user': dict(user) if user else None})
+            if path in ('/api/auth/setup', '/api/auth/login') and method == 'POST':
+                return self.auth(path)
+            if path.startswith(('/api/', '/files/')):
+                with connect() as db:
+                    self.user = self.authorized(db)
+                if not self.user:
+                    raise Problem('请先登录', 401)
+                if self.user['must_change'] and path not in ('/api/auth/logout', '/api/account/password'):
+                    raise Problem('请先修改初始密码', 403)
             if path == '/api/auth/logout' and method == 'POST':
-                jar=cookies.SimpleCookie(); jar.load(self.headers.get('Cookie',''))
-                token=jar.get('plm_session')
-                if token:
-                    with transaction() as db: db.execute('DELETE FROM sessions WHERE token=?',(hashlib.sha256(token.value.encode()).hexdigest(),))
-                return self.send({'ok':True},extra={'Set-Cookie':self.cookie('',0)})
+                with FILE_LOCK, transaction() as db:
+                    db.execute('DELETE FROM sessions WHERE token=?', (self.session_token(),))
+                return self.send({'ok': True}, extra={'Set-Cookie': self.cookie('', 0)})
+            if path == '/api/users' and method == 'GET':
+                self.require_admin()
+                with connect() as db:
+                    return self.send([dict(row) for row in db.execute(f'SELECT {PUBLIC_USER} FROM users ORDER BY name,id')])
+            if path.startswith('/api/avatars/') and method == 'GET':
+                return self.serve_avatar(path.rsplit('/', 1)[1])
+            if path == '/api/account/avatar' and method == 'POST':
+                return self.update_avatar()
+            if path == '/api/activity' and method == 'GET':
+                return self.list_activity()
+            if path == '/api/restore' and method == 'POST':
+                self.require_admin()
+                return self.restore()
             if path == '/api/state' and method == 'GET':
-                with connect() as db: return self.send(get_state(db))
+                with connect() as db:
+                    db.execute('BEGIN')
+                    user = self.authorized(db)
+                    if not user or user['must_change']:
+                        raise Problem('请先登录', 401)
+                    data = get_state(db)
+                return self.send(data)
             if path == '/api/backup' and method == 'GET':
-                with FILE_LOCK: return self.backup()
+                with FILE_LOCK:
+                    with connect() as db:
+                        user = self.authorized(db)
+                    if not user or user['role'] != 'admin' or user['must_change']:
+                        raise Problem('需要管理员权限', 403)
+                    return self.backup()
             if path.startswith('/files/') and method == 'GET':
-                with FILE_LOCK: return self.serve_file(path.split('/')[-1])
+                with FILE_LOCK:
+                    with connect() as db:
+                        if not self.authorized(db):
+                            raise Problem('请先登录', 401)
+                    return self.serve_file(path.split('/')[-1])
             if path == '/api/electronic-import/preview' and method == 'POST': return self.electronic_preview()
             if path == '/api/files' and method == 'POST':
                 with FILE_LOCK: return self.upload()
             if path.startswith('/api/') and method != 'GET':
                 data = self.body()
                 with FILE_LOCK:
-                    with transaction() as db: result = self.mutate(db,path,method,data)
+                    with transaction() as db:
+                        user = self.authorized(db)
+                        if not user:
+                            raise Problem('请先登录', 401)
+                        if user['must_change'] and path != '/api/account/password':
+                            raise Problem('请先修改初始密码', 403)
+                        self.user = user
+                        result = self.mutate(db, path, method, data)
                     for fid in result.pop('_delete_files', []): remove_upload(fid)
                 return self.send(result)
             if method == 'GET': return self.static(path)
@@ -465,30 +700,128 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as e:
             print(f'Internal error: {e}',file=sys.stderr)
             self.send({'error':'服务暂时不可用，请查看服务器日志'},500)
-    def auth(self,path):
-        ip=self.client_address[0]; recent=[x for x in self.attempts.get(ip,[]) if x>time.time()-600]
-        self.attempts[ip]=recent
-        if len(recent)>=12: raise Problem('尝试次数过多，请十分钟后重试',429)
-        data=self.body(); password=str(data.get('password',''))
-        with transaction() as db:
-            row=db.execute("SELECT value FROM settings WHERE key='password'").fetchone()
-            if path.endswith('setup'):
-                if row: raise Problem('管理员已经初始化',409)
-                if len(password)<10 or len(password)>256: raise Problem('密码长度应为 10 至 256 个字符')
-                salt=secrets.token_hex(16)
-                db.execute('INSERT INTO settings VALUES(?,?)',('password',json.dumps({'salt':salt,'hash':password_hash(password,salt)})))
+    def auth(self, path):
+        ip = self.headers.get('X-Real-IP', self.client_address[0]) if BASE_PATH else self.client_address[0]
+        recent = [stamp for stamp in self.attempts.get(ip, []) if stamp > time.time() - 600]
+        self.attempts[ip] = recent
+        if len(recent) >= 12:
+            raise Problem('尝试次数过多，请十分钟后重试', 429)
+        data = self.body()
+        password = data.get('password')
+        with FILE_LOCK, transaction() as db:
+            if path.endswith('/setup'):
+                if os.environ.get('PLM_DISABLE_SETUP') == '1' or db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+                    raise Problem('管理员已经初始化', 409)
+                id = create_account(db, {'name': data.get('name') or '管理员',
+                                         'email': data.get('email') or 'admin@localhost',
+                                         'password': password}, 'admin', must_change=False)
             else:
-                self.attempts[ip].append(time.time())
-                if not row: raise Problem('请先设置管理员密码')
-                stored=json.loads(row[0])
-                if not hmac.compare_digest(stored['hash'],password_hash(password,stored['salt'])): raise Problem('密码不正确',401)
-            token=secrets.token_urlsafe(32)
-            db.execute('DELETE FROM sessions WHERE expires<?',(time.time(),))
-            db.execute('INSERT INTO sessions VALUES(?,?)',(hashlib.sha256(token.encode()).hexdigest(),time.time()+604800))
-        self.attempts.pop(ip,None)
-        self.send({'ok':True},extra={'Set-Cookie':self.cookie(token)})
+                recent.append(time.time())
+                email = str(data.get('email') or '').strip().lower()
+                user = db.execute('SELECT id,password FROM users WHERE email=?', (email,)).fetchone()
+                if not user or not check_password(password, user['password']):
+                    raise Problem('邮箱或密码不正确', 401)
+                id = user['id']
+            token = secrets.token_urlsafe(32)
+            db.execute('DELETE FROM sessions WHERE expires<?', (time.time(),))
+            db.execute('INSERT INTO sessions(token,expires,user_id) VALUES(?,?,?)',
+                       (hashlib.sha256(token.encode()).hexdigest(), time.time() + 604800, id))
+        self.attempts.pop(ip, None)
+        self.send({'ok': True}, extra={'Set-Cookie': self.cookie(token)})
+
+    def update_avatar(self):
+        _, files = self.multipart()
+        if len(files) != 1:
+            raise Problem('请选择一张头像图片')
+        _, _, blob = files[0]
+        mime = image_mime(blob[:12])
+        if not mime or len(blob) > 2 * 1024 * 1024:
+            raise Problem('请选择 2 MB 以内的图片')
+        with FILE_LOCK, transaction() as db:
+            if not self.authorized(db):
+                raise Problem('请先登录', 401)
+            db.execute('UPDATE users SET avatar=?,avatar_mime=? WHERE id=?', (blob, mime, self.user['id']))
+        self.send({'ok': True})
+
+    def serve_avatar(self, id):
+        with connect() as db:
+            row = db.execute('SELECT avatar,avatar_mime FROM users WHERE id=?', (id,)).fetchone()
+        if not row or not row['avatar']:
+            raise Problem('头像不存在', 404)
+        self.send_response(200)
+        self.send_header('Content-Type', image_mime(row['avatar'][:12]) or 'application/octet-stream')
+        self.send_header('Content-Length', str(len(row['avatar'])))
+        self.send_header('Cache-Control', 'private, no-cache')
+        self.security_headers()
+        self.end_headers()
+        self.wfile.write(row['avatar'])
+
+    def list_activity(self):
+        from urllib.parse import parse_qs
+        query = parse_qs(urlparse(self.path).query)
+        before = int(query.get('before', ['0'])[0])
+        subject = query.get('part', [''])[0]
+        with connect() as db:
+            rows = db.execute(
+                """SELECT * FROM activity WHERE (?=0 OR id<?) AND (?='' OR subject_id=?)
+                   ORDER BY id DESC LIMIT 101""", (before, before, subject, subject)
+            ).fetchall()
+        self.send({'items': [dict(row) for row in rows[:100]], 'more': len(rows) > 100})
+
+    def mutate_account(self, db, resource, id, method, data):
+        actor = self.user
+        if resource == 'users':
+            self.require_admin()
+            if method == 'POST' and not id:
+                user_id = create_account(db, data)
+                log_activity(db, actor, '新增用户', user_id, account_name(data.get('name')))
+                return {'id': user_id}
+            if method == 'PUT' and id:
+                user = exists(db, 'users', id)
+                email = account_email(data.get('email', user['email']))
+                name = account_name(data.get('name', user['name']))
+                if db.execute('SELECT 1 FROM users WHERE email=? AND id<>?', (email, id)).fetchone():
+                    raise Problem('邮箱已使用', 409)
+                db.execute('UPDATE users SET name=?,email=? WHERE id=?', (name, email, id))
+                return {'id': id}
+        if resource == 'reset-password' and method == 'POST' and id:
+            self.require_admin()
+            if id == actor['id']:
+                raise Problem('请在个人资料中修改自己的密码')
+            user = exists(db, 'users', id)
+            db.execute('UPDATE users SET password=?,must_change=1 WHERE id=?',
+                       (password_record(data.get('password')), id))
+            db.execute('DELETE FROM sessions WHERE user_id=?', (id,))
+            log_activity(db, actor, '重置密码', id, user['name'])
+            return {'ok': True}
+        if resource == 'account':
+            if id == 'profile' and method == 'PUT':
+                if set(data) - {'phone'}:
+                    raise Problem('只能修改自己的手机号', 403)
+                phone = str(data.get('phone') or '').strip()
+                if len(phone) > 30:
+                    raise Problem('手机号最多 30 个字符')
+                db.execute('UPDATE users SET phone=? WHERE id=?', (phone, actor['id']))
+                return {'ok': True}
+            if id == 'password' and method == 'POST':
+                user = exists(db, 'users', actor['id'])
+                current = data.get('current_password')
+                password = data.get('password')
+                if not check_password(current, user['password']):
+                    raise Problem('当前密码不正确')
+                if password == current:
+                    raise Problem('新密码需与当前密码不同')
+                db.execute('UPDATE users SET password=?,must_change=0 WHERE id=?',
+                           (password_record(password), actor['id']))
+                db.execute('DELETE FROM sessions WHERE user_id=? AND token<>?',
+                           (actor['id'], self.session_token()))
+                return {'ok': True}
+        raise Problem('不支持的账户操作', 405)
+
     def mutate(self,db,path,method,d):
         seg=path.strip('/').split('/'); resource=seg[1]; id=seg[2] if len(seg)>2 else None
+        if resource in ('users', 'account', 'reset-password'):
+            return self.mutate_account(db, resource, id, method, d)
         if resource=='electronic-import' and id=='commit' and method=='POST': return self.commit_electronic_import(db,d)
         if resource=='material-cells' and method=='PUT':
             allowed={'spec','unit','price','min_stock','location','notes','category','material_level','external_code','brand'}
@@ -507,10 +840,10 @@ class Handler(BaseHTTPRequestHandler):
             set_material_children(db,id,d.get('child_ids'));return {'ok':True}
         if resource=='material-parents' and method=='PUT':
             set_material_parents(db,id,d.get('parent_ids'));return {'ok':True}
-        if resource=='movements' and method=='POST': return {'id':record_movement(db,d)}
+        if resource=='movements' and method=='POST': return {'id':record_movement(db,d,self.user)}
         if resource=='demo' and method=='POST':
             if any(db.execute(f'SELECT 1 FROM {t} LIMIT 1').fetchone() for t in ('products','parts','suppliers','purchases','movements')): raise Problem('仅空数据库可以载入示例')
-            seed_demo(db); return {'ok':True}
+            seed_demo(db); log_activity(db, self.user, '载入示例', '', '示例数据'); return {'ok':True}
         if resource=='bom-versions' and method=='POST':
             exists(db,'products',d['product_id']); bid=uid()
             db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),d['product_id']))
@@ -531,16 +864,21 @@ class Handler(BaseHTTPRequestHandler):
                 line=exists(db,'bom_lines',id)
                 version=exists(db,'bom_versions',line['version_id'])
                 db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
-                db.execute('DELETE FROM bom_lines WHERE id=?',(id,)); return {'ok':True}
+                db.execute('DELETE FROM bom_lines WHERE id=?',(id,))
+                part = exists(db, 'parts', line['part_id'])
+                log_activity(db, self.user, 'BOM 移除物料', part['id'], f"{part['code']} {part['name']}", version['name'])
+                return {'ok':True}
             if method in ('POST','PUT'):
                 if method=='PUT': d={**exists(db,'bom_lines',id),**d}
-                version=exists(db,'bom_versions',d['version_id']); exists(db,'parts',d['part_id'])
+                version=exists(db,'bom_versions',d['version_id']); part=exists(db,'parts',d['part_id'])
                 db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
                 values=(d['version_id'],d['part_id'],num(d.get('qty'),True),str(d.get('reference','')),str(d.get('notes','')))
                 if method=='POST':
                     id=uid(); db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?)',(id,*values))
                 else:
                     exists(db,'bom_lines',id); db.execute('UPDATE bom_lines SET version_id=?,part_id=?,qty=?,reference=?,notes=? WHERE id=?',(*values,id))
+                log_activity(db, self.user, 'BOM 新增物料' if method=='POST' else 'BOM 修改物料',
+                             part['id'], f"{part['code']} {part['name']}", f"{version['name']} · 用量 {values[2]:g}")
                 return {'id':id}
         if resource=='bom-import' and method=='POST':
             version=exists(db,'bom_versions',d['version_id']); count=0
@@ -551,16 +889,29 @@ class Handler(BaseHTTPRequestHandler):
                 part=db.execute('SELECT id FROM parts WHERE code=? UNION ALL SELECT part_id FROM material_code_aliases WHERE code=?',(code,code)).fetchone()
                 if not part: raise Problem(f'第 {i+1} 行物料编码不存在，请先建立物料：{row.get("code","")}')
                 db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?) ON CONFLICT(version_id,part_id) DO UPDATE SET qty=excluded.qty,reference=excluded.reference,notes=excluded.notes',(uid(),version['id'],part[0],num(row.get('qty'),True),str(row.get('reference','')),str(row.get('notes','')))); count+=1
+            log_activity(db, self.user, '导入 BOM', version['product_id'], version['name'], f'{count} 条明细')
             return {'count':count}
+        if resource == 'purchases' and method == 'PUT':
+            purchase = exists(db, 'purchases', id)
+            if set(d) != {'responsible_id'} or not d['responsible_id']:
+                raise Problem('请选择采购负责人')
+            owner = assign_user(db, d['responsible_id'])
+            db.execute('UPDATE purchases SET responsible_id=? WHERE id=?', (owner, id))
+            log_activity(db, self.user, '修改采购负责人', id, purchase['code'], exists(db, 'users', owner)['name'])
+            return {'id': id}
         if resource=='purchases' and method=='POST':
             exists(db,'suppliers',d['supplier_id']); id=uid()
             if not d.get('lines'): raise Problem('请至少添加一个采购物料')
             date=required(d.get('date'),'采购日期')
             try: datetime.strptime(date,'%Y-%m-%d')
             except ValueError: raise Problem('采购日期格式错误')
-            db.execute('INSERT INTO purchases VALUES(?,?,?,?,?,?)',(id,next_code(db,'PO'),d['supplier_id'],date,str(d.get('notes','')),now()))
+            responsible = assign_user(db, d.get('responsible_id') or self.user['id'])
+            code = next_code(db, 'PO')
+            db.execute('INSERT INTO purchases(id,code,supplier_id,date,notes,created_at,responsible_id) VALUES(?,?,?,?,?,?,?)',
+                       (id,code,d['supplier_id'],date,str(d.get('notes','')),now(),responsible))
             for l in d['lines']:
                 exists(db,'parts',l['part_id']); db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',(uid(),id,l['part_id'],num(l['qty'],True),num(l['price']),0))
+            log_activity(db, self.user, '新增采购单', id, code, exists(db, 'users', responsible)['name'])
             return {'id':id}
         if resource == 'quotes' and method == 'POST':
             part_id = d['part_id']
@@ -599,6 +950,8 @@ class Handler(BaseHTTPRequestHandler):
                     if any(db.execute('SELECT 1 FROM bom_lines WHERE version_id=?',(v,)).fetchone() for v in versions): raise Problem('产品仍有 BOM 明细，不能删除')
                     db.execute('DELETE FROM bom_versions WHERE product_id=?',(id,))
                 db.execute(f'DELETE FROM {resource} WHERE id=?',(id,))
+                if resource == 'parts':
+                    log_activity(db, self.user, '删除物料', id, f"{p['code']} {p['name']}")
                 removed=[r[0] for r in db.execute('SELECT id FROM files WHERE owner_type=? AND owner_id=?',(resource,id))]
                 db.execute('DELETE FROM files WHERE owner_type=? AND owner_id=?',(resource,id)); return {'ok':True,'_delete_files':removed}
             if method not in ('POST','PUT'): raise Problem('不支持的操作',405)
@@ -629,6 +982,9 @@ class Handler(BaseHTTPRequestHandler):
                     code=material_code(db,category,level,numbering_product_id,serial)
                 values.update(code=code,material_serial=serial,numbering_product_id=numbering_product_id,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location','')),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
             else: values.update({k:str(d.get(k,'')) for k in ('contact','phone','email','address','notes')})
+            if resource in RESPONSIBILITIES:
+                column = RESPONSIBILITIES[resource]
+                values[column] = assign_user(db, d.get(column))
             if method=='POST':
                 id=uid(); values.update(id=id,created_at=now())
                 cols=list(values); db.execute(f'INSERT INTO {resource} ({",".join(cols)}) VALUES({",".join("?" for _ in cols)})',tuple(values.values()))
@@ -644,6 +1000,10 @@ class Handler(BaseHTTPRequestHandler):
             if resource=='parts' and parent_ids is not None:
                 if values['material_level']!=2 and parent_ids: raise Problem('只有二级物料可以选择关联一级物料')
                 if values['material_level']==2: set_material_parents(db,id,parent_ids)
+            if resource in ('parts', 'products'):
+                noun = '物料' if resource == 'parts' else '产品'
+                log_activity(db, self.user, ('新增' if method == 'POST' else '修改') + noun,
+                             id, f"{values['code']} {values['name']}")
             return {'id':id}
         raise Problem('接口不存在或不支持该操作',404)
     def electronic_preview(self):
@@ -731,6 +1091,8 @@ class Handler(BaseHTTPRequestHandler):
         if version: db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
         result={'rows':len(rows),'materials':len(groups),'created':created,'reused':len(reused),'reference_total':round(total,6)}
         db.execute('INSERT INTO import_runs VALUES(?,?,?,?)',(request_id,fingerprint,json.dumps(result),now()))
+        log_activity(db, self.user, '导入二级物料', parent_id or (version['product_id'] if version else ''),
+                     '电子物料 BOM', f'新建 {created} 项 · 复用 {len(reused)} 项')
         return result
     def multipart(self):
         raw=self.body(); content=self.headers.get('Content-Type','')
@@ -750,6 +1112,9 @@ class Handler(BaseHTTPRequestHandler):
         created=[]
         try:
             with transaction() as db:
+                user = self.authorized(db)
+                if not user or user['must_change']:
+                    raise Problem('请先登录', 401)
                 exists(db,owner,owner_id)
                 db.execute(f'UPDATE {owner} SET updated_at=? WHERE id=?',(now(),owner_id))
                 old=None
@@ -804,37 +1169,90 @@ class Handler(BaseHTTPRequestHandler):
             raise Problem('文件未找到', 404)
         b = path.read_bytes()
         self.send_response(200)
-        self.send_header('Content-Type', f['mime'])
+        image_type = image_mime(b[:12]) if f['kind'] == 'image' else None
+        content_type = image_type or ('application/pdf' if f['mime'] == 'application/pdf' else 'application/octet-stream')
+        self.send_header('Content-Type', content_type)
         self.send_header('Content-Length', str(len(b)))
-        disposition = 'inline' if f['kind'] == 'image' else 'attachment'
+        disposition = 'inline' if image_type else 'attachment'
         self.send_header('Content-Disposition', f"{disposition}; filename*=UTF-8''{quote(name, safe='')}")
         self.security_headers()
         self.send_header('Cache-Control', 'private, no-cache')
         self.end_headers()
         self.wfile.write(b)
     def backup(self):
-        import tempfile, zipfile
-        # SQLite online backup and a file snapshot are collected under FILE_LOCK.
-        # The ZIP is streamed from disk so attachments do not all occupy memory.
-        with tempfile.TemporaryDirectory() as td:
-            target=sqlite3.connect(Path(td)/'plm.sqlite3')
-            with connect() as db: db.backup(target)
-            target.close()
-            snapshot=sqlite3.connect(Path(td)/'plm.sqlite3')
-            files=snapshot.execute('SELECT id FROM files').fetchall(); snapshot.close()
-            output=Path(td)/'backup.zip'
-            with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as z:
-                z.write(Path(td)/'plm.sqlite3','plm.sqlite3')
-                for (fid,) in files:
-                    f=DATA/'uploads'/fid
-                    if not f.is_file(): raise Problem('备份失败：有附件文件缺失，请检查服务器存储',500)
-                    z.write(f,'uploads/'+fid)
+        with tempfile.TemporaryDirectory(dir=DATA) as folder:
+            output = Path(folder) / 'backup.zip'
+            write_backup(output)
             self.send_response(200)
-            self.send_header('Content-Type','application/zip')
-            self.send_header('Content-Disposition','attachment; filename="jiecheng-plm-backup-'+datetime.now().strftime('%Y%m%d')+'.zip"')
-            self.send_header('Content-Length',str(output.stat().st_size))
-            self.security_headers(); self.end_headers()
-            with output.open('rb') as source: shutil.copyfileobj(source,self.wfile,1024*1024)
+            self.send_header('Content-Type', 'application/zip')
+            self.send_header('Content-Disposition', 'attachment; filename="jiecheng-plm-backup-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '.zip"')
+            self.send_header('Content-Length', str(output.stat().st_size))
+            self.send_header('Cache-Control', 'no-store')
+            self.security_headers()
+            self.end_headers()
+            with output.open('rb') as source:
+                shutil.copyfileobj(source, self.wfile, 1024 * 1024)
+
+    def restore(self):
+        size = int(self.headers.get('Content-Length', '0'))
+        if size <= 0 or size > MAX_RESTORE:
+            raise Problem('请选择不超过 1 GB 的 ZIP 备份', 413)
+        if self.headers.get('X-PLM-Restore') != 'replace':
+            raise Problem('请确认覆盖当前数据')
+        with tempfile.TemporaryDirectory(dir=DATA) as folder:
+            directory = Path(folder)
+            archive = directory / 'restore.zip'
+            with archive.open('wb') as target:
+                remaining = size
+                while remaining:
+                    chunk = self.rfile.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        raise Problem('备份上传不完整')
+                    target.write(chunk)
+                    remaining -= len(chunk)
+            try:
+                staged, version = stage_restore(archive, directory)
+            except (zipfile.BadZipFile, sqlite3.Error, RuntimeError, NotImplementedError, ValueError) as exc:
+                raise Problem('ZIP 或备份数据库无法读取') from exc
+            with FILE_LOCK:
+                self.apply_restore(staged, version, directory)
+        self.send({'ok': True}, extra={'Set-Cookie': self.cookie('', 0)})
+
+    def apply_restore(self, staged, version, directory):
+        copied = []
+        with connect() as live, connect(staged) as recovered:
+            admin = self.authorized(live)
+            if not admin or admin['role'] != 'admin' or admin['must_change']:
+                raise Problem('请重新登录管理员账户', 403)
+            if version == 6:
+                # Legacy archives predate user accounts. Keep the current directory.
+                recovered.executemany('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?)',
+                                      live.execute('SELECT * FROM users'))
+            for row in live.execute("SELECT key,value FROM settings WHERE key LIKE 'sequence_%'"):
+                current = recovered.execute('SELECT value FROM settings WHERE key=?', (row['key'],)).fetchone()
+                if not current or int(row['value']) > int(current['value']):
+                    recovered.execute('INSERT OR REPLACE INTO settings VALUES(?,?)', tuple(row))
+            log_activity(recovered, admin, '恢复备份', '', 'ZIP 数据备份')
+            old_files = {r[0] for r in live.execute('SELECT id FROM files')}
+            rollback = directory / 'before-restore.zip'
+            write_backup(rollback)
+            rollback.replace(DATA / 'before-restore.zip')
+            try:
+                for (old_id,) in recovered.execute('SELECT id FROM files').fetchall():
+                    id = uid()
+                    destination = DATA / 'uploads' / id
+                    copied.append(id)
+                    (staged / 'uploads' / old_id).replace(destination)
+                    recovered.execute('UPDATE files SET id=? WHERE id=?', (id, old_id))
+                recovered.commit()
+                recovered.backup(live)
+            except Exception:
+                for id in copied:
+                    remove_upload(id)
+                raise
+            for id in old_files:
+                remove_upload(id)
+
     def static(self,path):
         base=(ROOT/'dist').resolve(); file=(base/path.lstrip('/')).resolve()
         if not file.is_relative_to(base): raise Problem('无效路径',403)
@@ -859,7 +1277,7 @@ def seed_demo(db):
     for product,lines in [('p1',[('m1',1),('m2',1),('m3',1),('m4',1),('m5',1),('m6',4),('m7',1),('m8',12)]),('p2',[('m1',1),('m4',1),('m5',1),('m6',4)]),('p3',[('m4',1),('m7',1)]),('p4',[('m7',1),('m8',12),('m5',1)])]:
         for part,qty in lines: db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?)',(uid(),'v'+product,part,qty,'',''))
     for part,qty in [('m1',24),('m2',36),('m3',8),('m4',18),('m5',120),('m6',350),('m7',45),('m8',1500)]: record_movement(db,{'type':'入库','part_id':part,'qty':qty,'reason':'示例期初入库'})
-    db.execute('INSERT INTO purchases VALUES(?,?,?,?,?,?)',('po1','PO-DEMO-001','s1',datetime.now().strftime('%Y-%m-%d'),'示例采购单',now()))
+    db.execute('INSERT INTO purchases(id,code,supplier_id,date,notes,created_at) VALUES(?,?,?,?,?,?)',('po1','PO-DEMO-001','s1',datetime.now().strftime('%Y-%m-%d'),'示例采购单',now()))
     db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',('pl1','po1','m4',50,12.8,0))
     db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',('pl2','po1','m5',100,1.25,0))
     record_movement(db,{'type':'入库','part_id':'m4','qty':10,'purchase_line_id':'pl1','reason':'示例采购分批到货'})
@@ -867,8 +1285,22 @@ def seed_demo(db):
     link_material(db,'m3','m7',1);link_material(db,'m3','m8',12)
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser(); parser.add_argument('--host',default=os.environ.get('PLM_HOST','127.0.0.1')); parser.add_argument('--port',type=int,default=int(os.environ.get('PLM_PORT','8787'))); args=parser.parse_args()
-    init_db(); server=ThreadingHTTPServer((args.host,args.port),Handler)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--host', default=os.environ.get('PLM_HOST', '127.0.0.1'))
+    parser.add_argument('--port', type=int, default=int(os.environ.get('PLM_PORT', '8787')))
+    parser.add_argument('--bootstrap-admin', nargs=2, metavar=('NAME', 'EMAIL'),
+                        help='初始化管理员，从标准输入读取临时密码')
+    args = parser.parse_args()
+    if args.bootstrap_admin:
+        name, email = args.bootstrap_admin
+        try:
+            init_db(bootstrap={'name': name, 'email': email, 'password': sys.stdin.readline().rstrip('\r\n')})
+        except Problem as exc:
+            raise SystemExit(exc.message)
+        print('管理员已初始化，首次登录须修改密码。')
+        raise SystemExit(0)
+    init_db()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f'捷程未来PLM  http://{args.host}:{args.port}  数据目录：{DATA}',flush=True)
     stop_cleanup = threading.Event()
     threading.Thread(target=run_image_cleanup, args=(stop_cleanup,), daemon=True).start()

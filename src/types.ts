@@ -1,4 +1,5 @@
 export type Product = {
+  manager_id: string | null;
   english_code: string;
   id: string;
   code: string;
@@ -9,6 +10,7 @@ export type Product = {
   updated_at: string;
 };
 export type Part = {
+  custodian_id: string | null;
   external_code: string;
   brand: string;
   material_serial: number;
@@ -53,6 +55,7 @@ export type BomLine = {
   notes: string;
 };
 export type Purchase = {
+  responsible_id: string | null;
   id: string;
   code: string;
   supplier_id: string;
@@ -69,6 +72,7 @@ export type PurchaseLine = {
   received: number;
 };
 export type Movement = {
+  handler_id: string | null;
   id: string;
   code: string;
   type: string;
@@ -108,7 +112,24 @@ export type MaterialLink = {
   created_at: string;
 };
 export type CodeAlias = { code: string; part_id: string };
+export type UserOption = { id: string; name: string };
+export type User = UserOption & {
+  email: string;
+  role: "admin" | "member";
+  phone: string;
+  must_change: number;
+  has_avatar: number;
+};
+export type Activity = {
+  id: number;
+  actor_name: string;
+  action: string;
+  subject: string;
+  detail: string;
+  created_at: string;
+};
 export type State = {
+  users: UserOption[];
   material_links: MaterialLink[];
   material_code_aliases: CodeAlias[];
   products: Product[];
@@ -123,6 +144,7 @@ export type State = {
   quotes: Quote[];
 };
 export const emptyState: State = {
+  users: [],
   material_links: [],
   material_code_aliases: [],
   products: [],

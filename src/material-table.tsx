@@ -15,6 +15,7 @@ const fields = {
   price: ["单价", 92],
   subtotal: ["小计", 100],
   stock: ["库存", 82],
+  custodian: ["物料管理员", 126],
   min_stock: ["最低库存", 96],
   location: ["库位", 100],
   reference: ["位号", 108],

@@ -10,7 +10,7 @@ Python 3.10+ 标准库服务，SQLite 数据库，本地图片和附件存储。
 ./start.sh
 ```
 
-打开 http://127.0.0.1:8787，首次设置管理员密码。
+打开 http://127.0.0.1:8787，首次填写管理员用户名、邮箱和密码。
 
 局域网：
 
@@ -71,14 +71,14 @@ python3 -m unittest discover -s tests -v
 python3 scripts/package-release.py
 ```
 
-部署包生成在上级 `releases/jiecheng-plm-1.4.3.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
+部署包生成在上级 `releases/jiecheng-plm-1.5.0.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
 
 ## 部署到服务器
 
 将部署包上传并解压到空目录：
 
 ```sh
-tar -xzf jiecheng-plm-1.4.3.tar.gz
+tar -xzf jiecheng-plm-1.5.0.tar.gz
 cd jiecheng-plm
 ./start.sh --host 127.0.0.1 --port 8787
 ```
@@ -99,7 +99,13 @@ sudo systemctl enable --now jiecheng-plm
 
 将 `deploy/nginx.conf` 的 `location /` 合并到现有 HTTPS 域名配置，代理至 `http://127.0.0.1:8787`。保留 `Host $http_host`，上传限制设为 `20m`。示例 systemd 服务开启安全 Cookie，HTTP 内网使用时将 `PLM_SECURE_COOKIE` 改为 `0`。
 
-首次管理员密码设置应在开放服务器访问前完成。可通过 SSH 转发本地访问：`ssh -L 8787:127.0.0.1:8787 user@server`。开启安全 Cookie 的服务需通过正式 HTTPS 域名登录。
+开放服务器访问前，可在终端初始化管理员。命令从标准输入读取临时密码，账户首次登录需更改密码。
+
+```sh
+python3 server/app.py --bootstrap-admin '管理员姓名' admin@example.com
+```
+
+部署到 `/JPLM/` 时使用 `deploy/nginx-jplm.conf`，并设置 `PLM_BASE_PATH=/JPLM`、`PLM_SECURE_COOKIE=1` 和 `PLM_DISABLE_SETUP=1`。
 
 ### 配置
 
@@ -109,6 +115,8 @@ sudo systemctl enable --now jiecheng-plm
 | `PLM_PORT` | `8787` | 监听端口 |
 | `PLM_DATA_DIR` | 程序目录下 `data` | 数据库与附件目录 |
 | `PLM_SECURE_COOKIE` | `0` | HTTPS 设置为 `1` |
+| `PLM_BASE_PATH` | 空 | 部署路径前缀，例如 `/JPLM` |
+| `PLM_DISABLE_SETUP` | `0` | 已通过终端初始化时设为 `1`，关闭网页创建管理员 |
 | `PLM_QUIET` | `0` | `1` 关闭访问日志 |
 
 `--host`、`--port` 优先于对应环境变量。
@@ -127,18 +135,20 @@ sudo systemctl enable --now jiecheng-plm
 
 若原部署已使用 `/opt/yanwu`、`/var/lib/yanwu` 或旧服务名，可继续沿用，**不要为了重命名另建空数据目录**。在现有服务工作目录替换程序文件即可。
 
-恢复时先停止服务，保留旧数据目录，将备份 ZIP 的 `plm.sqlite3` 和 `uploads/` 解压到新的空数据目录根部，修正属主后启动。不要保留旧的 `plm.sqlite3-wal` 或 `plm.sqlite3-shm`。备份含密码哈希和会话，须私下保管。
+1.5 将原管理员迁移为邮箱账户，原密码可继续使用。迁移前可设置 `PLM_ADMIN_EMAIL` 和 `PLM_ADMIN_NAME`；默认邮箱为 `admin@localhost`。已有业务记录的责任人可在详情补填，历史库存流水保留原样。
+
+管理员可在「设置与数据 → 备份与恢复」下载完整 ZIP，或上传不超过 1 GB 的数据库版本 6、7 备份。恢复覆盖当前数据，旧会话失效。版本 6 备份保留当前账户，版本 7 会还原备份中的账户。覆盖前的 ZIP 保存在数据目录的 `before-restore.zip`。备份含用户资料和密码哈希，需私下保管。
 
 忘记密码时，由服务器管理员停止服务后执行：
 
 ```sh
-python3 scripts/admin.py reset-password --data-dir /var/lib/jiecheng-plm
+python3 scripts/admin.py reset-password --email admin@example.com --data-dir /var/lib/jiecheng-plm
 ```
 
 通过隐藏提示输入新密码。已有会话将失效。程序启动时和运行期间每 24 小时检查一次，清理上传目录中超过 7 天且无记录引用的图片。`cleanup-files` 子命令可在停止服务后手动清理无引用的遗留文件。
 
 ## 范围与约束
 
-单工作空间、单管理员密码。采购单当前不支持取消、改单或供应商退货。已有业务记录的物料不能删除，库存流水不能直接修改或删除。
+单工作空间，管理员可创建成员并重置密码。成员可修改自己的手机号、头像和密码。产品经理、物料管理员、采购负责人和库存经办人分别记录。采购单当前支持修改负责人。已有业务记录的物料不能删除，库存流水不能直接修改或删除。
 
 图片支持 PNG、JPG、JPEG、WebP、GIF、BMP，其他附件下载到本地查看。单次最多 12 个文件、总计 20 MB。数量最多 6 位小数，价格用于研发成本估算。手机摄像头及实体扫码枪需在实际设备与 HTTPS 环境验收。

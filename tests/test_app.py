@@ -19,7 +19,7 @@ class IntegrationTests(unittest.TestCase):
     def setUp(self):
         with app.transaction() as db:
             for t in reversed(app.TABLES): db.execute('DELETE FROM '+t)
-            db.execute('DELETE FROM sessions');db.execute('DELETE FROM settings');db.execute('DELETE FROM import_runs')
+            db.execute('DELETE FROM sessions');db.execute('DELETE FROM activity');db.execute('DELETE FROM users');db.execute('DELETE FROM settings');db.execute('DELETE FROM import_runs')
         app.Handler.attempts.clear();self.cookie=''
         self.request('auth/setup','POST',{'password':'test-password-1234'})
         self.part=self.request('parts','POST',{'name':'测试物料','category':'电子物料','price':1.5,'unit':'个','min_stock':2})['id']
@@ -82,6 +82,57 @@ class IntegrationTests(unittest.TestCase):
         self.assertIsNone(next(q for q in self.state()['quotes'] if q['id'] == existing)['price'])
         self.request('quotes/' + unpriced, 'DELETE', {})
         self.assertEqual(len(self.state()['quotes']), 2)
+
+    def test_accounts_record_responsibility_and_reject_privilege_escalation(self):
+        admin_cookie = self.cookie
+        account = {'name': '经办测试', 'email': 'operator@example.test', 'password': 'temporary-1234'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('users', 'POST', {**account, 'email': 'OPERATOR@example.test'}, 409)
+        self.request('auth/login', 'POST', account)
+        self.request('state', status=403)
+        self.request('account/password', 'POST', {'current_password': account['password'], 'password': 'replacement-1234'})
+        member_cookie = self.cookie
+        self.request('users', 'POST', {**account, 'email': 'other@example.test'}, 403)
+        self.request('account/profile', 'PUT', {'email': 'modified@example.test'}, 403)
+        self.request('account/profile', 'PUT', {'phone': '13500000000'})
+        user = self.request('auth/status')['user']
+        self.assertEqual(user['email'], account['email'])
+        self.assertEqual(user['phone'], '13500000000')
+        self.assertNotIn('password', user)
+        product = self.request('products', 'POST', {'name': '责任人测试', 'manager_id': member})['id']
+        self.request('parts/' + self.part, 'PUT', {'custodian_id': member})
+        admin = next(row['id'] for row in self.state()['users'] if row['id'] != member)
+        self.move('入库', 2, handler_id=admin)
+        stock = self.state()
+        self.assertEqual(stock['products'][0]['manager_id'], member)
+        self.assertEqual(stock['parts'][0]['custodian_id'], member)
+        self.assertEqual(stock['movements'][0]['handler_id'], admin)
+        activity = self.request('activity?part=' + self.part)['items']
+        self.assertEqual(activity[0]['action'], '入库')
+        self.assertEqual(activity[0]['actor_name'], account['name'])
+        self.assertIn('经办人 管理员', activity[0]['detail'])
+        self.request('backup', status=403)
+        self.cookie = admin_cookie
+        self.request('reset-password/' + member, 'POST', {'password': 'another-temporary-1234'})
+        self.cookie = member_cookie
+        self.request('state', status=401)
+
+    def test_zip_restore_validates_and_restores_attachments_and_revokes_sessions(self):
+        fid = self.upload('test.txt', b'backup contents')['ids'][0]
+        archive = self.request('backup', raw=True)
+        self.request('parts', 'POST', {'name': '恢复后消失'})
+        headers = {'Content-Type': 'application/zip', 'X-PLM-Restore': 'replace'}
+        self.request('restore', 'POST', b'invalid zip', 400, headers)
+        self.assertEqual(len(self.state()['parts']), 2)
+        self.request('restore', 'POST', archive, 200, headers)
+        self.request('state', status=401)
+        self.request('auth/login', 'POST', {'email': 'admin@localhost', 'password': 'test-password-1234'})
+        self.assertEqual(len(self.state()['parts']), 1)
+        restored = self.state()['files'][0]['id']
+        self.assertEqual((app.DATA / 'uploads' / restored).read_bytes(), b'backup contents')
+        self.assertFalse((app.DATA / 'uploads' / fid).exists())
+        self.assertTrue((app.DATA / 'before-restore.zip').is_file())
+        self.assertEqual(self.request('activity')['items'][0]['action'], '恢复备份')
 
     def test_purchase_creation_rolls_back(self):
         self.request('purchases','POST',{'supplier_id':self.supplier(),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
@@ -226,8 +277,8 @@ class IntegrationTests(unittest.TestCase):
         self.request('auth/setup','POST',{'password':'another-password'},409)
         self.request('auth/logout','POST',{})
         self.request('state',status=401)
-        self.request('auth/login','POST',{'password':'wrong'},401)
-        self.request('auth/login','POST',{'password':'test-password-1234'})
+        self.request('auth/login','POST',{'email':'admin@localhost','password':'wrong'},401)
+        self.request('auth/login','POST',{'email':'admin@localhost','password':'test-password-1234'})
         self.request('state')
     def test_existing_records_cannot_be_deleted(self):
         self.move('入库',1);self.request('parts/'+self.part,'DELETE',{},400)
@@ -265,7 +316,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertTrue(all(p['sub_product_id'] is None for p in materials.values()))
                     self.assertEqual(materials['screw']['stock'],5)
                     self.assertEqual(db.execute("SELECT qty FROM bom_lines WHERE id='legacy-line'").fetchone()[0],4)
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],6)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],7)
                     self.assertTrue(all(len(p['code'])==8 and p['code'][:2].isalpha() and p['code'][2:].isdigit() for p in materials.values()))
                     self.assertEqual(db.execute("SELECT part_id FROM material_code_aliases WHERE code='screw'").fetchone()[0],'screw')
             finally: app.DATA=previous

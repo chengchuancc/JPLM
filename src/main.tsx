@@ -62,6 +62,9 @@ import {
   Purchase,
   Movement,
   FileRecord,
+  User,
+  UserOption,
+  Activity,
 } from "./types";
 import {
   MaterialTable,
@@ -88,8 +91,10 @@ const date = (s: string) =>
   });
 const datetime = (s: string) =>
   new Date(s).toLocaleString("zh-CN", { hour12: false });
+const appBase = new URL(".", document.baseURI).pathname;
+const fileUrl = (id: string) => appBase + "files/" + encodeURIComponent(id);
 async function api(path: string, method = "GET", data?: unknown) {
-  const r = await fetch("/api/" + path, {
+  const r = await fetch(appBase + "api/" + path, {
     method,
     headers:
       data instanceof FormData ? {} : { "Content-Type": "application/json" },
@@ -327,7 +332,7 @@ function EntityForm({
   fields: Field[];
   initial?: any;
   submit: (d: any) => Promise<void>;
-  onCancel: () => void;
+  onCancel?: () => void;
   label?: string;
   images?: {
     upload: (files: File[]) => Promise<void>;
@@ -449,9 +454,11 @@ function EntityForm({
         </div>
       )}
       <div className="dialog-actions">
-        <Button type="button" onClick={onCancel}>
-          取消
-        </Button>
+        {onCancel && (
+          <Button type="button" onClick={onCancel}>
+            取消
+          </Button>
+        )}
         <Button primary disabled={busy} type="submit">
           {busy ? <Loader2 size={16} className="spin" /> : <Check size={16} />}{" "}
           {label}
@@ -463,9 +470,11 @@ function EntityForm({
 function Login({
   initialized,
   onLogin,
+  restored = false,
 }: {
   initialized: boolean;
   onLogin: () => void;
+  restored?: boolean;
 }) {
   return (
     <div className="login-page compact-login">
@@ -476,9 +485,20 @@ function Login({
           </div>
           <strong>捷程未来PLM</strong>
         </div>
-        <h2>{initialized ? "登录" : "设置管理员密码"}</h2>
+        <h2>{initialized ? "登录" : "创建管理员"}</h2>
+        {restored && <p className="muted">已恢复数据，请重新登录。</p>}
         <EntityForm
           fields={[
+            ...(!initialized
+              ? [{ name: "name", label: "用户名", required: true, wide: true }]
+              : []),
+            {
+              name: "email",
+              label: "邮箱",
+              type: "email",
+              required: true,
+              wide: true,
+            },
             {
               name: "password",
               label: "密码",
@@ -492,19 +512,499 @@ function Login({
             await api("auth/" + (initialized ? "login" : "setup"), "POST", d);
             onLogin();
           }}
-          onCancel={() => {}}
           label={initialized ? "登录" : "保存"}
         />
       </div>
     </div>
   );
 }
+function Avatar({
+  user,
+  version,
+  small = false,
+}: {
+  user?: User | null;
+  version: number;
+  small?: boolean;
+}) {
+  return (
+    <span className={"user-avatar" + (small ? " small-avatar" : "")}>
+      {user?.has_avatar ? (
+        <img
+          src={appBase + "api/avatars/" + user.id + "?v=" + version}
+          alt=""
+        />
+      ) : (
+        user?.name.slice(0, 1) || "人"
+      )}
+    </span>
+  );
+}
+
+function PersonSelect({
+  users,
+  label,
+  value,
+  onChange,
+}: {
+  users: UserOption[];
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label>
+      {label} *
+      <select
+        required
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+      >
+        <option value="">请选择</option>
+        {users.map((user) => (
+          <option key={user.id} value={user.id}>
+            {user.name}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function PasswordForm({ onSaved }: { onSaved: () => Promise<void> }) {
+  return (
+    <EntityForm
+      fields={[
+        {
+          name: "current_password",
+          label: "当前密码",
+          type: "password",
+          required: true,
+          wide: true,
+        },
+        {
+          name: "password",
+          label: "新密码",
+          type: "password",
+          placeholder: "至少 10 个字符",
+          required: true,
+          wide: true,
+        },
+        {
+          name: "confirm",
+          label: "确认新密码",
+          type: "password",
+          required: true,
+          wide: true,
+        },
+      ]}
+      submit={async (data) => {
+        if (data.password !== data.confirm) throw Error("两次输入的密码不一致");
+        await api("account/password", "POST", {
+          current_password: data.current_password,
+          password: data.password,
+        });
+        await onSaved();
+      }}
+    />
+  );
+}
+
+function ProfilePanel({
+  user,
+  version,
+  onSaved,
+}: {
+  user: User;
+  version: number;
+  onSaved: () => Promise<void>;
+}) {
+  const [error, setError] = useState("");
+  const [uploading, setUploading] = useState(false);
+  return (
+    <div className="settings-grid">
+      <section className="panel">
+        <div className="panel-heading">
+          <h3>个人资料</h3>
+        </div>
+        <div className="profile-identity">
+          <Avatar user={user} version={version} />
+          <div>
+            <strong>{user.name}</strong>
+            <small>{user.email}</small>
+          </div>
+          <label className="btn small">
+            更换头像
+            <input
+              hidden
+              type="file"
+              accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
+              disabled={uploading}
+              onChange={async (event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (!file) return;
+                setError("");
+                setUploading(true);
+                try {
+                  const form = new FormData();
+                  form.append("file", file);
+                  await api("account/avatar", "POST", form);
+                  await onSaved();
+                } catch (error) {
+                  setError((error as Error).message);
+                } finally {
+                  setUploading(false);
+                }
+              }}
+            />
+          </label>
+        </div>
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
+        <EntityForm
+          initial={{ phone: user.phone }}
+          fields={[{ name: "phone", label: "手机号", type: "tel", wide: true }]}
+          submit={async (data) => {
+            await api("account/profile", "PUT", data);
+            await onSaved();
+          }}
+        />
+      </section>
+      <section className="panel">
+        <div className="panel-heading">
+          <h3>修改密码</h3>
+        </div>
+        <PasswordForm key={version} onSaved={onSaved} />
+      </section>
+    </div>
+  );
+}
+
+function UserAdmin({
+  actorId,
+  onChange,
+}: {
+  actorId: string;
+  onChange: () => Promise<unknown>;
+}) {
+  const [users, setUsers] = useState<User[]>([]);
+  const [editor, setEditor] = useState<{ user?: User; reset?: boolean } | null>(
+    null,
+  );
+  const [error, setError] = useState("");
+  async function loadUsers() {
+    try {
+      setUsers(await api("users"));
+      setError("");
+    } catch (error) {
+      setError((error as Error).message);
+    }
+  }
+  useEffect(() => {
+    void loadUsers();
+  }, []);
+  return (
+    <>
+      <div className="section-toolbar">
+        <h3>用户管理</h3>
+        <Button small primary onClick={() => setEditor({})}>
+          <Plus size={15} />
+          新增用户
+        </Button>
+      </div>
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>用户名</th>
+              <th>邮箱</th>
+              <th>手机号</th>
+              <th>权限</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {users.map((user) => (
+              <tr key={user.id}>
+                <td>{user.name}</td>
+                <td>{user.email}</td>
+                <td>{user.phone || "—"}</td>
+                <td>{user.role === "admin" ? "管理员" : "成员"}</td>
+                <td>
+                  <div className="row-actions">
+                    <Button small onClick={() => setEditor({ user })}>
+                      编辑
+                    </Button>
+                    {user.id !== actorId && (
+                      <Button
+                        small
+                        onClick={() => setEditor({ user, reset: true })}
+                      >
+                        重置密码
+                      </Button>
+                    )}
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {editor && (
+        <Dialog
+          title={
+            editor.reset
+              ? "重置密码 · " + editor.user?.name
+              : editor.user
+                ? "编辑用户"
+                : "新增用户"
+          }
+          onClose={() => setEditor(null)}
+        >
+          <EntityForm
+            initial={
+              editor.user
+                ? { name: editor.user.name, email: editor.user.email }
+                : {}
+            }
+            fields={[
+              ...(!editor.reset
+                ? [
+                    {
+                      name: "name",
+                      label: "用户名",
+                      required: true,
+                      wide: true,
+                    },
+                    {
+                      name: "email",
+                      label: "邮箱",
+                      type: "email",
+                      required: true,
+                      wide: true,
+                    },
+                  ]
+                : []),
+              ...(!editor.user || editor.reset
+                ? [
+                    {
+                      name: "password",
+                      label: "临时密码",
+                      type: "password",
+                      placeholder: "至少 10 个字符",
+                      required: true,
+                      wide: true,
+                    },
+                  ]
+                : []),
+            ]}
+            onCancel={() => setEditor(null)}
+            submit={async (data) => {
+              if (editor.reset)
+                await api("reset-password/" + editor.user!.id, "POST", {
+                  password: data.password,
+                });
+              else if (editor.user)
+                await api("users/" + editor.user.id, "PUT", data);
+              else await api("users", "POST", data);
+              setEditor(null);
+              await Promise.all([loadUsers(), onChange()]);
+            }}
+          />
+        </Dialog>
+      )}
+    </>
+  );
+}
+
+function ActivityPanel({ part }: { part?: string }) {
+  const [items, setItems] = useState<Activity[]>([]);
+  const [more, setMore] = useState(false);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  async function loadActivity(before = 0) {
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api(
+        "activity?" +
+          new URLSearchParams({ before: String(before), part: part || "" }),
+      );
+      setItems((previous) =>
+        before ? [...previous, ...result.items] : result.items,
+      );
+      setMore(result.more);
+    } catch (error) {
+      setError((error as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  useEffect(() => {
+    void loadActivity();
+  }, [part]);
+  return (
+    <>
+      <div className="section-toolbar">
+        <h3>操作日志</h3>
+        <Button small disabled={busy} onClick={() => loadActivity()}>
+          <RefreshCw size={14} />
+          刷新
+        </Button>
+      </div>
+      {error && (
+        <p className="form-error" role="alert">
+          {error}
+        </p>
+      )}
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>操作人</th>
+              <th>操作</th>
+              <th>记录</th>
+              <th>详情</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((item) => (
+              <tr key={item.id}>
+                <td className="nowrap">{datetime(item.created_at)}</td>
+                <td>{item.actor_name}</td>
+                <td>{item.action}</td>
+                <td>{item.subject}</td>
+                <td>{item.detail || "—"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!busy && !items.length && <Empty title="暂无操作日志" />}
+      </div>
+      {more && (
+        <Button
+          small
+          disabled={busy}
+          onClick={() => loadActivity(items.at(-1)?.id)}
+        >
+          加载更多
+        </Button>
+      )}
+    </>
+  );
+}
+
+function BackupPanel({ onRestored }: { onRestored: () => void }) {
+  const [file, setFile] = useState<File | null>(null);
+  const [confirmed, setConfirmed] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  return (
+    <section className="panel">
+      <div className="panel-heading">
+        <h3>备份与恢复</h3>
+        <Download size={18} />
+      </div>
+      <a className="btn primary" href={appBase + "api/backup"} download>
+        <Download size={15} />
+        下载 ZIP 备份
+      </a>
+      <form
+        className="backup-restore-form"
+        onSubmit={async (event) => {
+          event.preventDefault();
+          if (!file || !confirmed || busy) return;
+          setBusy(true);
+          setError("");
+          try {
+            const response = await fetch(appBase + "api/restore", {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/zip",
+                "X-PLM-Restore": "replace",
+              },
+              body: file,
+            });
+            if (!response.ok) {
+              const result = await response.json().catch(() => ({}));
+              throw Error(
+                result.error ||
+                  (response.status === 413 ? "备份超过 1 GB" : "恢复失败"),
+              );
+            }
+            onRestored();
+          } catch (error) {
+            setError((error as Error).message);
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <label className="form-label">
+          恢复 ZIP 备份
+          <input
+            type="file"
+            accept=".zip,application/zip"
+            disabled={busy}
+            required
+            onChange={(event) => {
+              setFile(event.target.files?.[0] || null);
+              setConfirmed(false);
+              setError("");
+            }}
+          />
+        </label>
+        {file && (
+          <label className="restore-confirm">
+            <input
+              type="checkbox"
+              checked={confirmed}
+              disabled={busy}
+              required
+              onChange={(event) => setConfirmed(event.target.checked)}
+            />
+            用备份覆盖当前数据，恢复后重新登录
+          </label>
+        )}
+        {error && (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        )}
+        <Button type="submit" disabled={!file || !confirmed || busy}>
+          {busy ? "正在恢复…" : "恢复备份"}
+        </Button>
+      </form>
+    </section>
+  );
+}
 function App() {
   const [auth, setAuth] = useState<{
     initialized: boolean;
     authenticated: boolean;
+    user: User | null;
   } | null>(null);
   const [state, setState] = useState<State>(emptyState);
+  const currentUser = auth?.user;
+  const [avatarVersion, setAvatarVersion] = useState(0);
+  const [restored, setRestored] = useState(false);
+  const [accountView, setAccountView] = useState("profile");
+  const userOptions = state.users.map(({ id, name }) => ({
+    value: id,
+    label: name,
+  }));
+  const userName = (id: string | null) =>
+    state.users.find((user) => user.id === id)?.name || "—";
   const [loading, setLoading] = useState(true);
   const [fatal, setFatal] = useState("");
   const [view, setView] = useState("products");
@@ -558,7 +1058,7 @@ function App() {
     try {
       const a = await api("auth/status");
       setAuth(a);
-      if (a.authenticated) await refresh();
+      if (a.authenticated && !a.user?.must_change) await refresh();
     } catch (e) {
       setFatal((e as Error).message);
     } finally {
@@ -591,7 +1091,7 @@ function App() {
     return () => window.removeEventListener("plm-session-expired", expire);
   }, []);
   useEffect(() => {
-    if (!auth?.authenticated) return;
+    if (!auth?.authenticated || auth.user?.must_change) return;
     const sync = () => {
       if (document.visibilityState === "visible")
         refresh().catch((e) => setFatal(e.message));
@@ -604,7 +1104,7 @@ function App() {
       window.removeEventListener("focus", sync);
       document.removeEventListener("visibilitychange", sync);
     };
-  }, [auth?.authenticated]);
+  }, [auth?.authenticated, auth?.user?.must_change]);
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 4000);
@@ -654,7 +1154,7 @@ function App() {
       >
         {f ? (
           <img
-            src={"/files/" + f.id}
+            src={fileUrl(f.id)}
             alt={owner === "parts" ? p?.name : findProduct(id)?.name}
           />
         ) : owner === "parts" ? (
@@ -866,6 +1366,7 @@ function App() {
       ),
       price: materialCell(p, "price", "单价"),
       stock: amount(p.stock),
+      custodian: userName(p.custodian_id),
       children:
         p.material_level === 1 ? (
           <button
@@ -952,6 +1453,7 @@ function App() {
     "unit",
     "price",
     "stock",
+    "custodian",
     "min_stock",
     "location",
     "notes",
@@ -1036,6 +1538,7 @@ function App() {
         label: x,
       })),
     },
+    { name: "manager_id", label: "产品经理", options: userOptions, wide: true },
     { name: "description", label: "备注", type: "textarea", wide: true },
   ];
   const partFields: Field[] = [
@@ -1061,6 +1564,12 @@ function App() {
         value: p.id,
         label: p.name + (p.english_code ? " · " + p.english_code : ""),
       })),
+      wide: true,
+    },
+    {
+      name: "custodian_id",
+      label: "物料管理员",
+      options: userOptions,
       wide: true,
     },
     { name: "external_code", label: "外部料号" },
@@ -1104,6 +1613,7 @@ function App() {
               <th className="num">数量</th>
               <th className="num">结存</th>
               <th>关联记录</th>
+              <th>经办人</th>
               <th>用途 / 原因</th>
               <th>时间</th>
             </tr>
@@ -1161,6 +1671,7 @@ function App() {
                         </small>
                       )}
                     </td>
+                    <td>{userName(m.handler_id)}</td>
                     <td>{m.reason || "—"}</td>
                     <td className="muted nowrap">{datetime(m.created_at)}</td>
                   </tr>
@@ -1175,7 +1686,13 @@ function App() {
   function startInventory(type: string, p?: Part, extra?: any) {
     setModal({
       kind: "movement",
-      item: { type, part_id: p?.id || "", qty: "", ...extra },
+      item: {
+        type,
+        part_id: p?.id || "",
+        qty: "",
+        handler_id: currentUser?.id,
+        ...extra,
+      },
     });
   }
   function exportBom() {
@@ -1217,7 +1734,30 @@ function App() {
       </div>
     );
   if (!auth?.authenticated)
-    return <Login initialized={auth?.initialized || false} onLogin={load} />;
+    return (
+      <Login
+        initialized={auth?.initialized || false}
+        onLogin={load}
+        restored={restored}
+      />
+    );
+  if (currentUser?.must_change)
+    return (
+      <div className="login-page compact-login">
+        <div className="login-card">
+          <h2>修改初始密码</h2>
+          <PasswordForm onSaved={load} />
+          <Button
+            onClick={async () => {
+              await api("auth/logout", "POST");
+              await load();
+            }}
+          >
+            退出登录
+          </Button>
+        </div>
+      </div>
+    );
   return (
     <div className="app-shell">
       <aside className={`sidebar ${mobile ? "mobile-open" : ""}`}>
@@ -1257,10 +1797,18 @@ function App() {
             设置与数据
           </button>
           <div className="user-row">
-            <span className="user-avatar">管</span>
+            <Avatar user={currentUser} version={avatarVersion} />
             <div>
-              <strong>管理员</strong>
-              <span>研发工作空间</span>
+              <button
+                className="text-link"
+                onClick={() => {
+                  setAccountView("profile");
+                  go("settings");
+                }}
+              >
+                <strong>{currentUser?.name}</strong>
+              </button>
+              <span>{currentUser?.role === "admin" ? "管理员" : "成员"}</span>
             </div>
             <button
               className="icon-btn"
@@ -1313,7 +1861,15 @@ function App() {
               })}
             </span>
             <span className="topbar-separator" />
-            <span className="user-avatar small-avatar">管</span>
+            <button
+              aria-label="个人资料"
+              onClick={() => {
+                setAccountView("profile");
+                go("settings");
+              }}
+            >
+              <Avatar user={currentUser} version={avatarVersion} small />
+            </button>
           </div>
         </header>
         <main>
@@ -1502,7 +2058,10 @@ function App() {
                             {p.name}
                             <ArrowUpRight size={18} />
                           </button>
-                          <p>{p.description}</p>
+                          {p.manager_id && (
+                            <p>产品经理：{userName(p.manager_id)}</p>
+                          )}
+                          {p.description && <p>{p.description}</p>}
                           <div className="card-details">
                             <div>
                               <span>BOM 版本</span>
@@ -1573,6 +2132,7 @@ function App() {
                     <span>·</span>
                     {product.description}
                   </p>
+                  <p>产品经理：{userName(product.manager_id)}</p>
                 </div>
                 <Button
                   onClick={() => setModal({ kind: "product", item: product })}
@@ -2061,6 +2621,7 @@ function App() {
                   ["boms", "关联 BOM"],
                   ["purchases", "采购记录"],
                   ["history", "库存流水"],
+                  ["activity", "操作日志"],
                 ].map(([id, name]) => (
                   <button
                     key={id}
@@ -2279,6 +2840,8 @@ function App() {
                         {findProduct(part.numbering_product_id || "")?.name ||
                           "通用物料"}
                       </dd>
+                      <dt>物料管理员</dt>
+                      <dd>{userName(part.custodian_id)}</dd>
                       <dt>物料名称</dt>
                       <dd>{part.name}</dd>
                       <dt>外部料号</dt>
@@ -2444,6 +3007,9 @@ function App() {
                     <Empty text="该物料暂无采购记录。" />
                   )}
                 </div>
+              )}
+              {tab === "activity" && (
+                <ActivityPanel key={part.id} part={part.id} />
               )}
               {tab === "history" &&
                 movementTable(
@@ -2761,7 +3327,9 @@ function App() {
                               </td>
                               <td>
                                 <Badge>{costStatus(p)}</Badge>
-                                <small>{p.date}</small>
+                                <small>
+                                  {p.date} · {userName(p.responsible_id)}
+                                </small>
                               </td>
                             </tr>
                             {lines.map((l) => {
@@ -2854,6 +3422,14 @@ function App() {
                     {purchase.notes || "无备注"}
                   </p>
                 </div>
+                <Button
+                  onClick={() =>
+                    setModal({ kind: "purchase-owner", item: purchase })
+                  }
+                >
+                  <Pencil size={15} />
+                  负责人：{userName(purchase.responsible_id)}
+                </Button>
                 <Button
                   onClick={() =>
                     exportCSV(
@@ -3042,45 +3618,82 @@ function App() {
                   <h1>设置与数据</h1>
                 </div>
               </div>
-              <div className="settings-grid">
-                <section className="panel">
-                  <div className="panel-heading">
-                    <h3>数据备份</h3>
-                    <Download size={20} />
-                  </div>
-                  <p className="muted">
-                    下载包含 SQLite 数据库、产品与物料图片、附件的完整 ZIP
-                    备份。备份包含管理员登录凭据，请妥善保管。
-                  </p>
-                  <a className="btn primary" href="/api/backup" download>
-                    <Download size={16} />
-                    下载完整备份
-                  </a>
-                </section>
-                <section className="panel">
-                  <div className="panel-heading">
-                    <h3>示例工作空间</h3>
-                    <Boxes size={20} />
-                  </div>
-                  <p className="muted">
-                    载入一组明确标注的产品、BOM
-                    和采购库存示例，用于体验完整流程。仅支持空数据库。
-                  </p>
-                  <Button
-                    disabled={
-                      !!(
-                        state.products.length ||
-                        state.parts.length ||
-                        state.suppliers.length
-                      )
-                    }
-                    onClick={() => setModal({ kind: "demo" })}
+              <div className="tabs page-tabs">
+                {[
+                  ["profile", "个人资料"],
+                  ["activity", "操作日志"],
+                  ...(currentUser?.role === "admin"
+                    ? [
+                        ["users", "用户管理"],
+                        ["backup", "备份与恢复"],
+                      ]
+                    : []),
+                ].map(([id, label]) => (
+                  <button
+                    key={id}
+                    className={accountView === id ? "selected" : ""}
+                    onClick={() => setAccountView(id)}
                   >
-                    载入示例数据
-                    <ArrowUpRight size={16} />
-                  </Button>
-                </section>
+                    {label}
+                  </button>
+                ))}
               </div>
+              {accountView === "profile" && currentUser && (
+                <ProfilePanel
+                  user={currentUser}
+                  version={avatarVersion}
+                  onSaved={async () => {
+                    setAuth(await api("auth/status"));
+                    setAvatarVersion((version) => version + 1);
+                    notify("已保存");
+                  }}
+                />
+              )}
+              {accountView === "activity" && <ActivityPanel />}
+              {currentUser?.role === "admin" && accountView === "users" && (
+                <UserAdmin
+                  actorId={currentUser.id}
+                  onChange={async () => {
+                    await refresh();
+                    setAuth(await api("auth/status"));
+                  }}
+                />
+              )}
+              {currentUser?.role === "admin" && accountView === "backup" && (
+                <div className="settings-grid">
+                  <BackupPanel
+                    onRestored={() => {
+                      setState(emptyState);
+                      setRestored(true);
+                      setAccountView("profile");
+                      go("products");
+                      setAuth({
+                        initialized: true,
+                        authenticated: false,
+                        user: null,
+                      });
+                    }}
+                  />
+                  <section className="panel">
+                    <div className="panel-heading">
+                      <h3>示例数据</h3>
+                      <Boxes size={18} />
+                    </div>
+                    <Button
+                      disabled={
+                        !!(
+                          state.products.length ||
+                          state.parts.length ||
+                          state.suppliers.length
+                        )
+                      }
+                      onClick={() => setModal({ kind: "demo" })}
+                    >
+                      载入示例数据
+                    </Button>
+                  </section>
+                </div>
+              )}
             </>
           )}
           {detail &&
@@ -3462,10 +4075,31 @@ function App() {
               />
             </Dialog>
           )}
+          {modal.kind === "purchase-owner" && (
+            <Dialog title="修改采购负责人" onClose={() => setModal(null)}>
+              <EntityForm
+                initial={{ responsible_id: modal.item.responsible_id }}
+                fields={[
+                  {
+                    name: "responsible_id",
+                    label: "采购负责人",
+                    options: userOptions,
+                    required: true,
+                    wide: true,
+                  },
+                ]}
+                onCancel={() => setModal(null)}
+                submit={(data) =>
+                  mutate("purchases/" + modal.item.id, "PUT", data)
+                }
+              />
+            </Dialog>
+          )}
           {modal.kind === "purchase" && (
             <Dialog title="新建采购单" wide onClose={() => setModal(null)}>
               <PurchaseForm
                 state={state}
+                defaultOwner={currentUser?.id || ""}
                 onCancel={() => setModal(null)}
                 submit={(d) => mutate("purchases", "POST", d, "采购单已创建")}
               />
@@ -3537,12 +4171,12 @@ function App() {
           {modal.kind === "preview" && (
             <Dialog title={modal.item.name} wide onClose={() => setModal(null)}>
               <div className="image-preview">
-                <img src={"/files/" + modal.item.id} alt={modal.item.name} />
+                <img src={fileUrl(modal.item.id)} alt={modal.item.name} />
               </div>
               <div className="dialog-actions">
                 <a
                   className="btn"
-                  href={"/files/" + modal.item.id}
+                  href={fileUrl(modal.item.id)}
                   download={modal.item.name}
                 >
                   <Download size={15} />
@@ -3772,6 +4406,7 @@ function MovementForm({
   const [original, setOriginal] = useState(initial.original_id || "");
   const [qty, setQty] = useState(String(initial.qty || ""));
   const [product, setProduct] = useState(initial.product_id || "");
+  const [handler, setHandler] = useState(initial.handler_id || "");
   const [reason, setReason] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -3808,6 +4443,7 @@ function MovementForm({
             purchase_line_id: type === "入库" ? source : null,
             original_id: type === "退库" ? original : null,
             reason,
+            handler_id: handler,
           });
         } catch (e) {
           setError((e as Error).message);
@@ -3834,6 +4470,13 @@ function MovementForm({
         ))}
       </div>
       <div className="form-grid">
+        <PersonSelect
+          users={state.users}
+          label="经办人"
+          value={handler}
+          onChange={setHandler}
+        />
+
         <label className="wide-field">选择物料 *</label>
         <SearchPart
           parts={state.parts}
@@ -4007,13 +4650,16 @@ function SearchPart({
 }
 function PurchaseForm({
   state,
+  defaultOwner,
   submit,
   onCancel,
 }: {
   state: State;
+  defaultOwner: string;
   submit: (d: any) => Promise<void>;
   onCancel: () => void;
 }) {
+  const [owner, setOwner] = useState(defaultOwner);
   const [supplier, setSupplier] = useState("");
   const [date, setDate] = useState(
     new Date().getFullYear() +
@@ -4036,7 +4682,13 @@ function PurchaseForm({
         setError("");
         setBusy(true);
         try {
-          await submit({ supplier_id: supplier, date, notes, lines });
+          await submit({
+            supplier_id: supplier,
+            responsible_id: owner,
+            date,
+            notes,
+            lines,
+          });
         } catch (e) {
           setError((e as Error).message);
         } finally {
@@ -4045,6 +4697,13 @@ function PurchaseForm({
       }}
     >
       <div className="form-grid">
+        <PersonSelect
+          users={state.users}
+          label="采购负责人"
+          value={owner}
+          onChange={setOwner}
+        />
+
         <label>
           供应商 *
           <ChoiceSelect
@@ -4423,12 +5082,12 @@ function FileManager({
           <div className="file-card" key={f.id}>
             {f.kind === "image" ? (
               <button className="file-image" onClick={() => onPreview(f)}>
-                <img src={"/files/" + f.id} alt={f.name} />
+                <img src={fileUrl(f.id)} alt={f.name} />
               </button>
             ) : (
               <a
                 className="file-image attachment"
-                href={"/files/" + f.id}
+                href={fileUrl(f.id)}
                 download={f.name}
               >
                 <FileText size={38} />
@@ -4462,11 +5121,7 @@ function FileManager({
                     }}
                   />
                 </label>
-                <a
-                  className="text-link"
-                  href={"/files/" + f.id}
-                  download={f.name}
-                >
+                <a className="text-link" href={fileUrl(f.id)} download={f.name}>
                   <Download size={13} />
                 </a>
                 <button
@@ -4502,7 +5157,7 @@ function FileManager({
 function QRPanel({ part }: { part: Part }) {
   const [image, setImage] = useState("");
   const [error, setError] = useState("");
-  const url = location.origin + "/#parts/" + part.id;
+  const url = location.origin + appBase + "#parts/" + part.id;
   useEffect(() => {
     QRCode.toDataURL(url, {
       width: 600,
@@ -4876,7 +5531,7 @@ function MaterialPhoto({
           aria-label={"预览" + name + "图片"}
           onClick={() => preview(items[0])}
         >
-          <img src={"/files/" + items[0].id} alt={name} />
+          <img src={fileUrl(items[0].id)} alt={name} />
           {items.length > 1 && <span>{items.length}</span>}
         </button>
       ) : (

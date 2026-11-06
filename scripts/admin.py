@@ -1,24 +1,39 @@
 #!/usr/bin/env python3
-"""服务器本机管理工具。重置密码需要停止服务后由服务器管理员执行。"""
-import argparse, getpass, hashlib, json, os, secrets, sqlite3
+"""在服务器本机管理 JPLM 数据。手动清理前请停止服务。"""
+import argparse
+import getpass
+import os
+import sys
 from pathlib import Path
-ROOT=Path(__file__).resolve().parent.parent
-parser=argparse.ArgumentParser(description='捷程未来PLM 本机管理')
-parser.add_argument('command',choices=['reset-password','cleanup-files'])
-parser.add_argument('--data-dir',default=os.environ.get('PLM_DATA_DIR',str(ROOT/'data')))
-args=parser.parse_args();data=Path(args.data_dir).resolve()
-if not (data/'plm.sqlite3').is_file():raise SystemExit('数据库不存在，请核对 --data-dir')
-db=sqlite3.connect(data/'plm.sqlite3');db.execute('BEGIN IMMEDIATE')
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / 'server'))
+import app
+
+parser = argparse.ArgumentParser(description='捷程未来PLM 本机管理')
+parser.add_argument('command', choices=['reset-password', 'cleanup-files'])
+parser.add_argument('--email', help='要重置密码的账户邮箱')
+parser.add_argument('--data-dir', default=os.environ.get('PLM_DATA_DIR', str(ROOT / 'data')))
+args = parser.parse_args()
+app.DATA = Path(args.data_dir).resolve()
+if not (app.DATA / 'plm.sqlite3').is_file():
+    raise SystemExit('数据库不存在，请核对 --data-dir')
+if args.command == 'cleanup-files':
+    print(f'已清理 {app.cleanup_orphan_images()} 张超过保留期的无引用图片。')
+    raise SystemExit(0)
+if not args.email:
+    parser.error('重置密码需要 --email')
+password = getpass.getpass('临时密码（至少 10 个字符）：')
+if password != getpass.getpass('再次输入：'):
+    raise SystemExit('两次密码不一致')
 try:
-    if args.command=='reset-password':
-        a=getpass.getpass('新管理员密码（至少 10 个字符）：');b=getpass.getpass('再次输入：')
-        if a!=b or not 10<=len(a)<=256:raise SystemExit('两次密码不一致，或长度不符合要求')
-        salt=secrets.token_hex(16);hashed=hashlib.pbkdf2_hmac('sha256',a.encode(),bytes.fromhex(salt),310000).hex()
-        db.execute("INSERT INTO settings VALUES('password',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps({'salt':salt,'hash':hashed}),))
-        db.execute('DELETE FROM sessions');db.commit();print('密码已重置，已有会话已失效。')
-    else:
-        referenced={r[0] for r in db.execute('SELECT id FROM files')};removed=0
-        for file in (data/'uploads').iterdir():
-            if file.is_file() and file.name not in referenced:file.unlink();removed+=1
-        db.commit();print(f'已清理 {removed} 个未被引用的遗留文件。')
-finally:db.close()
+    record = app.password_record(password)
+    with app.transaction() as db:
+        user = db.execute('SELECT id FROM users WHERE email=?', (app.account_email(args.email),)).fetchone()
+        if not user:
+            raise SystemExit('未找到此邮箱对应的账户')
+        db.execute('UPDATE users SET password=?,must_change=1 WHERE id=?', (record, user['id']))
+        db.execute('DELETE FROM sessions WHERE user_id=?', (user['id'],))
+except app.Problem as exc:
+    raise SystemExit(exc.message)
+print('密码已重置，已有会话已失效。')
