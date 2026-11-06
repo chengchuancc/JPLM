@@ -154,6 +154,33 @@ class IntegrationTests(unittest.TestCase):
     def test_purchase_creation_rolls_back(self):
         self.request('purchases','POST',{'supplier_id':self.supplier(),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
         self.assertEqual(self.state()['purchases'],[]);self.assertEqual(self.state()['purchase_lines'],[])
+    def test_delete_product_with_bom_keeps_shared_material_code_and_stock(self):
+        product = self.request('products', 'POST', {'name': '产品A', 'english_code': 'AQUAMIX'})['id']
+        other = self.request('products', 'POST', {'name': '产品B'})['id']
+        versions = {v['product_id']: v['id'] for v in self.state()['bom_versions']}
+        part = self.request('bom-materials', 'POST', {'name': '共享物料', 'version_id': versions[product]})['id']
+        code = next(p['code'] for p in self.state()['parts'] if p['id'] == part)
+        self.request('bom-versions', 'POST', {'product_id': product, 'copy_from': versions[product]})
+        line = self.request('bom-lines', 'POST', {'version_id': versions[other], 'part_id': part, 'qty': 2})['id']
+        self.request('movements', 'POST', {'type': '入库', 'part_id': part, 'qty': 3})
+        self.request('products/' + product, 'DELETE', {}, 409)
+        self.assertEqual(len(self.state()['bom_lines']), 3)
+        self.request('products/' + product, 'DELETE', {'delete_bom': True})
+        state = self.state()
+        self.assertEqual([p['id'] for p in state['products']], [other])
+        self.assertEqual([v['id'] for v in state['bom_versions']], [versions[other]])
+        self.assertEqual([l['id'] for l in state['bom_lines']], [line])
+        material = next(p for p in state['parts'] if p['id'] == part)
+        self.assertEqual((material['code'], material['stock'], material['numbering_product_id']), (code, 3, None))
+
+    def test_product_with_stock_history_must_be_archived(self):
+        product = self.product()
+        self.move('入库', 2)
+        movement = self.move('出库', 1, product_id=product)['id']
+        self.request('products/' + product, 'DELETE', {'delete_bom': True}, 409)
+        self.assertEqual(self.state()['products'][0]['id'], product)
+        self.assertEqual(self.state()['movements'][-1]['id'], movement)
+
     def test_bom_version_and_atomic_import(self):
         p=self.product();v=self.state()['bom_versions'][0]['id']
         self.request('bom-lines','POST',{'version_id':v,'part_id':self.part,'qty':2})

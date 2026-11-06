@@ -937,16 +937,26 @@ class Handler(BaseHTTPRequestHandler):
             return {'ok':True,'_delete_files':[id]}
         if resource in ('products','parts','suppliers'):
             if method=='DELETE':
-                exists(db,resource,id)
+                record = exists(db, resource, id)
                 if resource=='parts':
-                    p=exists(db,'parts',id)
+                    p = record
                     if p['stock']!=0: raise Problem('仍有库存的物料不能删除')
                     if db.execute('SELECT 1 FROM bom_lines WHERE part_id=? UNION ALL SELECT 1 FROM purchase_lines WHERE part_id=? UNION ALL SELECT 1 FROM movements WHERE part_id=? LIMIT 1',(id,id,id)).fetchone(): raise Problem('物料已有业务记录，不能删除')
                     db.execute('DELETE FROM quotes WHERE part_id=?',(id,))
-                if resource=='products':
-                    versions=[r[0] for r in db.execute('SELECT id FROM bom_versions WHERE product_id=?',(id,))]
-                    if any(db.execute('SELECT 1 FROM bom_lines WHERE version_id=?',(v,)).fetchone() for v in versions): raise Problem('产品仍有 BOM 明细，不能删除')
-                    db.execute('DELETE FROM bom_versions WHERE product_id=?',(id,))
+                if resource == 'products':
+                    if db.execute('SELECT 1 FROM movements WHERE product_id=? LIMIT 1', (id,)).fetchone():
+                        raise Problem('产品有关联的库存流水，请在编辑产品中将状态设为已归档', 409)
+                    has_bom = db.execute(
+                        """SELECT 1 FROM bom_lines AS line JOIN bom_versions AS version
+                           ON line.version_id = version.id WHERE version.product_id=? LIMIT 1""",
+                        (id,),
+                    ).fetchone()
+                    if has_bom and d.get('delete_bom') is not True:
+                        raise Problem('请确认一并删除该产品的所有 BOM 版本和明细', 409)
+                    db.execute('DELETE FROM bom_versions WHERE product_id=?', (id,))
+                    # The numbering link determines future prefixes, not material ownership.
+                    db.execute('UPDATE parts SET numbering_product_id=NULL WHERE numbering_product_id=?', (id,))
+                    log_activity(db, self.user, '删除产品', id, f"{record['code']} {record['name']}")
                 db.execute(f'DELETE FROM {resource} WHERE id=?',(id,))
                 if resource == 'parts':
                     log_activity(db, self.user, '删除物料', id, f"{p['code']} {p['name']}")

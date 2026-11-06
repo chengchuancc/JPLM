@@ -1174,6 +1174,8 @@ function App() {
     );
   };
   const product = state.products.find((p) => p.id === detail);
+  const productHasMovements =
+    !!product && state.movements.some((row) => row.product_id === product.id);
   const part = state.parts.find((p) => p.id === detail);
   const purchase = state.purchases.find((p) => p.id === detail);
   const supplier = findSupplier(detail);
@@ -2166,24 +2168,7 @@ function App() {
                 ))}
               </div>
               {tab === "files" ? (
-                <>
-                  {fileManager("products", product.id)}
-                  <div className="danger-footer">
-                    <Button
-                      small
-                      onClick={() =>
-                        setModal({ kind: "delete-product", item: product })
-                      }
-                    >
-                      <Trash2 size={14} />
-                      删除产品
-                    </Button>
-                    <span>
-                      含 BOM
-                      明细或其他业务关联的产品无法删除；可在编辑中将其归档。
-                    </span>
-                  </div>
-                </>
+                fileManager("products", product.id)
               ) : (
                 <>
                   <div className="bom-version-bar">
@@ -2352,6 +2337,23 @@ function App() {
                   />
                 </>
               )}
+              <div className="danger-footer">
+                <Button
+                  small
+                  disabled={productHasMovements}
+                  onClick={() =>
+                    setModal({ kind: "delete-product", item: product })
+                  }
+                >
+                  <Trash2 size={14} />
+                  删除产品
+                </Button>
+                {productHasMovements && (
+                  <span>
+                    此产品有关联的库存流水，可在编辑产品中设为已归档。
+                  </span>
+                )}
+              </div>
             </>
           )}
           {(view === "parts" || view === "inventory") && !detail && (
@@ -4195,15 +4197,17 @@ function App() {
           {modal.kind.startsWith("delete-") && (
             <Dialog title="确认删除" onClose={() => setModal(null)}>
               <p className="confirm-copy">
-                {modal.kind === "delete-line"
-                  ? "将从当前 BOM 版本移除此物料，其他版本不会受影响。"
-                  : modal.kind === "delete-quote"
-                    ? "将解除此物料与供应商的关联。"
-                    : modal.kind === "delete-file"
-                      ? "将删除该图片或附件。"
-                      : "确定删除「" +
-                        modal.item.name +
-                        "」？已有业务关联的记录将无法删除。"}
+                {modal.kind === "delete-product"
+                  ? `确定删除「${modal.item.name}」？该产品的所有 BOM 版本、图片和附件将一并删除。物料库记录和料号会保留。`
+                  : modal.kind === "delete-line"
+                    ? "将从当前 BOM 版本移除此物料，其他版本不会受影响。"
+                    : modal.kind === "delete-quote"
+                      ? "将解除此物料与供应商的关联。"
+                      : modal.kind === "delete-file"
+                        ? "将删除该图片或附件。"
+                        : "确定删除「" +
+                          modal.item.name +
+                          "」？已有业务关联的记录将无法删除。"}
               </p>
               <AsyncAction
                 onCancel={() => setModal(null)}
@@ -4220,7 +4224,9 @@ function App() {
                   await mutate(
                     map[modal.kind] + "/" + modal.item.id,
                     "DELETE",
-                    undefined,
+                    modal.kind === "delete-product"
+                      ? { delete_bom: true }
+                      : undefined,
                     "已删除",
                   );
                   if (modal.kind === "delete-part") go("parts");
