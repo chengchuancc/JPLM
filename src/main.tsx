@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useContext, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Boxes,
@@ -62,6 +62,7 @@ import {
   Movement,
   FileRecord,
 } from "./types";
+import { MaterialTable, materialCategories } from "./material-table";
 import "./style.css";
 
 const money = (n: number) =>
@@ -134,7 +135,54 @@ type Field = {
   wide?: boolean;
   min?: number;
   step?: string;
+  create?: CreateChoice;
+  optionFilter?: (value: string) => boolean;
 };
+type CreateChoice = {
+  resource: "parts" | "products" | "suppliers";
+  level?: number;
+  productId?: string | null;
+};
+type ChoiceRequest = CreateChoice & {
+  select: (id: string, updated: State) => void;
+};
+const ChoiceContext = React.createContext<
+  ((request: ChoiceRequest) => void) | null
+>(null);
+const choiceNames = { parts: "物料", products: "产品", suppliers: "供应商" };
+
+function ChoiceSelect({
+  create,
+  onValueChange,
+  children,
+  ...props
+}: Omit<React.SelectHTMLAttributes<HTMLSelectElement>, "onChange"> & {
+  create?: CreateChoice;
+  onValueChange: (id: string, updated?: State) => void;
+}) {
+  const open = useContext(ChoiceContext);
+  return (
+    <select
+      {...props}
+      onChange={(e) => {
+        if (e.target.value === "__create_record__" && open && create) {
+          const select = e.currentTarget;
+          select.value = String(props.value ?? "");
+          open({ ...create, select: onValueChange });
+        } else {
+          onValueChange(e.target.value);
+        }
+      }}
+    >
+      {children}
+      {open && create && (
+        <option value="__create_record__">
+          ＋ 新建{choiceNames[create.resource]}
+        </option>
+      )}
+    </select>
+  );
+}
 function Button({
   children,
   onClick,
@@ -204,7 +252,13 @@ function Dialog({
       )?.focus();
     focus();
     const key = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (
+        Array.from(document.querySelectorAll('.dialog[aria-modal="true"]')).at(
+          -1,
+        ) !== el.current
+      )
+        return;
+      if (e.key === "Escape" && !e.defaultPrevented) onClose();
       if (e.key === "Tab") {
         const a = Array.from(
           el.current?.querySelectorAll<HTMLElement>(
@@ -301,20 +355,31 @@ function EntityForm({
                 }
               />
             ) : f.options ? (
-              <select
+              <ChoiceSelect
+                create={f.create}
                 required={f.required}
                 value={values[f.name] ?? ""}
-                onChange={(e) =>
-                  setValues({ ...values, [f.name]: e.target.value })
+                onValueChange={(value) =>
+                  setValues((previous: any) => ({
+                    ...previous,
+                    [f.name]: value,
+                  }))
                 }
               >
                 <option value="">请选择</option>
-                {f.options.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
+                {f.options
+                  .filter(
+                    (o) =>
+                      o.value === values[f.name] ||
+                      !f.optionFilter ||
+                      f.optionFilter(o.value),
+                  )
+                  .map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+              </ChoiceSelect>
             ) : (
               <input
                 required={f.required}
@@ -403,10 +468,19 @@ function App() {
   const [materialLevel, setMaterialLevel] = useState(1);
   const [showParents, setShowParents] = useState(true);
   const [parentFilter, setParentFilter] = useState("");
+  const [categories, setCategories] = useState<Record<string, string>>({});
+  const categoryProps = (key: string) => ({
+    category: categories[key] || "",
+    setCategory: (value: string) =>
+      setCategories((old) => ({ ...old, [key]: value })),
+  });
+  const matchesCategory = (key: string, part?: Part) =>
+    !categories[key] || categories[key] === part?.category;
   const [layout, setLayout] = useState("grid");
   const [version, setVersion] = useState("");
   const [tab, setTab] = useState("info");
   const [modal, setModal] = useState<Modal>(null);
+  const [choice, setChoice] = useState<ChoiceRequest | null>(null);
   const [toast, setToast] = useState("");
   const [mobile, setMobile] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -449,6 +523,7 @@ function App() {
       setAuth((a) => (a ? { ...a, authenticated: false } : a));
       setState(emptyState);
       setModal(null);
+      setChoice(null);
     };
     window.addEventListener("plm-session-expired", expire);
     return () => window.removeEventListener("plm-session-expired", expire);
@@ -542,6 +617,9 @@ function App() {
   const bom = bomAll.filter(
     (l) => findPart(l.part_id)?.material_level === materialLevel,
   );
+  const displayedBom = bom.filter((line) =>
+    matchesCategory("bom", findPart(line.part_id)),
+  );
   const levelName = materialLevel === 1 ? "一级物料" : "二级物料";
   const levelTabs = (
     <div
@@ -577,6 +655,7 @@ function App() {
   const visibleParts = state.parts.filter(
     (p) =>
       p.material_level === materialLevel &&
+      matchesCategory(view, p) &&
       (materialLevel !== 2 ||
         !parentFilter ||
         (parentFilter === "unlinked"
@@ -584,7 +663,7 @@ function App() {
           : state.material_links.some(
               (l) => l.child_id === p.id && l.parent_id === parentFilter,
             ))) &&
-      match(p.name, p.code, p.spec, p.location) &&
+      match(p.name, p.code, p.external_code, p.brand, p.spec, p.location) &&
       (filter === "全部" ||
         p.category === filter ||
         (filter === "低库存" && p.stock < p.min_stock) ||
@@ -609,6 +688,9 @@ function App() {
   }
   const childLinks = state.material_links.filter(
     (l) => l.parent_id === part?.id,
+  );
+  const displayedChildren = childLinks.filter((link) =>
+    matchesCategory("children", findPart(link.child_id)),
   );
   const parentLinks = state.material_links.filter(
     (l) => l.child_id === part?.id,
@@ -647,6 +729,107 @@ function App() {
         </button>
       </div>
     );
+  }
+  function editMaterial(p: Part) {
+    setModal({ kind: "part", item: p });
+  }
+  function materialEditButton(p: Part) {
+    return (
+      <button
+        title="编辑物料"
+        aria-label={"编辑物料 " + p.name}
+        onClick={() => editMaterial(p)}
+      >
+        <Pencil size={15} />
+      </button>
+    );
+  }
+  function materialCell(
+    p: Part,
+    field:
+      | "spec"
+      | "external_code"
+      | "brand"
+      | "unit"
+      | "category"
+      | "price"
+      | "min_stock"
+      | "location"
+      | "notes"
+      | "material_level",
+    label: string,
+    options?: Field["options"],
+  ) {
+    return (
+      <InlineCell
+        label={p.name + " " + label}
+        value={p[field]}
+        type={field === "price" || field === "min_stock" ? "number" : "text"}
+        options={options}
+        save={(value) => savePart(p.id, field, value)}
+      />
+    );
+  }
+  function baseMaterialCells(p: Part) {
+    return {
+      code: (
+        <button className="text-link mono" onClick={() => openMaterial(p.id)}>
+          {p.code}
+        </button>
+      ),
+      photo: materialPhoto(p),
+      name: (
+        <button
+          className="text-link material-name"
+          title={p.name}
+          onClick={() => openMaterial(p.id)}
+        >
+          {p.name}
+        </button>
+      ),
+      parents: p.material_level === 2 ? parentsCell(p) : null,
+      spec: materialCell(p, "spec", "规格型号"),
+      external_code: materialCell(p, "external_code", "外部料号"),
+      brand: materialCell(p, "brand", "品牌"),
+      unit: materialCell(p, "unit", "单位"),
+      category: materialCell(
+        p,
+        "category",
+        "类别",
+        materialCategories.map((value) => ({ value, label: value })),
+      ),
+      price: materialCell(p, "price", "单价"),
+      stock: amount(p.stock),
+      children:
+        p.material_level === 1 ? (
+          <button
+            className="text-link child-count"
+            onClick={() => openMaterial(p.id, "children")}
+          >
+            {
+              state.material_links.filter((link) => link.parent_id === p.id)
+                .length
+            }{" "}
+            项<ChevronRight size={13} />
+          </button>
+        ) : null,
+    };
+  }
+  function inventoryRowActions(p: Part) {
+    return [
+      { label: "入库", icon: ArrowDownToLine },
+      { label: "出库", icon: ArrowUpFromLine },
+      { label: "退库", icon: RotateCcw },
+      { label: "报废", icon: Archive },
+    ].map(({ label, icon: Icon }) => (
+      <button
+        key={label}
+        title={label}
+        onClick={() => startInventory(label, p)}
+      >
+        <Icon size={15} />
+      </button>
+    ));
   }
   const associationToggle = materialLevel === 2 && (
     <label className="field-toggle">
@@ -722,6 +905,7 @@ function App() {
     {
       name: "numbering_product_id",
       label: "编号所属产品",
+      create: { resource: "products" },
       options: state.products.map((p) => ({
         value: p.id,
         label: p.name + (p.english_code ? " · " + p.english_code : ""),
@@ -845,7 +1029,7 @@ function App() {
   }
   function exportBom() {
     exportCSV(
-      bom.map((l) => {
+      displayedBom.map((l) => {
         const p = findPart(l.part_id)!;
         return {
           物料编码: p.code,
@@ -1336,7 +1520,11 @@ function App() {
                         <Upload size={15} />
                         导入
                       </Button>
-                      <Button small disabled={!bom.length} onClick={exportBom}>
+                      <Button
+                        small
+                        disabled={!displayedBom.length}
+                        onClick={exportBom}
+                      >
                         <Download size={15} />
                         导出
                       </Button>
@@ -1362,162 +1550,105 @@ function App() {
                       </Button>
                     </div>
                   </div>
-                  <div className="table-wrap">
-                    <table className="editable-table bom-table">
-                      <thead>
-                        <tr>
-                          <th>图片</th>
-                          <th>名称</th>
-                          {materialLevel === 2 && showParents && (
-                            <th>关联一级物料</th>
-                          )}
-                          <th>规格型号</th>
-                          <th>单位</th>
-                          <th className="num">用量</th>
-                          <th className="num">单价</th>
-                          <th className="num">小计</th>
-                          <th className="num">库存</th>
-                          <th>位号</th>
-                          <th>备注</th>
-                          {materialLevel === 1 && <th>二级物料</th>}
-                          <th>操作</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {bom.map((l) => {
-                          const p = findPart(l.part_id)!;
-                          return (
-                            <tr key={l.id}>
-                              <td>{materialPhoto(p)}</td>
-                              <td>
-                                <button
-                                  className="text-link material-name"
-                                  onClick={() => openMaterial(p.id)}
-                                >
-                                  {p.name}
-                                </button>
-                                <small className="mono">
-                                  <button
-                                    className="text-link code-link"
-                                    onClick={() => go("parts", p.id)}
-                                  >
-                                    {p.code}
-                                    <ArrowUpRight size={11} />
-                                  </button>
-                                </small>
-                                {p.external_code && (
-                                  <small className="mono">
-                                    {p.external_code}
-                                  </small>
-                                )}
-                                {p.brand && <small>{p.brand}</small>}
-                              </td>
-                              {materialLevel === 2 && showParents && (
-                                <td>{parentsCell(p)}</td>
-                              )}
-                              <td>
-                                <InlineCell
-                                  label={p.name + " 规格型号"}
-                                  value={p.spec}
-                                  save={(v) => savePart(p.id, "spec", v)}
-                                />
-                              </td>
-                              <td>
-                                <InlineCell
-                                  label={p.name + " 单位"}
-                                  value={p.unit}
-                                  save={(v) => savePart(p.id, "unit", v)}
-                                />
-                              </td>
-                              <td className="num">
-                                <InlineCell
-                                  label={p.name + " 用量"}
-                                  value={l.qty}
-                                  type="number"
-                                  min={0.000001}
-                                  save={(v) => saveLine(l.id, "qty", v)}
-                                />
-                              </td>
-                              <td className="num">
-                                <InlineCell
-                                  label={p.name + " 单价"}
-                                  value={p.price}
-                                  type="number"
-                                  save={(v) => savePart(p.id, "price", v)}
-                                />
-                              </td>
-                              <td className="num">{money(p.price * l.qty)}</td>
-                              <td className="num">{amount(p.stock)}</td>
-                              <td>
-                                <InlineCell
-                                  label={p.name + " 位号"}
-                                  value={l.reference}
-                                  save={(v) => saveLine(l.id, "reference", v)}
-                                />
-                              </td>
-                              <td>
-                                <InlineCell
-                                  label={p.name + " 备注"}
-                                  value={l.notes}
-                                  save={(v) => saveLine(l.id, "notes", v)}
-                                />
-                              </td>
-                              {materialLevel === 1 ? (
-                                <td>
-                                  <button
-                                    className="text-link child-count"
-                                    onClick={() =>
-                                      openMaterial(p.id, "children")
-                                    }
-                                  >
-                                    {
-                                      state.material_links.filter(
-                                        (link) => link.parent_id === p.id,
-                                      ).length
-                                    }{" "}
-                                    项<ChevronRight size={13} />
-                                  </button>
-                                </td>
-                              ) : null}
-                              <td>
-                                <div className="row-actions">
-                                  <button
-                                    title="查看物料"
-                                    onClick={() => openMaterial(p.id)}
-                                  >
-                                    <ArrowUpRight size={15} />
-                                  </button>
-
-                                  <button
-                                    aria-label={"移除 " + p.name}
-                                    onClick={() =>
-                                      setModal({ kind: "delete-line", item: l })
-                                    }
-                                  >
-                                    <Trash2 size={15} />
-                                  </button>
-                                </div>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                    {!bom.length && (
+                  <MaterialTable
+                    tableId="bom"
+                    {...categoryProps("bom")}
+                    columns={[
+                      "photo",
+                      "name",
+                      "category",
+                      ...(materialLevel === 2 && showParents
+                        ? ["parents" as const]
+                        : []),
+                      "spec",
+                      "external_code",
+                      "brand",
+                      "unit",
+                      "qty",
+                      "price",
+                      "subtotal",
+                      "stock",
+                      "reference",
+                      "notes",
+                      ...(materialLevel === 1 ? ["children" as const] : []),
+                    ]}
+                    rows={displayedBom.map((line) => {
+                      const material = findPart(line.part_id)!;
+                      return {
+                        id: line.id,
+                        cells: {
+                          ...baseMaterialCells(material),
+                          qty: (
+                            <InlineCell
+                              label={material.name + " 用量"}
+                              value={line.qty}
+                              type="number"
+                              min={0.000001}
+                              save={(value) => saveLine(line.id, "qty", value)}
+                            />
+                          ),
+                          subtotal: money(material.price * line.qty),
+                          reference: (
+                            <InlineCell
+                              label={material.name + " 位号"}
+                              value={line.reference}
+                              save={(value) =>
+                                saveLine(line.id, "reference", value)
+                              }
+                            />
+                          ),
+                          notes: (
+                            <InlineCell
+                              label={material.name + " 备注"}
+                              value={line.notes}
+                              save={(value) =>
+                                saveLine(line.id, "notes", value)
+                              }
+                            />
+                          ),
+                          actions: (
+                            <div className="row-actions">
+                              {materialEditButton(material)}
+                              <button
+                                title="查看物料"
+                                onClick={() => openMaterial(material.id)}
+                              >
+                                <ArrowUpRight size={15} />
+                              </button>
+                              <button
+                                aria-label={"移除 " + material.name}
+                                onClick={() =>
+                                  setModal({ kind: "delete-line", item: line })
+                                }
+                              >
+                                <Trash2 size={15} />
+                              </button>
+                            </div>
+                          ),
+                        },
+                      };
+                    })}
+                    empty={
                       <Empty
-                        title={"暂无" + levelName}
+                        title={
+                          categories.bom
+                            ? "没有符合类别的物料"
+                            : "暂无" + levelName
+                        }
                         action={
-                          <Button
-                            small
-                            onClick={() => setModal({ kind: "bom-create" })}
-                          >
-                            <Plus size={15} />
-                            新建物料
-                          </Button>
+                          !categories.bom && (
+                            <Button
+                              small
+                              onClick={() => setModal({ kind: "bom-create" })}
+                            >
+                              <Plus size={15} />
+                              新建物料
+                            </Button>
+                          )
                         }
                       />
-                    )}
-                  </div>
+                    }
+                  />
                 </>
               )}
             </>
@@ -1532,20 +1663,7 @@ function App() {
                   </h1>
                 </div>
                 {view === "parts" ? (
-                  <Button
-                    primary
-                    onClick={() =>
-                      setModal({
-                        kind: "part",
-                        item: {
-                          category: "结构物料",
-                          unit: "个",
-                          price: 0,
-                          min_stock: 0,
-                        },
-                      })
-                    }
-                  >
+                  <Button primary onClick={() => setModal({ kind: "part" })}>
                     <Plus size={17} />
                     新建物料
                   </Button>
@@ -1674,194 +1792,69 @@ function App() {
                   </Button>
                 </div>
               </div>
-              <div className="table-wrap">
-                <table className="editable-table material-table">
-                  <thead>
-                    <tr>
-                      <th>图片</th>
-                      <th>名称</th>
-                      {materialLevel === 2 && showParents && (
-                        <th>关联一级物料</th>
-                      )}
-                      <th>规格型号</th>
-                      <th>单位</th>
-                      <th>类别</th>
-                      <th className="num">单价</th>
-                      <th className="num">库存</th>
-                      <th className="num">最低库存</th>
-                      <th>库位</th>
-                      <th>备注</th>
-                      <th>级别</th>
-                      {materialLevel === 1 && <th>二级物料</th>}
-                      <th>操作</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {visibleParts.map((p) => (
-                      <tr key={p.id}>
-                        <td>{materialPhoto(p)}</td>
-                        <td>
-                          <button
-                            className="text-link material-name"
-                            onClick={() => openMaterial(p.id)}
-                          >
-                            {p.name}
-                          </button>
-                          <small className="mono">
+              <MaterialTable
+                key={view}
+                tableId={view}
+                {...categoryProps(view)}
+                columns={[
+                  "photo",
+                  "name",
+                  "category",
+                  ...(materialLevel === 2 && showParents
+                    ? ["parents" as const]
+                    : []),
+                  "spec",
+                  "external_code",
+                  "brand",
+                  "unit",
+                  "price",
+                  "stock",
+                  "min_stock",
+                  "location",
+                  "notes",
+                  "level",
+                  ...(materialLevel === 1 ? ["children" as const] : []),
+                ]}
+                rows={visibleParts.map((material) => ({
+                  id: material.id,
+                  cells: {
+                    ...baseMaterialCells(material),
+                    min_stock: materialCell(material, "min_stock", "最低库存"),
+                    location: materialCell(material, "location", "库位"),
+                    notes: materialCell(material, "notes", "备注"),
+                    level: materialCell(material, "material_level", "级别", [
+                      { value: "1", label: "一级物料" },
+                      { value: "2", label: "二级物料" },
+                    ]),
+                    actions: (
+                      <div className="row-actions">
+                        {view === "inventory" ? (
+                          inventoryRowActions(material)
+                        ) : (
+                          <>
+                            {materialEditButton(material)}
                             <button
-                              className="text-link code-link"
-                              onClick={() => go("parts", p.id)}
+                              title="物料二维码"
+                              onClick={() =>
+                                setModal({ kind: "qr", item: material })
+                              }
                             >
-                              {p.code}
-                              <ArrowUpRight size={11} />
+                              <QrCode size={15} />
                             </button>
-                          </small>
-                          {p.external_code && (
-                            <small className="mono">{p.external_code}</small>
-                          )}
-                          {p.brand && <small>{p.brand}</small>}
-                        </td>
-                        {materialLevel === 2 && showParents && (
-                          <td>{parentsCell(p)}</td>
+                            <button
+                              title="查看物料"
+                              onClick={() => openMaterial(material.id)}
+                            >
+                              <ArrowUpRight size={15} />
+                            </button>
+                          </>
                         )}
-                        <td>
-                          <InlineCell
-                            label={p.name + " 规格型号"}
-                            value={p.spec}
-                            save={(v) => savePart(p.id, "spec", v)}
-                          />
-                        </td>
-                        <td>
-                          <InlineCell
-                            label={p.name + " 单位"}
-                            value={p.unit}
-                            save={(v) => savePart(p.id, "unit", v)}
-                          />
-                        </td>
-                        <td>
-                          <InlineCell
-                            label={p.name + " 类别"}
-                            value={p.category}
-                            options={["结构物料", "电子物料"].map((x) => ({
-                              value: x,
-                              label: x,
-                            }))}
-                            save={(v) => savePart(p.id, "category", v)}
-                          />
-                        </td>
-                        <td className="num">
-                          <InlineCell
-                            label={p.name + " 单价"}
-                            value={p.price}
-                            type="number"
-                            save={(v) => savePart(p.id, "price", v)}
-                          />
-                        </td>
-                        <td className="num strong">{amount(p.stock)}</td>
-                        <td className="num">
-                          <InlineCell
-                            label={p.name + " 最低库存"}
-                            value={p.min_stock}
-                            type="number"
-                            save={(v) => savePart(p.id, "min_stock", v)}
-                          />
-                        </td>
-                        <td>
-                          <InlineCell
-                            label={p.name + " 库位"}
-                            value={p.location}
-                            save={(v) => savePart(p.id, "location", v)}
-                          />
-                        </td>
-                        <td>
-                          <InlineCell
-                            label={p.name + " 备注"}
-                            value={p.notes}
-                            save={(v) => savePart(p.id, "notes", v)}
-                          />
-                        </td>
-                        <td>
-                          <InlineCell
-                            label={p.name + " 级别"}
-                            value={p.material_level}
-                            options={[
-                              { value: "1", label: "一级物料" },
-                              { value: "2", label: "二级物料" },
-                            ]}
-                            save={(v) => savePart(p.id, "material_level", v)}
-                          />
-                        </td>
-                        {materialLevel === 1 ? (
-                          <td>
-                            <button
-                              className="text-link child-count"
-                              onClick={() => openMaterial(p.id, "children")}
-                            >
-                              {
-                                state.material_links.filter(
-                                  (link) => link.parent_id === p.id,
-                                ).length
-                              }{" "}
-                              项<ChevronRight size={13} />
-                            </button>
-                          </td>
-                        ) : null}
-                        <td>
-                          <div className="row-actions">
-                            {view === "inventory" ? (
-                              <>
-                                <button
-                                  title="入库"
-                                  onClick={() => startInventory("入库", p)}
-                                >
-                                  <ArrowDownToLine size={15} />
-                                </button>
-                                <button
-                                  title="出库"
-                                  onClick={() => startInventory("出库", p)}
-                                >
-                                  <ArrowUpFromLine size={15} />
-                                </button>
-                                <button
-                                  title="退库"
-                                  onClick={() => startInventory("退库", p)}
-                                >
-                                  <RotateCcw size={15} />
-                                </button>
-                                <button
-                                  title="报废"
-                                  onClick={() => startInventory("报废", p)}
-                                >
-                                  <Archive size={15} />
-                                </button>
-                              </>
-                            ) : (
-                              <>
-                                <button
-                                  title="物料二维码"
-                                  onClick={() =>
-                                    setModal({ kind: "qr", item: p })
-                                  }
-                                >
-                                  <QrCode size={15} />
-                                </button>
-
-                                <button
-                                  title="查看物料"
-                                  onClick={() => openMaterial(p.id)}
-                                >
-                                  <ArrowUpRight size={15} />
-                                </button>
-                              </>
-                            )}
-                          </div>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-                {!visibleParts.length && <Empty title="暂无物料" />}
-              </div>
+                      </div>
+                    ),
+                  },
+                }))}
+                empty={<Empty title="暂无物料" />}
+              />
             </>
           )}
           {view === "parts" && detail && part && (
@@ -2000,151 +1993,108 @@ function App() {
                       </Button>
                     </div>
                   </div>
-                  <div className="table-wrap">
-                    <table className="editable-table children-table">
-                      <thead>
-                        <tr>
-                          <th>图片</th>
-                          <th>名称 / 编号</th>
-                          <th>规格 / 封装</th>
-                          <th>品牌</th>
-                          <th>单位</th>
-                          <th className="num">用量</th>
-                          <th className="num">单价</th>
-                          <th className="num">库存</th>
-                          <th>位号</th>
-                          <th>备注</th>
-                          <th>关联一级物料</th>
-                          <th>操作</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {childLinks.map((link) => {
-                          const child = findPart(link.child_id)!;
-                          return (
-                            <tr key={link.id}>
-                              <td>{materialPhoto(child)}</td>
-                              <td>
-                                <button
-                                  className="text-link material-name"
-                                  onClick={() => openMaterial(child.id)}
-                                >
-                                  {child.name}
-                                </button>
-                                <small className="mono">{child.code}</small>
-                                {child.external_code && (
-                                  <small className="mono">
-                                    {child.external_code}
-                                  </small>
-                                )}
-                              </td>
-                              <td>
-                                <InlineCell
-                                  label={child.name + " 规格型号"}
-                                  value={child.spec}
-                                  save={(v) => savePart(child.id, "spec", v)}
-                                />
-                              </td>
-                              <td>
-                                <InlineCell
-                                  label={child.name + " 品牌"}
-                                  value={child.brand}
-                                  save={(v) => savePart(child.id, "brand", v)}
-                                />
-                              </td>
-                              <td>
-                                <InlineCell
-                                  label={child.name + " 单位"}
-                                  value={child.unit}
-                                  save={(v) => savePart(child.id, "unit", v)}
-                                />
-                              </td>
-                              <td className="num">
-                                <InlineCell
-                                  label={child.name + " 关联用量"}
-                                  value={link.qty}
-                                  type="number"
-                                  min={0.000001}
-                                  save={async (v) => {
-                                    await api(
-                                      "material-links/" + link.id,
-                                      "PUT",
-                                      { qty: v },
-                                    );
-                                    await refresh();
-                                  }}
-                                />
-                              </td>
-                              <td className="num">{money(child.price)}</td>
-                              <td className="num">{amount(child.stock)}</td>
-                              <td>
-                                <InlineCell
-                                  label={child.name + " 关联位号"}
-                                  value={link.reference}
-                                  save={async (v) => {
-                                    await api(
-                                      "material-links/" + link.id,
-                                      "PUT",
-                                      { reference: v },
-                                    );
-                                    await refresh();
-                                  }}
-                                />
-                              </td>
-                              <td>
-                                <InlineCell
-                                  label={child.name + " 关联备注"}
-                                  value={link.notes}
-                                  save={async (v) => {
-                                    await api(
-                                      "material-links/" + link.id,
-                                      "PUT",
-                                      { notes: v },
-                                    );
-                                    await refresh();
-                                  }}
-                                />
-                              </td>
-                              <td>{parentsCell(child)}</td>
-                              <td>
-                                <button
-                                  className="icon-btn"
-                                  title={"解除" + child.name + "关联"}
-                                  onClick={() =>
-                                    setModal({
-                                      kind: "unlink-material",
-                                      item: link,
-                                    })
-                                  }
-                                >
-                                  <X size={15} />
-                                </button>
-                              </td>
-                            </tr>
-                          );
-                        })}
-                      </tbody>
-                    </table>
-                    {!childLinks.length && (
+                  <MaterialTable
+                    tableId="children"
+                    {...categoryProps("children")}
+                    columns={[
+                      "photo",
+                      "name",
+                      "category",
+                      "spec",
+                      "external_code",
+                      "brand",
+                      "unit",
+                      "qty",
+                      "price",
+                      "stock",
+                      "reference",
+                      "notes",
+                      "parents",
+                    ]}
+                    rows={displayedChildren.map((link) => {
+                      const child = findPart(link.child_id)!;
+                      const saveLink = async (
+                        field: "qty" | "reference" | "notes",
+                        value: string,
+                      ) => {
+                        await api("material-links/" + link.id, "PUT", {
+                          [field]: value,
+                        });
+                        await refresh();
+                      };
+                      return {
+                        id: link.id,
+                        cells: {
+                          ...baseMaterialCells(child),
+                          qty: (
+                            <InlineCell
+                              label={child.name + " 关联用量"}
+                              value={link.qty}
+                              type="number"
+                              min={0.000001}
+                              save={(value) => saveLink("qty", value)}
+                            />
+                          ),
+                          price: money(child.price),
+                          reference: (
+                            <InlineCell
+                              label={child.name + " 关联位号"}
+                              value={link.reference}
+                              save={(value) => saveLink("reference", value)}
+                            />
+                          ),
+                          notes: (
+                            <InlineCell
+                              label={child.name + " 关联备注"}
+                              value={link.notes}
+                              save={(value) => saveLink("notes", value)}
+                            />
+                          ),
+                          actions: (
+                            <div className="row-actions">
+                              {materialEditButton(child)}
+                              <button
+                                title={"解除" + child.name + "关联"}
+                                onClick={() =>
+                                  setModal({
+                                    kind: "unlink-material",
+                                    item: link,
+                                  })
+                                }
+                              >
+                                <X size={15} />
+                              </button>
+                            </div>
+                          ),
+                        },
+                      };
+                    })}
+                    empty={
                       <Empty
-                        title="暂无二级物料"
+                        title={
+                          categories.children
+                            ? "没有符合类别的物料"
+                            : "暂无二级物料"
+                        }
                         action={
-                          <Button
-                            small
-                            onClick={() =>
-                              setModal({
-                                kind: "child-create",
-                                extra: { parent_id: part.id, level: 2 },
-                              })
-                            }
-                          >
-                            <Plus size={15} />
-                            新增二级物料
-                          </Button>
+                          !categories.children && (
+                            <Button
+                              small
+                              onClick={() =>
+                                setModal({
+                                  kind: "child-create",
+                                  extra: { parent_id: part.id, level: 2 },
+                                })
+                              }
+                            >
+                              <Plus size={15} />
+                              新增二级物料
+                            </Button>
+                          )
                         }
                       />
-                    )}
-                  </div>
+                    }
+                  />
                 </>
               )}
               {tab === "parents" && part.material_level === 2 && (
@@ -2958,7 +2908,7 @@ function App() {
         </div>
       )}
       {modal && (
-        <>
+        <ChoiceContext.Provider value={setChoice}>
           {((["product", "part", "supplier"].includes(modal.kind) &&
             !modal.item?.id) ||
             modal.kind === "bom-create" ||
@@ -3059,6 +3009,11 @@ function App() {
               onClose={() => setModal(null)}
             >
               <RecordPicker
+                create={{
+                  resource: "parts",
+                  level: modal.kind === "material-parents" ? 1 : 2,
+                  productId: modal.item.numbering_product_id,
+                }}
                 records={state.parts.filter(
                   (p) =>
                     p.material_level ===
@@ -3161,6 +3116,11 @@ function App() {
                   (p) => p.material_level === materialLevel,
                 )}
                 item={modal.item}
+                create={{
+                  resource: "parts",
+                  level: materialLevel,
+                  productId: product?.id,
+                }}
                 submit={(d) =>
                   mutate(
                     "bom-lines" + (d.id ? "/" + d.id : ""),
@@ -3207,6 +3167,7 @@ function App() {
                     label: "供应商",
                     required: true,
                     options: supplierOptions,
+                    create: { resource: "suppliers" },
                     wide: true,
                   },
                   {
@@ -3381,7 +3342,50 @@ function App() {
               />
             </Dialog>
           )}
-        </>
+        </ChoiceContext.Provider>
+      )}
+      {choice && (
+        <Dialog
+          title={"新建" + choiceNames[choice.resource]}
+          onClose={() => setChoice(null)}
+        >
+          <QuickCreateForm
+            images={choice.resource !== "suppliers"}
+            fields={(choice.resource === "parts"
+              ? partFields
+              : choice.resource === "products"
+                ? productFields
+                : supplierFields
+            ).filter(
+              (field) =>
+                field.name !== "name" &&
+                (field.name !== "material_level" || !choice.level),
+            )}
+            initial={{
+              unit: "PCS",
+              material_level: choice.level || 1,
+              category: choice.level === 2 ? "电子物料" : "结构物料",
+              numbering_product_id: choice.productId || "",
+            }}
+            create={async (data) =>
+              (await api(choice.resource, "POST", data)).id
+            }
+            upload={async (id, images) => {
+              const form = new FormData();
+              form.append("owner_type", choice.resource);
+              form.append("owner_id", id);
+              images.forEach((image) => form.append("file", image));
+              await api("files", "POST", form);
+            }}
+            done={async (id) => {
+              const updated = await refresh();
+              choice.select(id, updated);
+              setChoice(null);
+              notify("已添加");
+            }}
+            onCancel={() => setChoice(null)}
+          />
+        </Dialog>
       )}
     </div>
   );
@@ -3427,15 +3431,25 @@ function AsyncAction({
 function BomForm({
   parts,
   item,
+  create,
   submit,
   onCancel,
 }: {
   parts: Part[];
   item: any;
+  create: CreateChoice;
   submit: (d: any) => Promise<void>;
   onCancel: () => void;
 }) {
   const [q, setQ] = useState("");
+  const query = q.trim().toLowerCase();
+  const matchedIds = new Set(
+    parts
+      .filter((p) =>
+        [p.code, p.name, p.spec].join(" ").toLowerCase().includes(query),
+      )
+      .map((p) => p.id),
+  );
   return (
     <>
       <div className="search-input form-search">
@@ -3453,21 +3467,14 @@ function BomForm({
           {
             name: "part_id",
             label: "选择物料",
+            create,
             required: true,
             wide: true,
-            options: parts
-              .filter(
-                (p) =>
-                  p.id === item.part_id ||
-                  [p.code, p.name, p.spec]
-                    .join(" ")
-                    .toLowerCase()
-                    .includes(q.toLowerCase()),
-              )
-              .map((p) => ({
-                value: p.id,
-                label: p.code + " · " + p.name + " / " + p.spec,
-              })),
+            optionFilter: (id) => matchedIds.has(id),
+            options: parts.map((p) => ({
+              value: p.id,
+              label: p.code + " · " + p.name + " / " + p.spec,
+            })),
           },
           {
             name: "qty",
@@ -3571,6 +3578,7 @@ function MovementForm({
         <label className="wide-field">选择物料 *</label>
         <SearchPart
           parts={state.parts}
+          create={type === "入库" ? { resource: "parts" } : undefined}
           value={part}
           onChange={(v) => {
             setPart(v);
@@ -3603,9 +3611,10 @@ function MovementForm({
         {type === "出库" && (
           <label>
             关联研发产品
-            <select
+            <ChoiceSelect
+              create={{ resource: "products" }}
               value={product}
-              onChange={(e) => setProduct(e.target.value)}
+              onValueChange={setProduct}
             >
               <option value="">不关联产品</option>
               {state.products.map((p) => (
@@ -3613,7 +3622,7 @@ function MovementForm({
                   {p.name}
                 </option>
               ))}
-            </select>
+            </ChoiceSelect>
           </label>
         )}
         {type === "入库" && (
@@ -3693,10 +3702,12 @@ function MovementForm({
 }
 function SearchPart({
   parts,
+  create,
   value,
   onChange,
 }: {
   parts: Part[];
+  create?: CreateChoice;
   value: string;
   onChange: (v: string) => void;
 }) {
@@ -3709,11 +3720,12 @@ function SearchPart({
         value={search}
         onChange={(e) => setSearch(e.target.value)}
       />
-      <select
+      <ChoiceSelect
+        create={create}
         required
         aria-label="选择物料"
         value={value}
-        onChange={(e) => onChange(e.target.value)}
+        onValueChange={onChange}
       >
         <option value="">请选择物料</option>
         {parts
@@ -3730,7 +3742,7 @@ function SearchPart({
               {p.code} · {p.name} / {p.spec}
             </option>
           ))}
-      </select>
+      </ChoiceSelect>
     </div>
   );
 }
@@ -3776,19 +3788,18 @@ function PurchaseForm({
       <div className="form-grid">
         <label>
           供应商 *
-          <select
+          <ChoiceSelect
+            create={{ resource: "suppliers" }}
             required
             value={supplier}
-            onChange={(e) => {
-              setSupplier(e.target.value);
+            onValueChange={(id, updated = state) => {
+              setSupplier(id);
               setLines((ls) =>
                 ls.map((l) => ({
                   ...l,
                   price:
-                    state.quotes.find(
-                      (q) =>
-                        q.part_id === l.part_id &&
-                        q.supplier_id === e.target.value,
+                    updated.quotes.find(
+                      (q) => q.part_id === l.part_id && q.supplier_id === id,
                     )?.price ?? l.price,
                 })),
               );
@@ -3800,7 +3811,7 @@ function PurchaseForm({
                 {s.name}
               </option>
             ))}
-          </select>
+          </ChoiceSelect>
         </label>
         <label>
           采购日期 *
@@ -3812,9 +3823,6 @@ function PurchaseForm({
           />
         </label>
       </div>
-      {!state.suppliers.length && (
-        <p className="form-error">请先在供应商模块创建供应商。</p>
-      )}
       <div className="purchase-form-heading">
         <h3>采购物料</h3>
         <div className="search-input">
@@ -3835,12 +3843,12 @@ function PurchaseForm({
         </div>
         {lines.map((l, i) => (
           <div className="purchase-form-line" key={i}>
-            <select
+            <ChoiceSelect
+              create={{ resource: "parts" }}
               aria-label={"第 " + (i + 1) + " 行物料"}
               required
               value={l.part_id}
-              onChange={(e) => {
-                const id = e.target.value;
+              onValueChange={(id, updated = state) => {
                 setLines((ls) =>
                   ls.map((l, j) =>
                     j === i
@@ -3848,11 +3856,11 @@ function PurchaseForm({
                           ...l,
                           part_id: id,
                           price:
-                            state.quotes.find(
+                            updated.quotes.find(
                               (q) =>
                                 q.part_id === id && q.supplier_id === supplier,
                             )?.price ??
-                            state.parts.find((p) => p.id === id)?.price ??
+                            updated.parts.find((p) => p.id === id)?.price ??
                             0,
                         }
                       : l,
@@ -3875,7 +3883,7 @@ function PurchaseForm({
                     {p.code} · {p.name}
                   </option>
                 ))}
-            </select>
+            </ChoiceSelect>
             <input
               aria-label={"第 " + (i + 1) + " 行数量"}
               type="number"
@@ -4506,13 +4514,15 @@ function InlineCell({
           setEditing(true);
         }}
       >
-        {options?.find((x) => x.value === String(value))?.label ??
-          (String(value ?? "") || "—")}
+        <span className="cell-value">
+          {options?.find((x) => x.value === String(value))?.label ??
+            (String(value ?? "") || "—")}
+        </span>
         <Pencil size={11} />
       </button>
     );
   return (
-    <div className="inline-editor">
+    <div className={"inline-editor" + (options ? " select-editor" : "")}>
       {options ? (
         <select
           autoFocus
@@ -4629,7 +4639,7 @@ function QuickCreateForm({
   parents?: Part[];
   create: (data: any) => Promise<string>;
   upload: (id: string, files: File[]) => Promise<void>;
-  done: () => Promise<void>;
+  done: (id: string) => Promise<void>;
   onCancel: () => void;
 }) {
   const [name, setName] = useState("");
@@ -4694,7 +4704,7 @@ function QuickCreateForm({
             await upload(created.current, selected);
             uploaded.current = true;
           }
-          await done();
+          await done(created.current);
         } catch (e) {
           setError((e as Error).message);
         } finally {
@@ -4802,12 +4812,16 @@ function QuickCreateForm({
               <label key={f.name} className={f.wide ? "wide-field" : ""}>
                 {f.label}
                 {f.options ? (
-                  <select
+                  <ChoiceSelect
+                    create={f.create}
                     disabled={busy || !!created.current}
                     aria-label={f.label}
                     value={values[f.name] ?? ""}
-                    onChange={(e) =>
-                      setValues({ ...values, [f.name]: e.target.value })
+                    onValueChange={(value) =>
+                      setValues((previous: any) => ({
+                        ...previous,
+                        [f.name]: value,
+                      }))
                     }
                   >
                     <option value="">请选择</option>
@@ -4816,7 +4830,7 @@ function QuickCreateForm({
                         {o.label}
                       </option>
                     ))}
-                  </select>
+                  </ChoiceSelect>
                 ) : f.type === "textarea" ? (
                   <textarea
                     disabled={busy || !!created.current}
@@ -4849,6 +4863,11 @@ function QuickCreateForm({
             <label className="form-label">关联一级物料</label>
             <RecordChoices
               records={parents}
+              create={{
+                resource: "parts",
+                level: 1,
+                productId: values.numbering_product_id,
+              }}
               selected={parentIds}
               onChange={setParentIds}
               disabled={busy || !!created.current}
@@ -4878,13 +4897,16 @@ function RecordChoices({
   selected,
   onChange,
   disabled = false,
+  create,
 }: {
   records: Part[];
   selected: string[];
   onChange: (ids: string[]) => void;
   disabled?: boolean;
+  create?: CreateChoice;
 }) {
   const [search, setSearch] = useState("");
+  const open = useContext(ChoiceContext);
   const toggle = (id: string) =>
     onChange(
       selected.includes(id)
@@ -4930,6 +4952,19 @@ function RecordChoices({
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
+      {open && create && (
+        <Button
+          small
+          type="button"
+          disabled={disabled}
+          onClick={() =>
+            open({ ...create, select: (id) => onChange([...selected, id]) })
+          }
+        >
+          <Plus size={14} />
+          新建{create.level === 1 ? "一级物料" : "二级物料"}
+        </Button>
+      )}
       <div className="record-options">
         {matches.map((record) => (
           <label className="record-option" key={record.id}>
@@ -4954,11 +4989,13 @@ function RecordChoices({
 }
 function RecordPicker({
   records,
+  create,
   selected,
   submit,
   onCancel,
 }: {
   records: Part[];
+  create: CreateChoice;
   selected: string[];
   submit: (ids: string[]) => Promise<void>;
   onCancel: () => void;
@@ -4966,7 +5003,12 @@ function RecordPicker({
   const [ids, setIds] = useState(selected);
   return (
     <>
-      <RecordChoices records={records} selected={ids} onChange={setIds} />
+      <RecordChoices
+        records={records}
+        selected={ids}
+        onChange={setIds}
+        create={create}
+      />
       <AsyncAction
         label="保存关联"
         onCancel={onCancel}
@@ -5113,12 +5155,17 @@ function ElectronicImportForm({
       <div className="import-targets">
         <label>
           关联一级物料
-          <select
+          <ChoiceSelect
+            create={{
+              resource: "parts",
+              level: 1,
+              productId: context.numbering_product_id,
+            }}
             aria-label="导入关联一级物料"
             disabled={!!context.parent_id || busy}
             value={parent}
-            onChange={(e) => {
-              setParent(e.target.value);
+            onValueChange={(id) => {
+              setParent(id);
               reset();
             }}
           >
@@ -5128,17 +5175,18 @@ function ElectronicImportForm({
                 {p.name} · {p.code}
               </option>
             ))}
-          </select>
+          </ChoiceSelect>
         </label>
         {!context.version_id && !parent && (
           <label>
             编号所属产品
-            <select
+            <ChoiceSelect
+              create={{ resource: "products" }}
               aria-label="导入编号所属产品"
               disabled={busy}
               value={product}
-              onChange={(e) => {
-                setProduct(e.target.value);
+              onValueChange={(id) => {
+                setProduct(id);
                 reset();
               }}
             >
@@ -5149,7 +5197,7 @@ function ElectronicImportForm({
                   {p.english_code ? " · " + p.english_code : ""}
                 </option>
               ))}
-            </select>
+            </ChoiceSelect>
           </label>
         )}
         {preview && (
