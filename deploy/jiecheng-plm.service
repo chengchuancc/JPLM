@@ -1,0 +1,28 @@
+[Unit]
+Description=Jiecheng PLM
+After=network.target
+
+[Service]
+Type=simple
+User=jiecheng-plm
+Group=jiecheng-plm
+WorkingDirectory=/opt/jiecheng-plm
+Environment=PLM_HOST=127.0.0.1
+Environment=PLM_PORT=8787
+Environment=PLM_DATA_DIR=/var/lib/jiecheng-plm
+# HTTPS 反向代理部署时开启；纯 HTTP 内网使用时改为 0。
+Environment=PLM_SECURE_COOKIE=1
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /opt/jiecheng-plm/server/app.py
+Restart=on-failure
+RestartSec=3
+StateDirectory=jiecheng-plm
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/jiecheng-plm
+
+[Install]
+WantedBy=multi-user.target

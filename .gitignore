@@ -1,0 +1,10 @@
+node_modules/
+dist/
+data/
+__pycache__/
+*.pyc
+.env
+.DS_Store
+.openai/
+.env.*
+*.sqlite3*
