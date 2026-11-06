@@ -2860,8 +2860,6 @@ td .text-link:hover {
   white-space: nowrap;
 }
 .brand {
-  flex-direction: column;
-  align-items: flex-start;
   padding: 0 4px;
   gap: 6px;
 }
