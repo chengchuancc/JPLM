@@ -2865,18 +2865,6 @@ td .text-link:hover {
   padding: 0 4px;
   gap: 6px;
 }
-.sidebar-brand-logo {
-  display: flex;
-  align-items: center;
-  width: 116px;
-  height: 33px;
-  padding: 0 9px;
-  border-radius: 6px;
-  background: var(--accent);
-}
-.sidebar-brand-logo .brand-wordmark {
-  width: 100%;
-}
 .sidebar nav {
   margin-top: 8px;
 }
@@ -2892,8 +2880,8 @@ td .text-link:hover {
   flex-wrap: wrap;
   padding: 15px 14px;
   margin-bottom: 24px;
-  color: #fff;
-  background: var(--accent);
+  background: var(--bg);
+  border: 1px solid var(--border);
   border-radius: 7px;
 }
 .compact-login .login-brand strong {
@@ -3877,16 +3865,7 @@ button.material-photo {
 }
 .brand-wordmark {
   width: 128px;
-  aspect-ratio: 1134 / 188;
-  position: relative;
+  max-width: 100%;
+  height: auto;
   display: block;
-  overflow: hidden;
-}
-.brand-wordmark img {
-  position: absolute;
-  width: calc(100% * 1162 / 1134);
-  max-width: none;
-  left: 50%;
-  top: 50%;
-  transform: translate(-50%, -52.67%);
 }

@@ -467,18 +467,16 @@ function EntityForm({
     </form>
   );
 }
-function BrandWordmark() {
-  return (
-    <span className="brand-wordmark">
-      <img src={appBase + "brand-wordmark.png"} alt="MakaGiC" />
-    </span>
-  );
-}
-
 function LoginBrand() {
   return (
     <div className="login-brand">
-      <BrandWordmark />
+      <img
+        className="brand-wordmark"
+        src={appBase + "brand-wordmark-black.png"}
+        alt="MakaGiC"
+        width={1134}
+        height={188}
+      />
       <strong>捷程未来PLM</strong>
     </div>
   );
@@ -1804,9 +1802,7 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobile ? "mobile-open" : ""}`}>
         <a className="brand" href="#products" onClick={() => go("products")}>
-          <span className="sidebar-brand-logo">
-            <BrandWordmark />
-          </span>
+          <BrandMark />
           <strong>捷程未来PLM</strong>
         </a>
         <nav>
