@@ -467,6 +467,21 @@ function EntityForm({
     </form>
   );
 }
+function LoginBrand() {
+  return (
+    <div className="login-brand">
+      <span className="brand-wordmark">
+        <img src={appBase + "brand-wordmark.png"} alt="MakaGiC" />
+      </span>
+      <strong>捷程未来PLM</strong>
+    </div>
+  );
+}
+
+function BrandMark() {
+  return <img className="brand-mark" src={appBase + "brand-mark.png"} alt="" />;
+}
+
 function Login({
   initialized,
   onLogin,
@@ -479,12 +494,7 @@ function Login({
   return (
     <div className="login-page compact-login">
       <div className="login-card">
-        <div className="login-brand">
-          <div className="logo">
-            <Boxes size={24} />
-          </div>
-          <strong>捷程未来PLM</strong>
-        </div>
+        <LoginBrand />
         <h2>{initialized ? "登录" : "创建管理员"}</h2>
         {restored && <p className="muted">已恢复数据，请重新登录。</p>}
         <EntityForm
@@ -1721,8 +1731,8 @@ function App() {
   if (loading)
     return (
       <div className="loading-page">
-        <Boxes size={34} />
-        <span>正在打开研发工作空间…</span>
+        <BrandMark />
+        <span>加载中…</span>
       </div>
     );
   if (fatal && !auth)
@@ -1745,6 +1755,7 @@ function App() {
     return (
       <div className="login-page compact-login">
         <div className="login-card">
+          <LoginBrand />
           <h2>修改初始密码</h2>
           <PasswordForm onSaved={load} />
           <Button
@@ -1762,9 +1773,7 @@ function App() {
     <div className="app-shell">
       <aside className={`sidebar ${mobile ? "mobile-open" : ""}`}>
         <a className="brand" href="#products" onClick={() => go("products")}>
-          <div className="logo">
-            <Boxes size={23} />
-          </div>
+          <BrandMark />
           <div>
             <strong>捷程未来PLM</strong>
           </div>
