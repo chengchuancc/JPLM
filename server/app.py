@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """捷程未来PLM：仅依赖 Python 3.10+ 标准库。"""
-import argparse, hashlib, hmac, io, json, math, mimetypes, os, secrets, sqlite3, sys, time, threading, shutil
+import argparse, hashlib, hmac, io, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.parser import BytesParser
@@ -8,13 +8,28 @@ from email.policy import default
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as BaseThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from urllib.parse import quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = Path(os.environ.get('PLM_DATA_DIR', str(ROOT / 'data'))).resolve()
 MAX_UPLOAD = 20 * 1024 * 1024
 FILE_LOCK = threading.RLock()
+IMAGE_MIMES = {
+    '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+    '.webp': 'image/webp', '.gif': 'image/gif', '.bmp': 'image/bmp',
+}
+UPLOAD_ID = re.compile(r'[0-9a-f]{24}')
+CLEANUP_INTERVAL = 24 * 60 * 60
+ORPHAN_IMAGE_GRACE = 7 * CLEANUP_INTERVAL
+QUOTES_SCHEMA = """CREATE TABLE IF NOT EXISTS quotes(
+    id TEXT PRIMARY KEY,
+    part_id TEXT NOT NULL REFERENCES parts(id),
+    supplier_id TEXT NOT NULL REFERENCES suppliers(id),
+    price REAL CHECK(price >= 0),
+    url TEXT NOT NULL DEFAULT '',
+    UNIQUE(part_id, supplier_id)
+);"""
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS import_runs(id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,result TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
@@ -25,7 +40,7 @@ CREATE TABLE IF NOT EXISTS parts(id TEXT PRIMARY KEY,code TEXT UNIQUE NOT NULL,n
 CREATE TABLE IF NOT EXISTS material_links(id TEXT PRIMARY KEY,parent_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,child_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,qty REAL NOT NULL DEFAULT 1 CHECK(qty>0),created_at TEXT NOT NULL,UNIQUE(parent_id,child_id),CHECK(parent_id<>child_id));
 CREATE TABLE IF NOT EXISTS material_code_aliases(code TEXT PRIMARY KEY,part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE);
 CREATE INDEX IF NOT EXISTS idx_material_links_child ON material_links(child_id);
-CREATE TABLE IF NOT EXISTS quotes(id TEXT PRIMARY KEY,part_id TEXT NOT NULL REFERENCES parts(id),supplier_id TEXT NOT NULL REFERENCES suppliers(id),price REAL NOT NULL CHECK(price>=0),url TEXT NOT NULL DEFAULT '',UNIQUE(part_id,supplier_id));
+
 CREATE TABLE IF NOT EXISTS bom_versions(id TEXT PRIMARY KEY,product_id TEXT NOT NULL REFERENCES products(id),name TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,UNIQUE(product_id,name));
 CREATE TABLE IF NOT EXISTS bom_lines(id TEXT PRIMARY KEY,version_id TEXT NOT NULL REFERENCES bom_versions(id) ON DELETE CASCADE,part_id TEXT NOT NULL REFERENCES parts(id),qty REAL NOT NULL CHECK(qty>0),reference TEXT NOT NULL DEFAULT '',notes TEXT NOT NULL DEFAULT '',UNIQUE(version_id,part_id));
 CREATE TABLE IF NOT EXISTS purchases(id TEXT PRIMARY KEY,code TEXT UNIQUE NOT NULL,supplier_id TEXT NOT NULL REFERENCES suppliers(id),date TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
@@ -58,17 +73,25 @@ def init_db():
     DATA.mkdir(parents=True, exist_ok=True)
     (DATA / 'uploads').mkdir(exist_ok=True)
     with connect() as db:
-        db.executescript(SCHEMA)
+        db.executescript(SCHEMA + QUOTES_SCHEMA)
         columns={r[1] for r in db.execute('PRAGMA table_info(parts)')}
         product_columns={r[1] for r in db.execute('PRAGMA table_info(products)')}
         version=db.execute('PRAGMA user_version').fetchone()[0]
-        if version>5: raise RuntimeError('数据库版本高于当前程序版本')
+        if version>6: raise RuntimeError('数据库版本高于当前程序版本')
         if version<5 and (db.execute('SELECT 1 FROM parts LIMIT 1').fetchone() or db.execute('SELECT 1 FROM products LIMIT 1').fetchone()):
             backup_path=DATA/'plm.before-v5.sqlite3'
             if not backup_path.exists():
                 backup=sqlite3.connect(backup_path)
                 try: db.backup(backup)
                 finally: backup.close()
+        if version == 5:
+            backup_path = DATA / 'plm.before-v6.sqlite3'
+            if not backup_path.exists():
+                backup = sqlite3.connect(backup_path)
+                try:
+                    db.backup(backup)
+                finally:
+                    backup.close()
         db.execute('BEGIN IMMEDIATE')
         if 'material_level' not in columns:
             db.execute('ALTER TABLE parts ADD COLUMN material_level INTEGER NOT NULL DEFAULT 1 CHECK(material_level IN (1,2))')
@@ -103,7 +126,13 @@ def init_db():
         for field in ('reference','notes'):
             if field not in link_columns: db.execute(f"ALTER TABLE material_links ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
         db.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_material_serial ON parts(material_serial)')
-        db.execute('PRAGMA user_version=5')
+        quote_columns = {row['name']: row for row in db.execute('PRAGMA table_info(quotes)')}
+        if quote_columns['price']['notnull']:
+            db.execute('ALTER TABLE quotes RENAME TO quotes_v5')
+            db.execute(QUOTES_SCHEMA)
+            db.execute('INSERT INTO quotes SELECT id,part_id,supplier_id,price,url FROM quotes_v5')
+            db.execute('DROP TABLE quotes_v5')
+        db.execute('PRAGMA user_version=6')
 
 class ClosingConnection(sqlite3.Connection):
     def __exit__(self, exc_type, exc_value, traceback):
@@ -133,6 +162,75 @@ def exists(db, table, id):
     r = db.execute(f'SELECT * FROM {table} WHERE id=?', (id,)).fetchone()
     if not r: raise Problem('关联记录不存在', 404)
     return dict(r)
+
+def image_mime(header):
+    if header.startswith(b'\x89PNG\r\n\x1a\n'):
+        return 'image/png'
+    if header.startswith(b'\xff\xd8\xff'):
+        return 'image/jpeg'
+    if header[:6] in (b'GIF87a', b'GIF89a'):
+        return 'image/gif'
+    if header.startswith(b'RIFF') and header[8:12] == b'WEBP':
+        return 'image/webp'
+    if header.startswith(b'BM'):
+        return 'image/bmp'
+    return None
+
+def owner_file_name(original, owner_code, owner_name, position):
+    if not owner_code:
+        return original
+    label = re.sub(r'[\x00-\x1f\x7f<>:"/\\|?*]+', ' ', owner_name)
+    label = ' '.join(label.split()).strip(' .')
+    # Bound the filename by UTF-8 bytes without cutting a character in half.
+    label = label.encode('utf-8')[:150].decode('utf-8', errors='ignore').rstrip(' .')
+    extension = Path(original).suffix
+    if not re.fullmatch(r'\.[A-Za-z0-9]{1,15}', extension):
+        extension = ''
+    stem = f'{owner_code} {label}' if label else owner_code
+    return f'{stem}（{position:02d}）{extension.lower()}'
+
+def remove_upload(id):
+    try:
+        (DATA / 'uploads' / id).unlink(missing_ok=True)
+        return True
+    except OSError as exc:
+        print(f'无法清理上传文件 {id}：{exc}', file=sys.stderr)
+        return False
+
+def cleanup_orphan_images():
+    cutoff = time.time() - ORPHAN_IMAGE_GRACE
+    removed = 0
+    # The upload and backup paths take the same lock. The transaction also
+    # excludes writers from the local admin tool while we check references.
+    with FILE_LOCK, transaction() as db, os.scandir(DATA / 'uploads') as entries:
+        referenced = {row[0] for row in db.execute('SELECT id FROM files')}
+        for entry in entries:
+            if entry.name in referenced or not UPLOAD_ID.fullmatch(entry.name):
+                continue
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
+                    continue
+                with open(entry.path, 'rb') as file:
+                    is_image = image_mime(file.read(12)) is not None
+                if is_image and remove_upload(entry.name):
+                    removed += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                print(f'无法检查上传文件 {entry.name}：{exc}', file=sys.stderr)
+    return removed
+
+def run_image_cleanup(stop, interval=CLEANUP_INTERVAL):
+    while not stop.is_set():
+        try:
+            removed = cleanup_orphan_images()
+            if removed:
+                print(f'已清理 {removed} 张无引用图片。', flush=True)
+        except (OSError, sqlite3.Error) as exc:
+            print(f'图片清理失败：{exc}', file=sys.stderr)
+        stop.wait(interval)
 
 def next_code(db, prefix):
     return prefix + '-' + datetime.now().strftime('%Y%m%d') + '-' + secrets.token_hex(3).upper()
@@ -260,7 +358,20 @@ TABLES = ('products','parts','suppliers','quotes','bom_versions','bom_lines','pu
 
 def get_state(db):
     db.execute('BEGIN')
-    return {t:[{k:r[k] for k in r.keys() if k!='sub_product_id'} for r in db.execute(f'SELECT * FROM {t} ORDER BY rowid')] for t in TABLES}
+    state = {t: [{k:r[k] for k in r.keys() if k != 'sub_product_id'}
+                 for r in db.execute(f'SELECT * FROM {t} ORDER BY rowid')] for t in TABLES}
+    owners = {(table, row['id']): row
+              for table in ('parts', 'products') for row in state[table]}
+    positions = {}
+    for file in state['files']:
+        owner = (file['owner_type'], file['owner_id'])
+        positions[owner] = positions.get(owner, 0) + 1
+        record = owners.get(owner)
+        if record:
+            file['original_name'] = file['name']
+            file['name'] = owner_file_name(file['name'], record['code'], record['name'], positions[owner])
+    return state
+
 
 class ThreadingHTTPServer(BaseThreadingHTTPServer):
     request_queue_size=64
@@ -341,7 +452,7 @@ class Handler(BaseHTTPRequestHandler):
                 data = self.body()
                 with FILE_LOCK:
                     with transaction() as db: result = self.mutate(db,path,method,data)
-                    for fid in result.pop('_delete_files',[]): (DATA/'uploads'/fid).unlink(missing_ok=True)
+                    for fid in result.pop('_delete_files', []): remove_upload(fid)
                 return self.send(result)
             if method == 'GET': return self.static(path)
             raise Problem('接口不存在',404)
@@ -451,11 +562,25 @@ class Handler(BaseHTTPRequestHandler):
             for l in d['lines']:
                 exists(db,'parts',l['part_id']); db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',(uid(),id,l['part_id'],num(l['qty'],True),num(l['price']),0))
             return {'id':id}
-        if resource=='quotes' and method=='POST':
-            exists(db,'parts',d['part_id']); exists(db,'suppliers',d['supplier_id'])
-            url=str(d.get('url','')).strip()
-            if url and urlparse(url).scheme not in ('http','https'): raise Problem('采购链接必须以 http:// 或 https:// 开头')
-            id=uid(); db.execute('INSERT INTO quotes VALUES(?,?,?,?,?) ON CONFLICT(part_id,supplier_id) DO UPDATE SET price=excluded.price,url=excluded.url',(id,d['part_id'],d['supplier_id'],num(d['price']),url)); return {'id':id}
+        if resource == 'quotes' and method == 'POST':
+            part_id = d['part_id']
+            supplier_id = d['supplier_id']
+            exists(db, 'parts', part_id)
+            exists(db, 'suppliers', supplier_id)
+            previous = db.execute('SELECT * FROM quotes WHERE part_id=? AND supplier_id=?',
+                                  (part_id, supplier_id)).fetchone()
+            url = str(d.get('url', previous['url'] if previous else '') or '').strip()
+            if url and urlparse(url).scheme not in ('http', 'https'):
+                raise Problem('采购链接必须以 http:// 或 https:// 开头')
+            raw_price = d.get('price', previous['price'] if previous else None)
+            price = None if raw_price in (None, '') else num(raw_price)
+            if previous:
+                id = previous['id']
+                db.execute('UPDATE quotes SET price=?,url=? WHERE id=?', (price, url, id))
+            else:
+                id = uid()
+                db.execute('INSERT INTO quotes VALUES(?,?,?,?,?)', (id, part_id, supplier_id, price, url))
+            return {'id': id}
         if resource=='quotes' and method=='DELETE':
             db.execute('DELETE FROM quotes WHERE id=?',(id,)); return {'ok':True}
         if resource=='files' and method=='DELETE':
@@ -631,32 +756,62 @@ class Handler(BaseHTTPRequestHandler):
                 if replace_id:
                     old=exists(db,'files',replace_id)
                     if old['owner_type']!=owner or old['owner_id']!=owner_id: raise Problem('不能替换其他记录的附件')
-                for filename,mime,blob in uploads:
-                    if not blob: raise Problem('不能上传空文件')
-                    fid=uid(); name=Path(filename.replace('\\','/')).name[:200]
-                    ext=Path(name).suffix.lower()
-                    image_mimes={'.png':'image/png','.jpg':'image/jpeg','.jpeg':'image/jpeg','.webp':'image/webp','.gif':'image/gif','.bmp':'image/bmp'}
-                    mime=image_mimes.get(ext,'application/pdf' if ext=='.pdf' else 'application/octet-stream')
-                    kind='image' if ext in image_mimes else 'attachment'
-                    if kind=='image':
-                        good=(blob.startswith(b'\x89PNG\r\n\x1a\n') if ext=='.png' else blob.startswith(b'\xff\xd8\xff') if ext in ('.jpg','.jpeg') else blob[:6] in (b'GIF87a',b'GIF89a') if ext=='.gif' else blob.startswith(b'RIFF') and blob[8:12]==b'WEBP' if ext=='.webp' else blob.startswith(b'BM'))
-                        if not good: raise Problem('图片格式与文件内容不匹配')
-                    (DATA/'uploads'/fid).write_bytes(blob); created.append(fid)
-                    db.execute('INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',(fid,owner,owner_id,name,mime,len(blob),kind,now()))
-                if old: db.execute('DELETE FROM files WHERE id=?',(replace_id,))
+                for filename, _, blob in uploads:
+                    if not blob:
+                        raise Problem('不能上传空文件')
+                    fid = uid()
+                    name = Path(filename.replace('\\', '/')).name[:200]
+                    ext = Path(name).suffix.lower()
+                    image_type = IMAGE_MIMES.get(ext)
+                    mime = image_type or ('application/pdf' if ext == '.pdf' else 'application/octet-stream')
+                    kind = 'image' if image_type else 'attachment'
+                    if image_type and image_mime(blob[:12]) != image_type:
+                        raise Problem('图片格式与文件内容不匹配')
+                    created.append(fid)
+                    (DATA / 'uploads' / fid).write_bytes(blob)
+                    if old:
+                        # Replacing an image keeps its position and changes the
+                        # URL so a previously cached image is not reused.
+                        db.execute('UPDATE files SET id=?,name=?,mime=?,size=?,kind=?,created_at=? WHERE id=?',
+                                   (fid, name, mime, len(blob), kind, now(), old['id']))
+                    else:
+                        db.execute('INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',
+                                   (fid, owner, owner_id, name, mime, len(blob), kind, now()))
         except Exception:
-            for fid in created: (DATA/'uploads'/fid).unlink(missing_ok=True)
+            for fid in created:
+                remove_upload(fid)
             raise
-        if replace_id: (DATA/'uploads'/replace_id).unlink(missing_ok=True)
-        self.send({'ids':created})
-    def serve_file(self,id):
-        with connect() as db: f=exists(db,'files',id)
-        path=DATA/'uploads'/id
-        if not path.is_file(): raise Problem('文件未找到',404)
-        b=path.read_bytes(); self.send_response(200); self.send_header('Content-Type',f['mime']); self.send_header('Content-Length',str(len(b)))
-        from urllib.parse import quote
-        disposition='inline' if f['kind']=='image' else 'attachment'
-        self.send_header('Content-Disposition',f"{disposition}; filename*=UTF-8''{quote(f['name'])}"); self.security_headers(); self.send_header('Cache-Control','private, max-age=300'); self.end_headers(); self.wfile.write(b)
+        if replace_id:
+            remove_upload(replace_id)
+        self.send({'ids': created})
+
+    def serve_file(self, id):
+        with connect() as db:
+            db.execute('BEGIN')
+            f = exists(db, 'files', id)
+            name = f['name']
+            owner = f['owner_type']
+            record = db.execute(f'SELECT code,name FROM {owner} WHERE id=?', (f['owner_id'],)).fetchone()
+            if record:
+                position = db.execute(
+                    """SELECT COUNT(*) FROM files WHERE owner_type=? AND owner_id=?
+                       AND rowid <= (SELECT rowid FROM files WHERE id=?)""",
+                    (owner, f['owner_id'], id),
+                ).fetchone()[0]
+                name = owner_file_name(name, record['code'], record['name'], position)
+        path = DATA / 'uploads' / id
+        if not path.is_file():
+            raise Problem('文件未找到', 404)
+        b = path.read_bytes()
+        self.send_response(200)
+        self.send_header('Content-Type', f['mime'])
+        self.send_header('Content-Length', str(len(b)))
+        disposition = 'inline' if f['kind'] == 'image' else 'attachment'
+        self.send_header('Content-Disposition', f"{disposition}; filename*=UTF-8''{quote(name, safe='')}")
+        self.security_headers()
+        self.send_header('Cache-Control', 'private, no-cache')
+        self.end_headers()
+        self.wfile.write(b)
     def backup(self):
         import tempfile, zipfile
         # SQLite online backup and a file snapshot are collected under FILE_LOCK.
@@ -715,5 +870,12 @@ if __name__=='__main__':
     parser=argparse.ArgumentParser(); parser.add_argument('--host',default=os.environ.get('PLM_HOST','127.0.0.1')); parser.add_argument('--port',type=int,default=int(os.environ.get('PLM_PORT','8787'))); args=parser.parse_args()
     init_db(); server=ThreadingHTTPServer((args.host,args.port),Handler)
     print(f'捷程未来PLM  http://{args.host}:{args.port}  数据目录：{DATA}',flush=True)
-    try: server.serve_forever()
-    except KeyboardInterrupt: server.server_close()
+    stop_cleanup = threading.Event()
+    threading.Thread(target=run_image_cleanup, args=(stop_cleanup,), daemon=True).start()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_cleanup.set()
+        server.server_close()

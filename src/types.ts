@@ -86,6 +86,7 @@ export type FileRecord = {
   owner_type: string;
   owner_id: string;
   name: string;
+  original_name?: string;
   mime: string;
   size: number;
   kind: string;
@@ -94,7 +95,7 @@ export type Quote = {
   id: string;
   part_id: string;
   supplier_id: string;
-  price: number;
+  price: number | null;
   url: string;
 };
 export type MaterialLink = {

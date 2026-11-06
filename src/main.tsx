@@ -30,6 +30,7 @@ import {
   Pencil,
   Copy,
   FileText,
+  Paperclip,
   Image as ImageIcon,
   QrCode,
   Printer,
@@ -58,6 +59,7 @@ import {
   Product,
   Part,
   Supplier,
+  Quote,
   Purchase,
   Movement,
   FileRecord,
@@ -606,6 +608,10 @@ function App() {
   const product = state.products.find((p) => p.id === detail);
   const part = state.parts.find((p) => p.id === detail);
   const purchase = state.purchases.find((p) => p.id === detail);
+  const supplier = findSupplier(detail);
+  const suppliedMaterials = supplier
+    ? state.quotes.filter((q) => q.supplier_id === supplier.id)
+    : [];
   const versions = state.bom_versions.filter((v) => v.product_id === detail);
   const selectedVersion =
     versions.find((v) => v.id === version) || versions[versions.length - 1];
@@ -814,6 +820,31 @@ function App() {
           </button>
         ) : null,
     };
+  }
+  function supplierLinkActions(link: Quote) {
+    return (
+      <div className="row-actions">
+        <button
+          title="编辑关联"
+          onClick={() => setModal({ kind: "quote", item: link })}
+        >
+          <Pencil size={14} />
+        </button>
+        <button
+          title="解除供应商关联"
+          onClick={() => setModal({ kind: "delete-quote", item: link })}
+        >
+          <X size={15} />
+        </button>
+      </div>
+    );
+  }
+  function purchaseLink(url: string) {
+    return url ? (
+      <a className="text-link" href={url} target="_blank" rel="noreferrer">
+        采购链接 <ExternalLink size={13} />
+      </a>
+    ) : null;
   }
   function inventoryRowActions(p: Part) {
     return [
@@ -1145,7 +1176,7 @@ function App() {
               <>
                 <ChevronRight size={14} />
                 <span className="current">
-                  {product?.name || part?.name || purchase?.code}
+                  {product?.name || part?.name || supplier?.name || purchase?.code}
                 </span>
               </>
             )}
@@ -1842,10 +1873,16 @@ function App() {
                               <QrCode size={15} />
                             </button>
                             <button
-                              title="查看物料"
-                              onClick={() => openMaterial(material.id)}
+                              title="图片与附件"
+                              aria-label={material.name + "的图片与附件"}
+                              onClick={() =>
+                                setModal({
+                                  kind: "material-files",
+                                  item: material,
+                                })
+                              }
                             >
-                              <ArrowUpRight size={15} />
+                              <Paperclip size={15} />
                             </button>
                           </>
                         )}
@@ -2200,7 +2237,7 @@ function App() {
                         onClick={() =>
                           setModal({
                             kind: "quote",
-                            item: { part_id: part.id, price: part.price },
+                            item: { part_id: part.id },
                           })
                         }
                       >
@@ -2213,42 +2250,26 @@ function App() {
                       .map((q) => (
                         <div className="quote-row" key={q.id}>
                           <div>
-                            <strong>{findSupplier(q.supplier_id)?.name}</strong>
-                            <span>
-                              {money(q.price)} / {part.unit}
-                            </span>
-                            {q.url && (
-                              <a href={q.url} target="_blank" rel="noreferrer">
-                                采购链接
-                                <ExternalLink size={13} />
-                              </a>
+                            <strong>
+                              <button
+                                className="text-link"
+                                onClick={() => go("suppliers", q.supplier_id)}
+                              >
+                                {findSupplier(q.supplier_id)?.name}
+                              </button>
+                            </strong>
+                            {q.price !== null && (
+                              <span>
+                                {money(q.price)} / {part.unit}
+                              </span>
                             )}
+                            {purchaseLink(q.url)}
                           </div>
-                          <div className="row-actions">
-                            <button
-                              title="编辑报价"
-                              onClick={() =>
-                                setModal({ kind: "quote", item: q })
-                              }
-                            >
-                              <Pencil size={14} />
-                            </button>
-                            <button
-                              title="移除关联"
-                              onClick={() =>
-                                setModal({ kind: "delete-quote", item: q })
-                              }
-                            >
-                              <X size={15} />
-                            </button>
-                          </div>
+                          {supplierLinkActions(q)}
                         </div>
                       ))}
                     {!state.quotes.some((q) => q.part_id === part.id) && (
-                      <Empty
-                        title="暂无关联供应商"
-                        text="关联供应商，记录采购价格与链接。"
-                      />
+                      <Empty title="暂无关联供应商" />
                     )}
                   </section>
                 </div>
@@ -2366,7 +2387,7 @@ function App() {
               </div>
             </>
           )}
-          {view === "suppliers" && (
+          {view === "suppliers" && !detail && (
             <>
               <div className="page-heading">
                 <div>
@@ -2411,7 +2432,12 @@ function App() {
                       .map((s) => (
                         <tr key={s.id}>
                           <td className="strong">
-                            {s.name}
+                            <button
+                              className="text-link"
+                              onClick={() => go("suppliers", s.id)}
+                            >
+                              {s.name} <ArrowUpRight size={13} />
+                            </button>
                             <small>{s.notes}</small>
                           </td>
                           <td>{s.contact || "—"}</td>
@@ -2421,11 +2447,18 @@ function App() {
                           </td>
                           <td>{s.address || "—"}</td>
                           <td className="num">
-                            {
-                              state.quotes.filter((q) => q.supplier_id === s.id)
-                                .length
-                            }{" "}
-                            种
+                            <button
+                              className="text-link"
+                              aria-label={s.name + "的关联物料"}
+                              onClick={() => go("suppliers", s.id)}
+                            >
+                              {
+                                state.quotes.filter(
+                                  (q) => q.supplier_id === s.id,
+                                ).length
+                              }{" "}
+                              种
+                            </button>
                           </td>
                           <td>
                             <div className="row-actions">
@@ -2459,6 +2492,100 @@ function App() {
                     text="添加供应商后，即可关联报价和创建采购单。"
                   />
                 )}
+              </div>
+            </>
+          )}
+          {view === "suppliers" && detail && supplier && (
+            <>
+              <div className="detail-heading">
+                <button
+                  className="back-btn"
+                  aria-label="返回供应商列表"
+                  onClick={() => go("suppliers")}
+                >
+                  <ArrowLeft size={18} />
+                </button>
+                <div className="detail-title">
+                  <h1>{supplier.name}</h1>
+                  <p>
+                    {[
+                      supplier.contact,
+                      supplier.phone,
+                      supplier.email,
+                      supplier.address,
+                    ]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </p>
+                </div>
+                <Button
+                  onClick={() => setModal({ kind: "supplier", item: supplier })}
+                >
+                  <Pencil size={16} />
+                  编辑
+                </Button>
+              </div>
+              <div className="section-toolbar">
+                <h3>
+                  关联物料{" "}
+                  <span className="muted">{suppliedMaterials.length}</span>
+                </h3>
+                <Button
+                  primary
+                  small
+                  onClick={() =>
+                    setModal({
+                      kind: "quote",
+                      item: { supplier_id: supplier.id },
+                    })
+                  }
+                >
+                  <Plus size={15} />
+                  关联物料
+                </Button>
+              </div>
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>料号</th>
+                      <th>名称</th>
+                      <th>规格 / 封装</th>
+                      <th className="num">采购单价</th>
+                      <th>采购链接</th>
+                      <th>操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {suppliedMaterials.map((link) => {
+                      const material = findPart(link.part_id);
+                      if (!material) return null;
+                      return (
+                        <tr key={link.id}>
+                          <td className="mono">{material.code}</td>
+                          <td>
+                            <button
+                              className="text-link"
+                              onClick={() => openMaterial(material.id)}
+                            >
+                              {material.name}
+                              <ArrowUpRight size={13} />
+                            </button>
+                          </td>
+                          <td>{material.spec || "—"}</td>
+                          <td className="num">
+                            {link.price === null
+                              ? "—"
+                              : money(link.price) + " / " + material.unit}
+                          </td>
+                          <td>{purchaseLink(link.url) || "—"}</td>
+                          <td>{supplierLinkActions(link)}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                {!suppliedMaterials.length && <Empty title="暂无关联物料" />}
               </div>
             </>
           )}
@@ -2883,7 +3010,8 @@ function App() {
           {detail &&
             ((view === "products" && !product) ||
               (view === "parts" && !part) ||
-              (view === "purchases" && !purchase)) && (
+              (view === "purchases" && !purchase) ||
+              (view === "suppliers" && !supplier)) && (
               <Empty
                 title="记录不存在"
                 action={<Button onClick={() => go(view)}>返回列表</Button>}
@@ -3159,22 +3287,60 @@ function App() {
             </Dialog>
           )}
           {modal.kind === "quote" && (
-            <Dialog title="供应商报价" onClose={() => setModal(null)}>
+            <Dialog
+              title={
+                modal.item.id
+                  ? "编辑供应商关联"
+                  : modal.item.part_id
+                    ? "关联供应商"
+                    : "关联物料"
+              }
+              onClose={() => setModal(null)}
+            >
               <EntityForm
                 fields={[
-                  {
-                    name: "supplier_id",
-                    label: "供应商",
-                    required: true,
-                    options: supplierOptions,
-                    create: { resource: "suppliers" },
-                    wide: true,
-                  },
+                  ...(!modal.item.supplier_id
+                    ? [
+                        {
+                          name: "supplier_id",
+                          label: "供应商",
+                          required: true,
+                          options: supplierOptions.filter(
+                            (s) =>
+                              !state.quotes.some(
+                                (q) =>
+                                  q.part_id === modal.item.part_id &&
+                                  q.supplier_id === s.value,
+                              ),
+                          ),
+                          create: { resource: "suppliers" as const },
+                          wide: true,
+                        },
+                      ]
+                    : []),
+                  ...(!modal.item.part_id
+                    ? [
+                        {
+                          name: "part_id",
+                          label: "物料",
+                          required: true,
+                          options: partOptions.filter(
+                            (p) =>
+                              !state.quotes.some(
+                                (q) =>
+                                  q.supplier_id === modal.item.supplier_id &&
+                                  q.part_id === p.value,
+                              ),
+                          ),
+                          create: { resource: "parts" as const },
+                          wide: true,
+                        },
+                      ]
+                    : []),
                   {
                     name: "price",
                     label: "采购单价（元）",
                     type: "number",
-                    required: true,
                     wide: true,
                   },
                   {
@@ -3298,7 +3464,7 @@ function App() {
                 {modal.kind === "delete-line"
                   ? "将从当前 BOM 版本移除此物料，其他版本不会受影响。"
                   : modal.kind === "delete-quote"
-                    ? "将移除此供应商报价关联。"
+                    ? "将解除此物料与供应商的关联。"
                     : modal.kind === "delete-file"
                       ? "将删除该图片或附件。"
                       : "确定删除「" +
@@ -4178,6 +4344,11 @@ function FileManager({
             )}
             <div className="file-info">
               <strong title={f.name}>{f.name}</strong>
+              {f.kind !== "image" && f.original_name && (
+                <span className="file-original-name" title={f.original_name}>
+                  {f.original_name}
+                </span>
+              )}
               <span>{(f.size / 1024).toFixed(1)} KB</span>
               <div className="file-actions">
                 <label className="text-link">

@@ -58,6 +58,31 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.stock(),4);self.move('入库',6,purchase_line_id=line)
         self.assertEqual(self.state()['purchase_lines'][0]['received'],10)
         self.assertEqual(self.stock(),10)
+    def test_supplier_links_allow_multiple_records_without_prices(self):
+        first, second = self.supplier(), self.supplier()
+        other_part = self.request('parts', 'POST', {'name': '另一个物料'})['id']
+        priced = {'part_id': self.part, 'supplier_id': first, 'price': 0, 'url': 'https://example.com/item'}
+        existing = self.request('quotes', 'POST', priced)['id']
+        with app.transaction() as db:
+            db.execute('ALTER TABLE quotes RENAME TO quotes_new')
+            db.execute(app.QUOTES_SCHEMA.replace('price REAL CHECK', 'price REAL NOT NULL CHECK'))
+            db.execute('INSERT INTO quotes SELECT * FROM quotes_new')
+            db.execute('DROP TABLE quotes_new')
+            db.execute('PRAGMA user_version=5')
+        app.init_db()
+        self.assertEqual(self.state()['quotes'], [{'id': existing, **priced}])
+        unpriced = self.request('quotes', 'POST', {'part_id': self.part, 'supplier_id': second})['id']
+        self.request('quotes', 'POST', {'part_id': other_part, 'supplier_id': first})
+        links = self.state()['quotes']
+        self.assertEqual({q['supplier_id'] for q in links if q['part_id'] == self.part}, {first, second})
+        self.assertEqual({q['part_id'] for q in links if q['supplier_id'] == first}, {self.part, other_part})
+        self.assertIsNone(next(q for q in links if q['id'] == unpriced)['price'])
+        edit = self.request('quotes', 'POST', {**priced, 'price': ''})
+        self.assertEqual(edit['id'], existing)
+        self.assertIsNone(next(q for q in self.state()['quotes'] if q['id'] == existing)['price'])
+        self.request('quotes/' + unpriced, 'DELETE', {})
+        self.assertEqual(len(self.state()['quotes']), 2)
+
     def test_purchase_creation_rolls_back(self):
         self.request('purchases','POST',{'supplier_id':self.supplier(),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
         self.assertEqual(self.state()['purchases'],[]);self.assertEqual(self.state()['purchase_lines'],[])
@@ -150,6 +175,49 @@ class IntegrationTests(unittest.TestCase):
         else:self.fail('Private image exposed without authentication')
         self.request('files/'+fid,'DELETE',{})
         self.assertFalse((app.DATA/'uploads'/fid).exists())
+    def test_file_names_follow_material_and_keep_replacement_order(self):
+        from urllib.parse import unquote
+        png = b'\x89PNG\r\n\x1a\n' + b'picture'
+        image = self.upload('screenshot.PNG', png)['ids'][0]
+        attachment = self.upload('manufacturer-v2.pdf', b'%PDF-1.4')['ids'][0]
+        name = self.state()['parts'][0]['name']
+        files = {f['id']: f for f in self.state()['files']}
+        self.assertEqual(files[image]['name'], f'{self.code} {name}（01）.png')
+        self.assertEqual(files[attachment]['name'], f'{self.code} {name}（02）.pdf')
+        self.assertEqual(files[attachment]['original_name'], 'manufacturer-v2.pdf')
+        replacement = self.upload('new.png', png, image)['ids'][0]
+        self.assertFalse((app.DATA / 'uploads' / image).exists())
+        self.request('parts/' + self.part, 'PUT', {'name': '控制板 / V2', 'category': '结构物料'})
+        code = self.state()['parts'][0]['code']
+        self.assertNotEqual(code, self.code)
+        files = {f['id']: f for f in self.state()['files']}
+        self.assertEqual(files[replacement]['name'], f'{code} 控制板 V2（01）.png')
+        self.assertEqual(files[attachment]['name'], f'{code} 控制板 V2（02）.pdf')
+        request = urllib.request.Request(self.base + '/files/' + attachment, headers={'Cookie': self.cookie})
+        with urllib.request.urlopen(request) as response:
+            self.assertEqual(unquote(response.headers['Content-Disposition'].split("''", 1)[1]), files[attachment]['name'])
+            self.assertEqual(response.read(), b'%PDF-1.4')
+
+    def test_automatic_cleanup_limits_removal_to_old_unreferenced_images(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'picture'
+        upload_dir = app.DATA / 'uploads'
+        referenced = upload_dir / self.upload('linked.png', png)['ids'][0]
+        orphan, recent, document, unmanaged, symlink = [
+            upload_dir / name for name in (app.uid(), app.uid(), app.uid(), 'manual.png', app.uid())
+        ]
+        for file in (orphan, recent, unmanaged):
+            file.write_bytes(png)
+        document.write_bytes(b'%PDF-1.4')
+        symlink.symlink_to(unmanaged)
+        stale_time = 1
+        for file in (referenced, orphan, document, unmanaged):
+            os.utime(file, (stale_time, stale_time))
+        self.assertEqual(app.cleanup_orphan_images(), 1)
+        self.assertFalse(orphan.exists())
+        for file in (referenced, recent, document, unmanaged, symlink):
+            self.assertTrue(file.exists(), file.name)
+        self.assertEqual(app.cleanup_orphan_images(), 0)
+
     def test_invalid_image_is_rejected(self):
         self.upload('bad.png',b'<script>bad</script>',status=400)
         self.assertEqual(self.state()['files'],[])
@@ -197,7 +265,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertTrue(all(p['sub_product_id'] is None for p in materials.values()))
                     self.assertEqual(materials['screw']['stock'],5)
                     self.assertEqual(db.execute("SELECT qty FROM bom_lines WHERE id='legacy-line'").fetchone()[0],4)
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],5)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],6)
                     self.assertTrue(all(len(p['code'])==8 and p['code'][:2].isalpha() and p['code'][2:].isdigit() for p in materials.values()))
                     self.assertEqual(db.execute("SELECT part_id FROM material_code_aliases WHERE code='screw'").fetchone()[0],'screw')
             finally: app.DATA=previous

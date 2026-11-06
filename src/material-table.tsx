@@ -1,5 +1,5 @@
 import { useRef, useState, type ReactNode } from "react";
-import { GripVertical } from "lucide-react";
+import { GripVertical, ListFilter } from "lucide-react";
 
 const fields = {
   code: ["料号", 110],
@@ -26,6 +26,19 @@ const fields = {
 
 type Column = keyof typeof fields;
 type Row = { id: string; cells: Partial<Record<Column, ReactNode>> };
+type Widths = Partial<Record<Column, number>>;
+const maximumWidth = 640;
+function minimumWidth(id: Column) {
+  if (id === "code") return 100;
+  if (id === "actions") return 112;
+  if (id === "photo") return 62;
+  if (id === "unit") return 68;
+  if (id === "category" || id === "parents") return 112;
+  return 80;
+}
+function clampWidth(id: Column, width: number) {
+  return Math.max(minimumWidth(id), Math.min(maximumWidth, Math.round(width)));
+}
 const numeric = new Set<Column>([
   "qty",
   "price",
@@ -68,6 +81,41 @@ export function MaterialTable({
     }
     return [];
   });
+  const widthKey = "plm-column-widths-" + tableId;
+  const [widths, setWidths] = useState<Widths>(() => {
+    try {
+      const saved = JSON.parse(localStorage.getItem(widthKey) || "{}");
+      const values: Widths = {};
+      for (const id of Object.keys(fields) as Column[]) {
+        if (typeof saved?.[id] === "number" && Number.isFinite(saved[id]))
+          values[id] = clampWidth(id, saved[id]);
+      }
+      return values;
+    } catch {
+      return {};
+    }
+  });
+  const widthOf = (id: Column) => widths[id] ?? fields[id][1];
+  const resize = useRef<{
+    id: Column;
+    pointer: number;
+    x: number;
+    start: number;
+    next: number;
+  } | null>(null);
+  function setWidth(id: Column, width: number | null, persist = false) {
+    const next = { ...widths };
+    if (width === null) delete next[id];
+    else next[id] = clampWidth(id, width);
+    setWidths(next);
+    if (persist) {
+      try {
+        localStorage.setItem(widthKey, JSON.stringify(next));
+      } catch {
+        /* Width remains available for this session. */
+      }
+    }
+  }
   const available: Column[] = columns.filter(
     (id) => id !== "code" && id !== "actions",
   );
@@ -119,12 +167,12 @@ export function MaterialTable({
       <table
         className="editable-table configurable-table"
         style={{
-          minWidth: visible.reduce((sum, id) => sum + fields[id][1], 0),
+          width: visible.reduce((sum, id) => sum + widthOf(id), 0),
         }}
       >
         <colgroup>
           {visible.map((id) => (
-            <col key={id} style={{ width: fields[id][1] }} />
+            <col key={id} style={{ width: widthOf(id) }} />
           ))}
         </colgroup>
         <thead>
@@ -195,20 +243,80 @@ export function MaterialTable({
                     </button>
                   )}
                   {id === "category" ? (
-                    <select
-                      aria-label="类别筛选"
-                      value={category}
-                      onChange={(e) => setCategory(e.target.value)}
-                    >
-                      <option value="">类别：全部</option>
-                      {materialCategories.map((item) => (
-                        <option key={item}>{item}</option>
-                      ))}
-                    </select>
+                    <div className="column-filter">
+                      <select
+                        aria-label="类别筛选"
+                        title={category ? "类别：" + category : "筛选类别"}
+                        value={category}
+                        onChange={(e) => setCategory(e.target.value)}
+                      >
+                        <option value="">类别</option>
+                        {materialCategories.map((item) => (
+                          <option key={item}>{item}</option>
+                        ))}
+                      </select>
+                      <ListFilter size={13} aria-hidden="true" />
+                    </div>
                   ) : (
                     fields[id][0]
                   )}
                 </div>
+                <button
+                  className="column-resizer"
+                  type="button"
+                  aria-label={"调整" + fields[id][0] + "列宽"}
+                  title="拖动调整列宽，双击恢复默认"
+                  onPointerDown={(e) => {
+                    if (e.button !== 0) return;
+                    const width = widthOf(id);
+                    e.currentTarget.setPointerCapture(e.pointerId);
+                    resize.current = {
+                      id,
+                      pointer: e.pointerId,
+                      x: e.clientX,
+                      start: width,
+                      next: width,
+                    };
+                  }}
+                  onPointerMove={(e) => {
+                    const active = resize.current;
+                    if (active?.pointer !== e.pointerId) return;
+                    active.next = clampWidth(
+                      id,
+                      active.start + e.clientX - active.x,
+                    );
+                    setWidth(id, active.next);
+                  }}
+                  onPointerUp={(e) => {
+                    const active = resize.current;
+                    if (active?.pointer !== e.pointerId) return;
+                    setWidth(id, active.next, true);
+                    resize.current = null;
+                  }}
+                  onLostPointerCapture={() => {
+                    const active = resize.current;
+                    if (active?.id !== id) return;
+                    setWidth(id, active.start);
+                    resize.current = null;
+                  }}
+                  onDoubleClick={() => setWidth(id, null, true)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Home") {
+                      e.preventDefault();
+                      setWidth(id, null, true);
+                    } else if (
+                      e.key === "ArrowLeft" ||
+                      e.key === "ArrowRight"
+                    ) {
+                      e.preventDefault();
+                      setWidth(
+                        id,
+                        widthOf(id) + (e.key === "ArrowRight" ? 10 : -10),
+                        true,
+                      );
+                    }
+                  }}
+                />
               </th>
             ))}
           </tr>

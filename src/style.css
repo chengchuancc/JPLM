@@ -3655,12 +3655,58 @@ button.material-photo {
 .column-target {
   box-shadow: inset 0 -2px #53725b;
 }
-.column-heading select {
+.column-filter {
+  position: relative;
+  min-width: 0;
+}
+.column-filter select {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  border-radius: 3px;
+  box-shadow: none;
+  color: inherit;
+  cursor: pointer;
   font: inherit;
-  padding: 3px 18px 3px 4px;
+  min-height: 26px;
   min-width: 0;
   width: 100%;
-  min-height: 28px;
+  padding: 3px 17px 3px 1px;
+}
+.column-filter select:hover,
+.column-filter select:focus-visible {
+  background: #edf1ed;
+}
+.column-filter > svg {
+  position: absolute;
+  right: 1px;
+  top: 50%;
+  transform: translateY(-50%);
+  pointer-events: none;
+}
+.configurable-table th:not(.fixed-code, .fixed-actions) {
+  position: relative;
+}
+.column-resizer {
+  position: absolute;
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 8px;
+  padding: 0;
+  cursor: col-resize;
+  touch-action: none;
+}
+.column-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 10px 1px;
+  border-right: 1px solid #dfe5df;
+}
+.column-resizer:hover::after,
+.column-resizer:focus-visible::after,
+.column-resizer:active::after {
+  border-right: 2px solid #718875;
 }
 .table-announcement {
   position: absolute;
@@ -3685,7 +3731,15 @@ button.material-photo {
 }
 @media (max-width: 600px) {
   .configurable-table .fixed-actions {
-    position: static;
+    position: relative;
+    z-index: auto;
     box-shadow: none;
   }
+}
+
+.file-original-name {
+  display: block;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
