@@ -18,7 +18,6 @@ import {
   MoreHorizontal,
   Grid2X2,
   List,
-  SlidersHorizontal,
   ScanLine,
   Settings,
   LogOut,
@@ -64,7 +63,12 @@ import {
   Movement,
   FileRecord,
 } from "./types";
-import { MaterialTable, materialCategories } from "./material-table";
+import {
+  MaterialTable,
+  ColumnVisibility,
+  materialCategories,
+  type Column,
+} from "./material-table";
 import "./style.css";
 
 const money = (n: number) =>
@@ -318,24 +322,53 @@ function EntityForm({
   submit,
   onCancel,
   label = "保存",
+  images,
 }: {
   fields: Field[];
   initial?: any;
   submit: (d: any) => Promise<void>;
   onCancel: () => void;
   label?: string;
+  images?: {
+    upload: (files: File[]) => Promise<void>;
+    finish: () => Promise<void>;
+  };
 }) {
   const [values, setValues] = useState<any>(initial);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [selected, setSelected] = useState<File[]>([]);
+  function addImages(files: File[]) {
+    if (!files.length) return;
+    try {
+      setSelected(mergeImages(selected, files));
+      setError("");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
   return (
     <form
+      onPaste={(event) => {
+        if (!images || busy) return;
+        const files = pasteEventImages(event);
+        if (!files.length) return;
+        event.preventDefault();
+        addImages(files);
+      }}
       onSubmit={async (e) => {
         e.preventDefault();
         setError("");
         setBusy(true);
         try {
           await submit(values);
+          if (images) {
+            if (selected.length) {
+              await images.upload(selected);
+              setSelected([]);
+            }
+            await images.finish();
+          }
         } catch (e) {
           setError((e as Error).message);
         } finally {
@@ -343,6 +376,17 @@ function EntityForm({
         }
       }}
     >
+      {images && (
+        <ImagePasteArea
+          selected={selected}
+          busy={busy}
+          addImages={addImages}
+          setError={setError}
+          removeImage={(index) =>
+            setSelected((files) => files.filter((_, i) => i !== index))
+          }
+        />
+      )}
       <div className="form-grid">
         {fields.map((f) => (
           <label key={f.name} className={f.wide ? "wide-field" : ""}>
@@ -468,7 +512,23 @@ function App() {
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("全部产品");
   const [materialLevel, setMaterialLevel] = useState(1);
-  const [showParents, setShowParents] = useState(true);
+  const [hiddenColumns, setHiddenColumns] = useState<Record<string, Column[]>>(
+    () => {
+      try {
+        const saved = JSON.parse(
+          localStorage.getItem("plm-hidden-columns") || "{}",
+        );
+        return Object.fromEntries(
+          ["parts", "inventory", "bom", "children"].map((id) => [
+            id,
+            Array.isArray(saved?.[id]) ? saved[id] : [],
+          ]),
+        );
+      } catch {
+        return {};
+      }
+    },
+  );
   const [parentFilter, setParentFilter] = useState("");
   const [categories, setCategories] = useState<Record<string, string>>({});
   const categoryProps = (key: string) => ({
@@ -862,16 +922,76 @@ function App() {
       </button>
     ));
   }
-  const associationToggle = materialLevel === 2 && (
-    <label className="field-toggle">
-      <input
-        type="checkbox"
-        checked={showParents}
-        onChange={(e) => setShowParents(e.target.checked)}
+  const levelColumns: Column[] = materialLevel === 2 ? ["parents"] : [];
+  const childColumns: Column[] = materialLevel === 1 ? ["children"] : [];
+  const bomColumns: Column[] = [
+    "photo",
+    "name",
+    "category",
+    ...levelColumns,
+    "spec",
+    "external_code",
+    "brand",
+    "unit",
+    "qty",
+    "price",
+    "subtotal",
+    "stock",
+    "reference",
+    "notes",
+    ...childColumns,
+  ];
+  const libraryColumns: Column[] = [
+    "photo",
+    "name",
+    "category",
+    ...levelColumns,
+    "spec",
+    "external_code",
+    "brand",
+    "unit",
+    "price",
+    "stock",
+    "min_stock",
+    "location",
+    "notes",
+    "level",
+    ...childColumns,
+  ];
+  const childrenColumns: Column[] = [
+    "photo",
+    "name",
+    "category",
+    "spec",
+    "external_code",
+    "brand",
+    "unit",
+    "qty",
+    "price",
+    "stock",
+    "reference",
+    "notes",
+    "parents",
+  ];
+  function displayFields(tableId: string, columns: Column[]) {
+    return (
+      <ColumnVisibility
+        columns={columns}
+        hidden={hiddenColumns[tableId] || []}
+        onChange={(hidden) => {
+          const next = { ...hiddenColumns, [tableId]: hidden };
+          setHiddenColumns(next);
+          if (hidden.includes("category") && categories[tableId])
+            categoryProps(tableId).setCategory("");
+          try {
+            localStorage.setItem("plm-hidden-columns", JSON.stringify(next));
+          } catch {
+            /* Available for this session. */
+          }
+        }}
       />
-      关联一级物料
-    </label>
-  );
+    );
+  }
   const bomCost = (pid: string) => {
     const vs = state.bom_versions.filter((v) => v.product_id === pid);
     return state.bom_lines
@@ -1176,7 +1296,10 @@ function App() {
               <>
                 <ChevronRight size={14} />
                 <span className="current">
-                  {product?.name || part?.name || supplier?.name || purchase?.code}
+                  {product?.name ||
+                    part?.name ||
+                    supplier?.name ||
+                    purchase?.code}
                 </span>
               </>
             )}
@@ -1342,7 +1465,7 @@ function App() {
                       (filter === "全部产品" || p.status === filter) &&
                       match(p.name, p.code, p.english_code),
                   )
-                  .map((p, i) => {
+                  .map((p) => {
                     const vs = state.bom_versions.filter(
                       (v) => v.product_id === p.id,
                     );
@@ -1362,9 +1485,6 @@ function App() {
                           ) && (
                             <span className="visual-caption">
                               {p.english_code || p.code}
-                              <span>
-                                PRODUCT / {String(i + 1).padStart(2, "0")}
-                              </span>
                             </span>
                           )}
                         </button>
@@ -1531,7 +1651,7 @@ function App() {
                   <div className="section-toolbar">
                     {levelTabs}
                     <div className="toolbar-controls">
-                      {associationToggle}
+                      {displayFields("bom", bomColumns)}
                       <Button
                         small
                         onClick={() =>
@@ -1584,25 +1704,8 @@ function App() {
                   <MaterialTable
                     tableId="bom"
                     {...categoryProps("bom")}
-                    columns={[
-                      "photo",
-                      "name",
-                      "category",
-                      ...(materialLevel === 2 && showParents
-                        ? ["parents" as const]
-                        : []),
-                      "spec",
-                      "external_code",
-                      "brand",
-                      "unit",
-                      "qty",
-                      "price",
-                      "subtotal",
-                      "stock",
-                      "reference",
-                      "notes",
-                      ...(materialLevel === 1 ? ["children" as const] : []),
-                    ]}
+                    columns={bomColumns}
+                    hiddenColumns={hiddenColumns["bom"] || []}
                     rows={displayedBom.map((line) => {
                       const material = findPart(line.part_id)!;
                       return {
@@ -1747,7 +1850,6 @@ function App() {
               <div className="section-toolbar">
                 {levelTabs}
                 <div className="toolbar-controls">
-                  {associationToggle}
                   {view === "parts" && materialLevel === 2 && (
                     <Button
                       small
@@ -1777,14 +1879,17 @@ function App() {
                         ))}
                     </select>
                   )}
-                  <div className="search-input">
-                    <Search size={16} />
-                    <input
-                      aria-label="搜索物料"
-                      placeholder="搜索物料"
-                      value={search}
-                      onChange={(e) => setSearch(e.target.value)}
-                    />
+                  <div className="material-search-controls">
+                    <div className="search-input">
+                      <Search size={16} />
+                      <input
+                        aria-label="搜索物料"
+                        placeholder="搜索物料"
+                        value={search}
+                        onChange={(e) => setSearch(e.target.value)}
+                      />
+                    </div>
+                    {displayFields(view, libraryColumns)}
                   </div>
                   {view === "inventory" && (
                     <select
@@ -1827,25 +1932,8 @@ function App() {
                 key={view}
                 tableId={view}
                 {...categoryProps(view)}
-                columns={[
-                  "photo",
-                  "name",
-                  "category",
-                  ...(materialLevel === 2 && showParents
-                    ? ["parents" as const]
-                    : []),
-                  "spec",
-                  "external_code",
-                  "brand",
-                  "unit",
-                  "price",
-                  "stock",
-                  "min_stock",
-                  "location",
-                  "notes",
-                  "level",
-                  ...(materialLevel === 1 ? ["children" as const] : []),
-                ]}
+                columns={libraryColumns}
+                hiddenColumns={hiddenColumns[view] || []}
                 rows={visibleParts.map((material) => ({
                   id: material.id,
                   cells: {
@@ -1991,6 +2079,7 @@ function App() {
                       <span className="muted">{childLinks.length}</span>
                     </h3>
                     <div className="toolbar-controls">
+                      {displayFields("children", childrenColumns)}
                       <Button
                         small
                         onClick={() =>
@@ -2033,21 +2122,8 @@ function App() {
                   <MaterialTable
                     tableId="children"
                     {...categoryProps("children")}
-                    columns={[
-                      "photo",
-                      "name",
-                      "category",
-                      "spec",
-                      "external_code",
-                      "brand",
-                      "unit",
-                      "qty",
-                      "price",
-                      "stock",
-                      "reference",
-                      "notes",
-                      "parents",
-                    ]}
+                    columns={childrenColumns}
+                    hiddenColumns={hiddenColumns["children"] || []}
                     rows={displayedChildren.map((link) => {
                       const child = findPart(link.child_id)!;
                       const saveLink = async (
@@ -3216,21 +3292,38 @@ function App() {
                         ? partFields
                         : supplierFields
                   }
-                  initial={modal.item || {}}
+                  initial={modal.item}
                   onCancel={() => setModal(null)}
-                  submit={(d) =>
-                    mutate(
-                      (
-                        {
-                          product: "products",
-                          part: "parts",
-                          supplier: "suppliers",
-                        } as any
-                      )[modal.kind] + (d.id ? "/" + d.id : ""),
-                      d.id ? "PUT" : "POST",
-                      d,
-                    )
+                  images={
+                    modal.kind === "product"
+                      ? {
+                          upload: async (files) => {
+                            const form = new FormData();
+                            form.append("owner_type", "products");
+                            form.append("owner_id", modal.item.id);
+                            files.forEach((file) => form.append("file", file));
+                            await api("files", "POST", form);
+                          },
+                          finish: async () => {
+                            await refresh();
+                            setModal(null);
+                            notify("已保存");
+                          },
+                        }
+                      : undefined
                   }
+                  submit={async (data) => {
+                    if (modal.kind === "product") {
+                      await api("products/" + data.id, "PUT", data);
+                    } else {
+                      await mutate(
+                        (modal.kind === "part" ? "parts/" : "suppliers/") +
+                          data.id,
+                        "PUT",
+                        data,
+                      );
+                    }
+                  }}
                 />
               </Dialog>
             )}
@@ -4794,6 +4887,91 @@ function MaterialPhoto({
     </div>
   );
 }
+function ImagePasteArea({
+  selected,
+  addImages,
+  removeImage,
+  setError,
+  busy,
+}: {
+  selected: File[];
+  addImages: (files: File[]) => void;
+  removeImage: (index: number) => void;
+  setError: (error: string) => void;
+  busy: boolean;
+}) {
+  const [previews, setPreviews] = useState<string[]>([]);
+  useEffect(() => {
+    const urls = selected.map((file) => URL.createObjectURL(file));
+    setPreviews(urls);
+    return () => urls.forEach((url) => URL.revokeObjectURL(url));
+  }, [selected]);
+  return (
+    <div
+      className="quick-create-images paste-image-area"
+      tabIndex={0}
+      aria-label="图片粘贴区域"
+    >
+      <div className="quick-previews">
+        {previews.map((u, i) => (
+          <div key={u}>
+            <img src={u} alt={selected[i]?.name} />
+            <button
+              type="button"
+              title="移除图片"
+              disabled={busy}
+              onClick={() => removeImage(i)}
+            >
+              <X size={12} />
+            </button>
+          </div>
+        ))}
+      </div>
+      <div className="paste-actions">
+        <Button
+          small
+          type="button"
+          disabled={busy}
+          onClick={async () => {
+            setError("");
+            try {
+              addImages(await readClipboardImages());
+            } catch (e) {
+              setError((e as Error).message);
+            }
+          }}
+        >
+          <ImageIcon size={16} />
+          粘贴图片
+        </Button>
+        <span>⌘V / Ctrl+V</span>
+        <label className={"btn small " + (busy ? "disabled" : "")}>
+          <ImageIcon size={15} />
+          选择文件
+          <input
+            aria-label="添加图片"
+            hidden
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
+            multiple
+            disabled={busy}
+            onChange={(e) => {
+              addImages(Array.from(e.target.files || []));
+              e.target.value = "";
+            }}
+          />
+        </label>
+      </div>
+    </div>
+  );
+}
+function mergeImages(previous: File[], files: File[]) {
+  const next = [...previous, ...files];
+  if (next.length > 12) throw Error("每次最多 12 张图片");
+  if (next.reduce((size, file) => size + file.size, 0) > 20 * 1024 * 1024)
+    throw Error("图片总计不能超过 20 MB");
+  return next;
+}
 function QuickCreateForm({
   images,
   fields,
@@ -4819,35 +4997,20 @@ function QuickCreateForm({
     initial.parent_ids || [],
   );
   const [selected, setSelected] = useState<File[]>([]);
-  const [previews, setPreviews] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const created = useRef("");
   const uploaded = useRef(false);
   function addImages(files: File[]) {
-    if (!files.length) {
-      setError("剪贴板中没有图片");
-      return;
+    if (!files.length) return;
+    try {
+      setSelected(mergeImages(selected, files));
+      uploaded.current = false;
+      setError("");
+    } catch (e) {
+      setError((e as Error).message);
     }
-    const all = [...selected, ...files];
-    if (all.length > 12) {
-      setError("每次最多 12 张图片");
-      return;
-    }
-    if (all.reduce((n, f) => n + f.size, 0) > 20 * 1024 * 1024) {
-      setError("图片总计不能超过 20 MB");
-      return;
-    }
-    setError("");
-    uploaded.current = false;
-    setSelected(all);
   }
-
-  useEffect(() => {
-    const urls = selected.map((f) => URL.createObjectURL(f));
-    setPreviews(urls);
-    return () => urls.forEach((u) => URL.revokeObjectURL(u));
-  }, [selected]);
   return (
     <form
       onPaste={(e) => {
@@ -4884,65 +5047,16 @@ function QuickCreateForm({
       }}
     >
       {images && (
-        <div
-          className="quick-create-images paste-image-area"
-          tabIndex={0}
-          aria-label="图片粘贴区域"
-        >
-          <div className="quick-previews">
-            {previews.map((u, i) => (
-              <div key={u}>
-                <img src={u} alt={selected[i]?.name} />
-                <button
-                  type="button"
-                  title="移除图片"
-                  disabled={busy}
-                  onClick={() => {
-                    uploaded.current = false;
-                    setSelected((fs) => fs.filter((_, j) => j !== i));
-                  }}
-                >
-                  <X size={12} />
-                </button>
-              </div>
-            ))}
-          </div>
-          <div className="paste-actions">
-            <Button
-              small
-              type="button"
-              disabled={busy}
-              onClick={async () => {
-                setError("");
-                try {
-                  addImages(await readClipboardImages());
-                } catch (e) {
-                  setError((e as Error).message);
-                }
-              }}
-            >
-              <ImageIcon size={16} />
-              粘贴图片
-            </Button>
-            <span>⌘V / Ctrl+V</span>
-            <label className={"btn small " + (busy ? "disabled" : "")}>
-              <ImageIcon size={15} />
-              选择文件
-              <input
-                aria-label="添加图片"
-                hidden
-                type="file"
-                accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
-                multiple
-                disabled={busy}
-                onChange={(e) => {
-                  addImages(Array.from(e.target.files || []));
-                  e.target.value = "";
-                }}
-              />
-            </label>
-          </div>
-        </div>
+        <ImagePasteArea
+          selected={selected}
+          busy={busy}
+          addImages={addImages}
+          setError={setError}
+          removeImage={(index) => {
+            uploaded.current = false;
+            setSelected((files) => files.filter((_, i) => i !== index));
+          }}
+        />
       )}
       <label className="form-label">
         名称

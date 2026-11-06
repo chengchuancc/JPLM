@@ -1,5 +1,5 @@
-import { useRef, useState, type ReactNode } from "react";
-import { GripVertical, ListFilter } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { GripVertical, ListFilter, SlidersHorizontal } from "lucide-react";
 
 const fields = {
   code: ["料号", 110],
@@ -24,7 +24,7 @@ const fields = {
   actions: ["操作", 112],
 } as const;
 
-type Column = keyof typeof fields;
+export type Column = keyof typeof fields;
 type Row = { id: string; cells: Partial<Record<Column, ReactNode>> };
 type Widths = Partial<Record<Column, number>>;
 const maximumWidth = 640;
@@ -48,9 +48,82 @@ const numeric = new Set<Column>([
 ]);
 export const materialCategories = ["结构物料", "电子物料"];
 
+export function ColumnVisibility({
+  columns,
+  hidden,
+  onChange,
+}: {
+  columns: Column[];
+  hidden: Column[];
+  onChange: (hidden: Column[]) => void;
+}) {
+  const menu = useRef<HTMLDetailsElement>(null);
+  useEffect(() => {
+    const dismiss = (event: PointerEvent) => {
+      if (menu.current && !menu.current.contains(event.target as Node))
+        menu.current.open = false;
+    };
+    document.addEventListener("pointerdown", dismiss);
+    return () => document.removeEventListener("pointerdown", dismiss);
+  }, []);
+  return (
+    <details
+      ref={menu}
+      className="column-visibility"
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || !menu.current?.open) return;
+        event.stopPropagation();
+        menu.current.open = false;
+        menu.current.querySelector("summary")?.focus();
+      }}
+    >
+      <summary className="btn small">
+        <SlidersHorizontal size={14} />
+        显示字段
+      </summary>
+      <div className="column-visibility-menu">
+        <div className="column-visibility-heading">
+          <strong>显示字段</strong>
+          <button
+            className="text-link"
+            type="button"
+            onClick={() => onChange([])}
+          >
+            显示全部
+          </button>
+        </div>
+        <div className="column-visibility-list">
+          {(["code", ...columns, "actions"] as Column[]).map((id) => {
+            const fixed = id === "code" || id === "actions";
+            return (
+              <label key={id}>
+                <input
+                  type="checkbox"
+                  checked={fixed || !hidden.includes(id)}
+                  disabled={fixed}
+                  onChange={(event) =>
+                    onChange(
+                      event.target.checked
+                        ? hidden.filter((item) => item !== id)
+                        : [...hidden, id],
+                    )
+                  }
+                />
+                {fields[id][0]}
+                {fixed && <span>固定</span>}
+              </label>
+            );
+          })}
+        </div>
+      </div>
+    </details>
+  );
+}
+
 export function MaterialTable({
   tableId,
   columns,
+  hiddenColumns,
   rows,
   category,
   setCategory,
@@ -58,6 +131,7 @@ export function MaterialTable({
 }: {
   tableId: string;
   columns: Column[];
+  hiddenColumns: Column[];
   rows: Row[];
   category: string;
   setCategory: (value: string) => void;
@@ -119,10 +193,11 @@ export function MaterialTable({
   const available: Column[] = columns.filter(
     (id) => id !== "code" && id !== "actions",
   );
-  const movable = [
+  const ordered = [
     ...order.filter((id) => available.includes(id)),
     ...available.filter((id) => !order.includes(id)),
   ];
+  const movable = ordered.filter((id) => !hiddenColumns.includes(id));
   const visible: Column[] = ["code", ...movable, "actions"];
   const wrap = useRef<HTMLDivElement>(null);
   const drag = useRef<{ id: Column; pointer: number; x: number } | null>(null);
