@@ -114,6 +114,19 @@ export type MaterialLink = {
 };
 export type CodeAlias = { code: string; part_id: string };
 export type UserOption = { id: string; name: string };
+export type ProjectSummary = {
+  id: string;
+  code: string;
+  name: string;
+  owner_id: string | null;
+  owner_name: string | null;
+  archived_at: string | null;
+  pending_purchases: number;
+  updated_at: string;
+};
+export type ProjectDetails = Omit<ProjectSummary, "owner_name" | "pending_purchases"> & {
+  members: string[];
+};
 export type User = UserOption & {
   email: string;
   role: "admin" | "member";
@@ -131,6 +144,8 @@ export type Activity = {
 };
 export type State = {
   users: UserOption[];
+  former_users: UserOption[];
+  project?: Omit<ProjectDetails, "members">;
   material_links: MaterialLink[];
   material_code_aliases: CodeAlias[];
   products: Product[];
@@ -147,6 +162,7 @@ export type State = {
 };
 export const emptyState: State = {
   users: [],
+  former_users: [],
   material_links: [],
   material_code_aliases: [],
   products: [],

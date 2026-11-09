@@ -56,6 +56,8 @@ import {
   emptyState,
   State,
   Product,
+  ProjectSummary,
+  ProjectDetails,
   Part,
   Supplier,
   Quote,
@@ -112,6 +114,11 @@ async function api(path: string, method = "GET", data?: unknown) {
   }
   return j;
 }
+const ProjectContext = React.createContext({ id: "", archived: false });
+function projectRequest(projectId: string, path: string, method = "GET", data?: unknown) {
+  return api("projects/" + encodeURIComponent(projectId) + "/" + path, method, data);
+}
+
 function download(content: Blob | string, name: string) {
   const url = URL.createObjectURL(
     content instanceof Blob
@@ -845,6 +852,7 @@ function ActivityPanel({
   part?: string;
   kind?: "operation" | "login";
 }) {
+  const { id: projectId } = useContext(ProjectContext);
   const [items, setItems] = useState<Activity[]>([]);
   const [more, setMore] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -853,14 +861,10 @@ function ActivityPanel({
     setBusy(true);
     setError("");
     try {
-      const result = await api(
-        "activity?" +
-          new URLSearchParams({
-            before: String(before),
-            part: part || "",
-            kind,
-          }),
-      );
+      const path = "activity?" + new URLSearchParams({ before: String(before), part: part || "", kind });
+      const result = projectId && kind === "operation"
+        ? await projectRequest(projectId, path)
+        : await api(path);
       setItems((previous) =>
         before ? [...previous, ...result.items] : result.items,
       );
@@ -1020,27 +1024,348 @@ function BackupPanel({ onRestored }: { onRestored: () => void }) {
     </section>
   );
 }
+type AuthState = {
+  initialized: boolean;
+  authenticated: boolean;
+  user: User | null;
+};
+type WorkspaceRoute = { projectId: string; view: string; detail: string };
+const projectHome: WorkspaceRoute = { projectId: "", view: "projects", detail: "" };
+
+function readWorkspaceRoute(): WorkspaceRoute {
+  const [top, id, view, detail] = location.hash.slice(1).split("/");
+  if (top === "settings") return { ...projectHome, view: "settings" };
+  if (top === "projects" && id) {
+    const valid = navs.some((nav) => nav.id === view) || view === "project-settings";
+    return { projectId: id, view: valid ? view : "products", detail: valid ? detail || "" : "" };
+  }
+  if (id && ["products", "parts", "purchases", "suppliers"].includes(top))
+    return { projectId: "", view: top, detail: id };
+  return projectHome;
+}
+
+function workspaceHash(route: WorkspaceRoute) {
+  const base = route.projectId ? "projects/" + route.projectId + "/" : "";
+  return "#" + base + route.view + (route.detail ? "/" + route.detail : "");
+}
+
 function App() {
-  const [auth, setAuth] = useState<{
-    initialized: boolean;
-    authenticated: boolean;
-    user: User | null;
-  } | null>(null);
-  const [state, setState] = useState<State>(emptyState);
-  const currentUser = auth?.user;
-  const [avatarVersion, setAvatarVersion] = useState(0);
+  const [auth, setAuth] = useState<AuthState | null>(null);
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [route, setRoute] = useState(readWorkspaceRoute);
   const [restored, setRestored] = useState(false);
-  const [accountView, setAccountView] = useState("profile");
-  const userOptions = state.users.map(({ id, name }) => ({
-    value: id,
-    label: name,
-  }));
-  const userName = (id: string | null) =>
-    state.users.find((user) => user.id === id)?.name || "—";
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const draftOpen = useRef(false);
+  const currentRoute = useRef(route);
+  currentRoute.current = route;
+
+  const reloadProjects = async () => {
+    const next: ProjectSummary[] = await api("projects");
+    setProjects(next);
+    return next;
+  };
+  async function load() {
+    setLoading(true);
+    setError("");
+    try {
+      const status: AuthState = await api("auth/status");
+      setAuth(status);
+      if (status.authenticated && !status.user?.must_change) await reloadProjects();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setLoading(false);
+    }
+  }
+  function navigate(next: WorkspaceRoute, replace = false) {
+    if (currentRoute.current.projectId !== next.projectId && draftOpen.current &&
+        !window.confirm("有未保存的内容。离开当前项目？")) return;
+    if (location.hash !== workspaceHash(next)) {
+      if (replace) history.replaceState(null, "", workspaceHash(next));
+      else history.pushState(null, "", workspaceHash(next));
+    }
+    currentRoute.current = next;
+    setRoute(next);
+  }
+  useEffect(() => {
+    void load();
+    const changed = () => {
+      const next = readWorkspaceRoute();
+      if (currentRoute.current.projectId !== next.projectId && draftOpen.current &&
+          !window.confirm("有未保存的内容。离开当前项目？")) {
+        history.replaceState(null, "", workspaceHash(currentRoute.current));
+        return;
+      }
+      currentRoute.current = next;
+      setRoute(next);
+    };
+    const expire = () => {
+      draftOpen.current = false;
+      setProjects([]);
+      setAuth((a) => a && { ...a, authenticated: false, user: null });
+    };
+    window.addEventListener("hashchange", changed);
+    window.addEventListener("plm-session-expired", expire);
+    return () => {
+      window.removeEventListener("hashchange", changed);
+      window.removeEventListener("plm-session-expired", expire);
+    };
+  }, []);
+  useEffect(() => {
+    if (route.projectId || !route.detail || !auth?.authenticated || auth.user?.must_change) return;
+    let active = true;
+    api("resolve/" + route.view + "/" + encodeURIComponent(route.detail)).then(
+      (record) => { if (active) navigate({ ...route, projectId: record.project_id }, true); },
+      () => { if (active) navigate(projectHome, true); },
+    );
+    return () => { active = false; };
+  }, [route, auth?.authenticated, auth?.user?.must_change]);
+
+  if (loading) return <div className="loading-page"><BrandMark /><span>加载中…</span></div>;
+  if (error) return <div className="loading-page"><AlertCircle /><p>{error}</p><Button onClick={load}>重试</Button></div>;
+  if (!auth?.authenticated || !auth.user)
+    return <Login initialized={auth?.initialized || false} onLogin={load} restored={restored} />;
+  if (auth.user.must_change)
+    return (
+      <div className="login-page compact-login">
+        <div className="login-card">
+          <LoginBrand />
+          <h2>修改初始密码</h2>
+          <PasswordForm onSaved={load} />
+          <Button onClick={async () => { await api("auth/logout", "POST"); await load(); }}>退出登录</Button>
+        </div>
+      </div>
+    );
+  if (!route.projectId && route.detail)
+    return <div className="loading-page"><BrandMark /><span>正在打开记录…</span></div>;
+  const project = projects.find((item) => item.id === route.projectId);
+  if (route.projectId && !project)
+    return (
+      <div className="loading-page">
+        <BrandMark /><span>项目不存在或无权访问</span>
+        <Button onClick={() => navigate(projectHome)}>返回项目列表</Button>
+      </div>
+    );
+  return (
+      <Workspace
+        key={project?.id || "system"}
+        route={route}
+        project={project}
+        projects={projects}
+        currentUser={auth.user}
+        navigate={navigate}
+        draftOpen={draftOpen}
+        reloadProjects={reloadProjects}
+        updateUser={async () => setAuth(await api("auth/status"))}
+        onLogout={async () => {
+          await api("auth/logout", "POST");
+          draftOpen.current = false;
+          navigate(projectHome, true);
+          setProjects([]);
+          setAuth({ ...auth, authenticated: false, user: null });
+        }}
+        onRestore={() => {
+          draftOpen.current = false;
+          navigate(projectHome, true);
+          setProjects([]);
+          setRestored(true);
+          setAuth({ initialized: true, authenticated: false, user: null });
+        }}
+      />
+  );
+}
+
+function ProjectDirectory({ projects, open, create }: {
+  projects: ProjectSummary[];
+  open: (id: string) => void;
+  create?: (name: string) => Promise<void>;
+}) {
+  const [query, setQuery] = useState("");
+  const [archived, setArchived] = useState(false);
+  const [creating, setCreating] = useState(false);
+  const term = query.trim().toLowerCase();
+  const rows = projects.filter((project) => !!project.archived_at === archived &&
+    [project.name, project.code].some((value) => value.toLowerCase().includes(term)));
+  return (
+    <>
+      <div className="page-heading">
+        <h1>项目 <span className="heading-count">{rows.length}</span></h1>
+        {create && <Button primary onClick={() => setCreating(true)}><Plus size={17} />新建项目</Button>}
+      </div>
+      <div className="section-toolbar">
+        <div className="tabs">
+          <button className={!archived ? "selected" : ""} onClick={() => setArchived(false)}>进行中</button>
+          <button className={archived ? "selected" : ""} onClick={() => setArchived(true)}>已归档</button>
+        </div>
+        <div className="search-input">
+          <Search size={15} />
+          <input aria-label="搜索项目" placeholder="搜索项目名称、代号…" value={query}
+            onChange={(event) => setQuery(event.target.value)} />
+        </div>
+      </div>
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>项目</th><th>代号</th><th>负责人</th><th>状态</th>
+            <th className="num">待入库单数</th><th>更新时间</th></tr></thead>
+          <tbody>
+            {rows.map((project) => (
+              <tr key={project.id}>
+                <td><button className="text-link" onClick={() => open(project.id)}>
+                  {project.name}<ArrowUpRight size={13} />
+                </button></td>
+                <td className="mono">{project.code}</td><td>{project.owner_name || "—"}</td>
+                <td>{project.archived_at ? "已归档" : "进行中"}</td>
+                <td className="num">{project.pending_purchases}</td><td>{datetime(project.updated_at)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {!rows.length && <Empty title={term ? "没有符合条件的项目" : archived ? "暂无归档项目" : "暂无项目"} />}
+      </div>
+      {creating && create && (
+        <Dialog title="新建项目" onClose={() => setCreating(false)}>
+          <EntityForm fields={[{ name: "name", label: "项目名称", required: true, wide: true }]}
+            label="创建项目" onCancel={() => setCreating(false)}
+            submit={async ({ name }) => { await create(name); setCreating(false); }} />
+        </Dialog>
+      )}
+    </>
+  );
+}
+
+function ProjectSettings({ project, user, onSaved, canSeed, onSeed }: {
+  project: ProjectSummary;
+  user: User;
+  onSaved: () => Promise<void>;
+  canSeed: boolean;
+  onSeed: () => void;
+}) {
+  const [tab, setTab] = useState("settings");
+  const [details, setDetails] = useState<ProjectDetails | null>(null);
+  const [users, setUsers] = useState<UserOption[]>([]);
+  const [name, setName] = useState(project.name);
+  const [owner, setOwner] = useState("");
+  const [members, setMembers] = useState<string[]>([]);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  const admin = user.role === "admin";
+  const canEdit = !project.archived_at && (admin || project.owner_id === user.id);
+  const projectPath = "projects/" + project.id;
+  useEffect(() => {
+    let active = true;
+    Promise.all([api(projectPath), admin ? api("users") : Promise.resolve([])])
+      .then(([item, people]) => {
+        if (!active) return;
+        setDetails(item);
+        setName(item.name);
+        setOwner(item.owner_id || "");
+        setMembers(item.members);
+        setUsers(people);
+      })
+      .catch((e) => { if (active) setError(e.message); })
+      .finally(() => { if (active) setBusy(false); });
+    return () => { active = false; };
+  }, [projectPath, admin]);
+  async function save(data: unknown) {
+    setError("");
+    setBusy(true);
+    try {
+      await api(projectPath, "PUT", data);
+      await onSaved();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <>
+      <div className="page-heading"><h1>项目设置</h1></div>
+      <div className="tabs page-tabs">
+        <button className={tab === "settings" ? "selected" : ""} onClick={() => setTab("settings")}>项目资料</button>
+        <button className={tab === "activity" ? "selected" : ""} onClick={() => setTab("activity")}>操作记录</button>
+      </div>
+      {tab === "activity" ? <ActivityPanel /> : (
+        <section className="panel project-settings">
+          <form onSubmit={(event) => {
+            event.preventDefault();
+            void save(admin ? { name, owner_id: owner, members } : { name });
+          }}>
+            <div className="form-grid">
+              <label>项目名称<input required value={name} disabled={!canEdit || busy}
+                onChange={(event) => setName(event.target.value)} /></label>
+              <label>项目代号<input value={project.code} readOnly /></label>
+              {admin && details && (
+                <label>项目负责人<select value={owner} disabled={!canEdit || busy}
+                  onChange={(event) => setOwner(event.target.value)}>
+                  <option value="">未指定</option>
+                  {users.map((person) => <option key={person.id} value={person.id}>{person.name}</option>)}
+                </select></label>
+              )}
+            </div>
+            {admin && details && (
+              <fieldset className="project-members" disabled={!canEdit || busy}>
+                <legend>项目成员</legend>
+                {users.map((person) => (
+                  <label key={person.id}>
+                    <input type="checkbox" checked={person.id === owner || members.includes(person.id)}
+                      disabled={person.id === owner}
+                      onChange={(event) => setMembers((old) =>
+                        event.target.checked ? [...old, person.id] : old.filter((id) => id !== person.id))} />
+                    {person.name}
+                  </label>
+                ))}
+              </fieldset>
+            )}
+            {error && <p className="form-error" role="alert">{error}</p>}
+            {canEdit && <Button primary type="submit" disabled={busy || !details}>保存项目设置</Button>}
+          </form>
+          {admin && <div className="project-settings-actions">
+            {canSeed && <Button type="button" disabled={busy} onClick={onSeed}>载入示例数据</Button>}
+            <Button type="button" disabled={busy} onClick={() => {
+              if (project.archived_at || window.confirm("归档后项目只能查看。确认归档？"))
+                void save({ archived: !project.archived_at });
+            }}>{project.archived_at ? "恢复项目" : "归档项目"}</Button>
+          </div>}
+        </section>
+      )}
+    </>
+  );
+}
+
+function Workspace({
+  route, project, projects, currentUser, navigate, draftOpen, reloadProjects,
+  updateUser, onLogout, onRestore,
+}: {
+  route: WorkspaceRoute;
+  project?: ProjectSummary;
+  projects: ProjectSummary[];
+  currentUser: User;
+  navigate: (route: WorkspaceRoute) => void;
+  draftOpen: React.MutableRefObject<boolean>;
+  reloadProjects: () => Promise<ProjectSummary[]>;
+  updateUser: () => Promise<void>;
+  onLogout: () => Promise<void>;
+  onRestore: () => void;
+}) {
+  const [state, setState] = useState<State>(emptyState);
+  const [avatarVersion, setAvatarVersion] = useState(0);
+  const [accountView, setAccountView] = useState("profile");
+  const { view, detail } = route;
+  const projectId = project?.id || "";
+  const archived = !!project?.archived_at || !!state.project?.archived_at;
+  const userOptions = state.users.map(({ id, name }) => ({ value: id, label: name }));
+  const userName = (id: string | null) =>
+    state.users.find((user) => user.id === id)?.name ||
+    state.former_users.find((user) => user.id === id)?.name || "—";
   const [fatal, setFatal] = useState("");
-  const [view, setView] = useState("products");
-  const [detail, setDetail] = useState("");
+  const [projectReady, setProjectReady] = useState(!project);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; };
+  }, []);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("全部产品");
   const [materialLevel, setMaterialLevel] = useState(1);
@@ -1079,86 +1404,108 @@ function App() {
   const [mobile, setMobile] = useState(false);
   const [busy, setBusy] = useState(false);
   const notify = (s: string) => setToast(s);
+  const businessApi = (path: string, method = "GET", data?: unknown) =>
+    projectRequest(projectId, path, method, data);
+
+  const refreshSequence = useRef(0);
   async function refresh() {
-    const s = await api("state");
-    setState({ ...emptyState, ...s });
-    setFatal("");
-    return s as State;
-  }
-  async function load() {
-    setLoading(true);
+    const sequence = ++refreshSequence.current;
+    if (!projectId) return emptyState;
     try {
-      const a = await api("auth/status");
-      setAuth(a);
-      if (a.authenticated && !a.user?.must_change) await refresh();
+      const result = await businessApi("state") as State;
+      if (sequence === refreshSequence.current) {
+        setState({ ...emptyState, ...result });
+        setFatal("");
+      }
+      return result;
     } catch (e) {
-      setFatal((e as Error).message);
+      if (sequence === refreshSequence.current) {
+        setState(emptyState);
+        setFatal((e as Error).message);
+      }
+      throw e;
     } finally {
-      setLoading(false);
+      if (sequence === refreshSequence.current) setProjectReady(true);
     }
   }
   useEffect(() => {
-    load();
-    const hash = () => {
-      const [v, id] = location.hash.slice(1).split("/");
-      if (navs.some((n) => n.id === v) || v === "settings") {
-        setView(v);
-        setDetail(id || "");
-        setSearch("");
-        setFilter(v === "products" ? "全部产品" : "全部");
-      }
-    };
-    hash();
-    window.addEventListener("hashchange", hash);
-    return () => window.removeEventListener("hashchange", hash);
-  }, []);
-  useEffect(() => {
-    const expire = () => {
-      setAuth((a) => (a ? { ...a, authenticated: false } : a));
-      setState(emptyState);
-      setModal(null);
-      setChoice(null);
-    };
-    window.addEventListener("plm-session-expired", expire);
-    return () => window.removeEventListener("plm-session-expired", expire);
-  }, []);
-  useEffect(() => {
-    if (!auth?.authenticated || auth.user?.must_change) return;
+    if (!projectId) return;
     const sync = () => {
-      if (document.visibilityState === "visible")
-        refresh().catch((e) => setFatal(e.message));
+      if (document.visibilityState === "visible") void refresh().catch(() => {});
     };
+    void refresh().catch(() => {});
     const timer = setInterval(sync, 15000);
     window.addEventListener("focus", sync);
     document.addEventListener("visibilitychange", sync);
     return () => {
+      ++refreshSequence.current;
       clearInterval(timer);
       window.removeEventListener("focus", sync);
       document.removeEventListener("visibilitychange", sync);
     };
-  }, [auth?.authenticated, auth?.user?.must_change]);
+  }, [projectId]);
+  const internalRoute = useRef("");
+  useEffect(() => {
+    setSearch("");
+    setFilter(view === "products" ? "全部产品" : "全部");
+    if (internalRoute.current !== workspaceHash(route)) {
+      setTab("info");
+      setVersion("");
+    }
+    internalRoute.current = "";
+    setMobile(false);
+    setModal(null);
+    setChoice(null);
+  }, [view, detail]);
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 4000);
     return () => clearTimeout(t);
   }, [toast]);
-  function go(v: string, id = "") {
-    setView(v);
-    setDetail(id);
-    setSearch("");
-    setFilter(v === "products" ? "全部产品" : "全部");
+  const readOnlyModal = modal && ["scan", "qr", "preview", "material-files", "deleted-parts"].includes(modal.kind);
+  useEffect(() => {
+    const hasDraft = !!projectId && (!!choice || (!!modal && !readOnlyModal));
+    draftOpen.current = hasDraft;
+    if (!hasDraft) return;
+    const warn = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => {
+      draftOpen.current = false;
+      window.removeEventListener("beforeunload", warn);
+    };
+  }, [projectId, modal, choice]);
+  function go(nextView: string, id = "") {
+    if (!mounted.current) return;
+    const next = {
+      projectId: nextView === "settings" || nextView === "projects" ? "" : projectId,
+      view: nextView,
+      detail: id,
+    };
+    internalRoute.current = workspaceHash(next);
     setTab("info");
     setVersion("");
+    navigate(next);
     setMobile(false);
-    location.hash = v + (id ? "/" + id : "");
   }
+  useEffect(() => {
+    if (view === "projects") void reloadProjects().catch((e) => setFatal(e.message));
+  }, [view]);
+  useEffect(() => {
+    if (archived && modal && !readOnlyModal) {
+      setModal(null);
+      notify("项目已归档，只能查看");
+    }
+  }, [archived, modal, readOnlyModal]);
   async function mutate(
     path: string,
     method: string,
     d?: any,
     message = "已保存",
   ) {
-    await api(path, method, d);
+    await businessApi(path, method, d);
     await refresh();
     setModal(null);
     notify(message);
@@ -1272,11 +1619,11 @@ function App() {
         (filter === "无库存" && p.stock === 0)),
   );
   async function savePart(id: string, key: string, value: string) {
-    await api("material-cells/" + id, "PUT", { [key]: value });
+    await businessApi("material-cells/" + id, "PUT", { [key]: value });
     await refresh();
   }
   async function saveLine(id: string, key: string, value: string) {
-    await api("bom-lines/" + id, "PUT", { [key]: value });
+    await businessApi("bom-lines/" + id, "PUT", { [key]: value });
     await refresh();
   }
   function materialPhoto(p: Part) {
@@ -1548,7 +1895,8 @@ function App() {
         : "待入库";
   }
   const low = state.parts.filter((p) => p.stock < p.min_stock);
-  const title = navs.find((n) => n.id === view)?.name || "工作空间";
+  const title = navs.find((n) => n.id === view)?.name ||
+    ({ projects: "项目列表", settings: "系统设置", "project-settings": "项目设置" }[view] || "工作空间");
   const partOptions = state.parts.map((p) => ({
     value: p.id,
     label: p.code + " · " + p.name + " / 库存 " + amount(p.stock),
@@ -1757,56 +2105,29 @@ function App() {
         selectedVersion?.name,
     );
   }
-  if (loading)
-    return (
-      <div className="loading-page">
-        <BrandMark />
-        <span>加载中…</span>
-      </div>
-    );
-  if (fatal && !auth)
-    return (
-      <div className="loading-page">
-        <AlertCircle />
-        <p>{fatal}</p>
-        <Button onClick={load}>重试</Button>
-      </div>
-    );
-  if (!auth?.authenticated)
-    return (
-      <Login
-        initialized={auth?.initialized || false}
-        onLogin={load}
-        restored={restored}
-      />
-    );
-  if (currentUser?.must_change)
-    return (
-      <div className="login-page compact-login">
-        <div className="login-card">
-          <LoginBrand />
-          <h2>修改初始密码</h2>
-          <PasswordForm onSaved={load} />
-          <Button
-            onClick={async () => {
-              await api("auth/logout", "POST");
-              await load();
-            }}
-          >
-            退出登录
-          </Button>
-        </div>
-      </div>
-    );
   return (
+    <ProjectContext.Provider value={{ id: projectId, archived }}>
     <div className="app-shell">
       <aside className={`sidebar ${mobile ? "mobile-open" : ""}`}>
-        <a className="brand" href="#products" onClick={() => go("products")}>
+        <a className="brand" href="#projects" onClick={(event) => { event.preventDefault(); go("projects"); }}>
           <BrandMark />
           <strong>捷程未来PLM</strong>
         </a>
+        {project && (
+          <label className="project-switch">
+            <span>当前项目</span>
+            <select aria-label="切换项目" value={project.id} onChange={(event) => {
+              navigate({ projectId: event.target.value, view: navs.some((nav) => nav.id === view) ? view : "products", detail: "" });
+            }}>
+              {projects.map((item) => <option key={item.id} value={item.id}>{item.name}{item.archived_at ? "（已归档）" : ""}</option>)}
+            </select>
+          </label>
+        )}
         <nav>
-          {navs.map((n) => (
+          <button className={view === "projects" ? "active" : ""} onClick={() => go("projects")}>
+            <Layers size={19} strokeWidth={1.7} /><span>项目列表</span>
+          </button>
+          {project && navs.map((n) => (
             <button
               key={n.id}
               className={view === n.id ? "active" : ""}
@@ -1822,15 +2143,18 @@ function App() {
               )}
             </button>
           ))}
+          {project && <button className={view === "project-settings" ? "active" : ""} onClick={() => go("project-settings")}>
+            <Settings size={19} strokeWidth={1.7} /><span>项目设置</span>
+          </button>}
         </nav>
         <div className="sidebar-bottom">
-          <button onClick={() => setModal({ kind: "scan" })}>
+          {project && !fatal && <button onClick={() => setModal({ kind: "scan" })}>
             <ScanLine size={18} />
             扫码识别物料<span className="key">↵</span>
-          </button>
+          </button>}
           <button onClick={() => go("settings")}>
             <Settings size={18} />
-            设置与数据
+            系统设置
           </button>
           <div className="user-row">
             <Avatar user={currentUser} version={avatarVersion} />
@@ -1849,11 +2173,7 @@ function App() {
             <button
               className="icon-btn"
               title="退出登录"
-              onClick={async () => {
-                await api("auth/logout", "POST");
-                setState(emptyState);
-                setAuth({ ...auth, authenticated: false });
-              }}
+              onClick={onLogout}
             >
               <LogOut size={17} />
             </button>
@@ -1873,8 +2193,12 @@ function App() {
             <Menu size={20} />
           </button>
           <div className="breadcrumb">
-            <span>工作空间</span>
-            <ChevronRight size={14} />
+            {project && <>
+              <button onClick={() => go("projects")}>项目</button>
+              <ChevronRight size={14} />
+              <button onClick={() => go("products")}>{project.name}</button>
+              <ChevronRight size={14} />
+            </>}
             <button onClick={() => go(view)}>{title}</button>
             {detail && (
               <>
@@ -1913,11 +2237,34 @@ function App() {
             <div className="form-error">
               {fatal}
               <Button
-                onClick={() => refresh().catch((e) => setFatal(e.message))}
+                onClick={() => {
+                  if (project) void refresh().catch(() => {});
+                  else void reloadProjects().then(() => setFatal(""), (e) => setFatal(e.message));
+                }}
               >
                 重试
               </Button>
             </div>
+          )}
+          {project && !projectReady && <p className="muted">正在加载项目…</p>}
+          {archived && !fatal && <p className="project-archived" role="status">项目已归档，只能查看</p>}
+          {projectReady && !fatal && <>
+          {view === "projects" && <ProjectDirectory projects={projects}
+            open={(id) => navigate({ projectId: id, view: "products", detail: "" })}
+            create={currentUser.role === "admin" ? async (name) => {
+              const result = await api("projects", "POST", { name });
+              await reloadProjects();
+              navigate({ projectId: result.id, view: "products", detail: "" });
+            } : undefined}
+          />}
+          {view === "project-settings" && project && (
+            <ProjectSettings project={{ ...project, ...state.project }} user={currentUser} onSaved={async () => {
+              await reloadProjects();
+              await refresh();
+            }} canSeed={!archived && !state.products.length && !state.parts.length &&
+              !state.deleted_parts.length && !state.suppliers.length && !state.movements.length &&
+              !state.purchases.length}
+              onSeed={() => setModal({ kind: "demo" })} />
           )}
           {view === "products" && !detail && (
             <>
@@ -2781,7 +3128,7 @@ function App() {
                         field: "qty" | "reference" | "notes",
                         value: string,
                       ) => {
-                        await api("material-links/" + link.id, "PUT", {
+                        await businessApi("material-links/" + link.id, "PUT", {
                           [field]: value,
                         });
                         await refresh();
@@ -3714,17 +4061,17 @@ function App() {
             <>
               <div className="page-heading">
                 <div>
-                  <h1>设置与数据</h1>
+                  <h1>系统设置</h1>
                 </div>
               </div>
               <div className="tabs page-tabs">
                 {[
                   ["profile", "个人资料"],
-                  ["activity", "操作记录"],
                   ["login-activity", "登录记录"],
                   ...(currentUser?.role === "admin"
                     ? [
                         ["users", "用户管理"],
+                        ["system-activity", "系统操作记录"],
                         ["backup", "备份与恢复"],
                       ]
                     : []),
@@ -3743,13 +4090,13 @@ function App() {
                   user={currentUser}
                   version={avatarVersion}
                   onSaved={async () => {
-                    setAuth(await api("auth/status"));
+                    await updateUser();
                     setAvatarVersion((version) => version + 1);
                     notify("已保存");
                   }}
                 />
               )}
-              {accountView === "activity" && <ActivityPanel />}
+              {currentUser.role === "admin" && accountView === "system-activity" && <ActivityPanel />}
               {accountView === "login-activity" && (
                 <ActivityPanel key="login" kind="login" />
               )}
@@ -3757,44 +4104,13 @@ function App() {
                 <UserAdmin
                   actorId={currentUser.id}
                   onChange={async () => {
-                    await refresh();
-                    setAuth(await api("auth/status"));
+                    await updateUser();
                   }}
                 />
               )}
               {currentUser?.role === "admin" && accountView === "backup" && (
                 <div className="settings-grid">
-                  <BackupPanel
-                    onRestored={() => {
-                      setState(emptyState);
-                      setRestored(true);
-                      setAccountView("profile");
-                      go("products");
-                      setAuth({
-                        initialized: true,
-                        authenticated: false,
-                        user: null,
-                      });
-                    }}
-                  />
-                  <section className="panel">
-                    <div className="panel-heading">
-                      <h3>示例数据</h3>
-                      <Boxes size={18} />
-                    </div>
-                    <Button
-                      disabled={
-                        !!(
-                          state.products.length ||
-                          state.parts.length ||
-                          state.suppliers.length
-                        )
-                      }
-                      onClick={() => setModal({ kind: "demo" })}
-                    >
-                      载入示例数据
-                    </Button>
-                  </section>
+                  <BackupPanel onRestored={onRestore} />
                 </div>
               )}
             </>
@@ -3809,6 +4125,7 @@ function App() {
                 action={<Button onClick={() => go(view)}>返回列表</Button>}
               />
             )}
+          </>}
           <footer className="main-footer">
             <span>捷程未来PLM</span>
             <span>
@@ -3827,8 +4144,8 @@ function App() {
           </button>
         </div>
       )}
-      {modal && (
-        <ChoiceContext.Provider value={setChoice}>
+      {!fatal && modal && (!archived || readOnlyModal) && (
+        <ChoiceContext.Provider value={archived ? null : setChoice}>
           {((["product", "part", "supplier"].includes(modal.kind) &&
             !modal.item?.id) ||
             modal.kind === "bom-create" ||
@@ -3883,7 +4200,7 @@ function App() {
                 }
                 onCancel={() => setModal(null)}
                 create={async (data) => {
-                  const r = await api(
+                  const r = await businessApi(
                     modal.kind === "bom-create"
                       ? "bom-materials"
                       : ["part", "child-create"].includes(modal.kind)
@@ -3909,7 +4226,7 @@ function App() {
                   );
                   fd.append("owner_id", id);
                   images.forEach((f) => fd.append("file", f));
-                  await api("files", "POST", fd);
+                  await businessApi("files", "POST", fd);
                 }}
                 done={async () => {
                   await refresh();
@@ -4018,7 +4335,7 @@ function App() {
                             form.append("owner_type", "products");
                             form.append("owner_id", modal.item.id);
                             files.forEach((file) => form.append("file", file));
-                            await api("files", "POST", form);
+                            await businessApi("files", "POST", form);
                           },
                           finish: async () => {
                             await refresh();
@@ -4030,7 +4347,7 @@ function App() {
                   }
                   submit={async (data) => {
                     if (modal.kind === "product") {
-                      await api("products/" + data.id, "PUT", data);
+                      await businessApi("products/" + data.id, "PUT", data);
                     } else {
                       await mutate(
                         (modal.kind === "part" ? "parts/" : "suppliers/") +
@@ -4086,7 +4403,7 @@ function App() {
                 }}
                 onCancel={() => setModal(null)}
                 submit={async (d) => {
-                  const r = await api("bom-versions", "POST", d);
+                  const r = await businessApi("bom-versions", "POST", d);
                   await refresh();
                   setVersion(r.id);
                   setModal(null);
@@ -4219,7 +4536,7 @@ function App() {
                 context={modal.extra || {}}
                 onCancel={() => setModal(null)}
                 submit={async (payload) => {
-                  const result = await api(
+                  const result = await businessApi(
                     "electronic-import/commit",
                     "POST",
                     payload,
@@ -4426,7 +4743,7 @@ function App() {
             <Dialog title="载入示例工作空间" onClose={() => setModal(null)}>
               <p className="confirm-copy">
                 将创建 4 个示例产品、8 种物料、2 家供应商，以及示例
-                BOM、采购和库存流水。示例数据会保存到当前数据库，请在正式录入数据前体验。
+                BOM、采购和库存流水。示例数据会保存到当前项目，请在正式录入数据前体验。
               </p>
               <AsyncAction
                 onCancel={() => setModal(null)}
@@ -4437,7 +4754,7 @@ function App() {
           )}
         </ChoiceContext.Provider>
       )}
-      {choice && (
+      {!fatal && !archived && choice && (
         <Dialog
           title={"新建" + choiceNames[choice.resource]}
           onClose={() => setChoice(null)}
@@ -4461,14 +4778,14 @@ function App() {
               numbering_product_id: choice.productId || "",
             }}
             create={async (data) =>
-              (await api(choice.resource, "POST", data)).id
+              (await businessApi(choice.resource, "POST", data)).id
             }
             upload={async (id, images) => {
               const form = new FormData();
               form.append("owner_type", choice.resource);
               form.append("owner_id", id);
               images.forEach((image) => form.append("file", image));
-              await api("files", "POST", form);
+              await businessApi("files", "POST", form);
             }}
             done={async (id) => {
               const updated = await refresh();
@@ -4481,6 +4798,7 @@ function App() {
         </Dialog>
       )}
     </div>
+    </ProjectContext.Provider>
   );
 }
 function AsyncAction({
@@ -5380,10 +5698,11 @@ function FileManager({
   onPreview: (f: FileRecord) => void;
   onDelete: (f: FileRecord) => void;
 }) {
+  const { id: projectId, archived } = useContext(ProjectContext);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const upload = async (fs: FileList | File[] | null, replace?: string) => {
-    if (!fs?.length) return;
+    if (!fs?.length || archived) return;
     setBusy(true);
     setError("");
     try {
@@ -5392,7 +5711,7 @@ function FileManager({
       fd.append("owner_id", id);
       if (replace) fd.append("replace_id", replace);
       for (const f of Array.from(fs)) fd.append("file", f);
-      await api("files", "POST", fd);
+      await projectRequest(projectId, "files", "POST", fd);
       await onRefresh();
       onError(replace ? "文件已替换" : "文件已上传");
     } catch (e) {
@@ -5406,7 +5725,7 @@ function FileManager({
       className="file-manager"
       onPaste={(e) => {
         const files = pasteEventImages(e);
-        if (files.length && !busy) {
+        if (files.length && !busy && !archived) {
           e.preventDefault();
           upload(files);
         }
@@ -5418,7 +5737,7 @@ function FileManager({
             图片与附件 <span className="muted">{items.length} 个文件</span>
           </h3>
         </div>
-        <Button
+        {!archived && <Button
           disabled={busy}
           onClick={async () => {
             try {
@@ -5430,8 +5749,8 @@ function FileManager({
         >
           <ImageIcon size={15} />
           粘贴图片
-        </Button>
-        <label className={`btn primary ${busy ? "disabled" : ""}`}>
+        </Button>}
+        {!archived && <label className={`btn primary ${busy ? "disabled" : ""}`}>
           <Upload size={16} />
           {busy ? "正在上传…" : "上传文件"}
           <input
@@ -5444,7 +5763,7 @@ function FileManager({
             }}
             hidden
           />
-        </label>
+        </label>}
       </div>
       {error && <div className="form-error">{error}</div>}
       <div className="file-grid">
@@ -5473,7 +5792,7 @@ function FileManager({
               )}
               <span>{(f.size / 1024).toFixed(1)} KB</span>
               <div className="file-actions">
-                <label className="text-link">
+                {!archived && <label className="text-link">
                   <RefreshCw size={13} />
                   替换
                   <input
@@ -5490,23 +5809,23 @@ function FileManager({
                       e.target.value = "";
                     }}
                   />
-                </label>
+                </label>}
                 <a className="text-link" href={fileUrl(f.id)} download={f.name}>
                   <Download size={13} />
                 </a>
-                <button
+                {!archived && <button
                   className="text-link"
                   title="删除文件"
                   onClick={() => onDelete(f)}
                 >
                   <Trash2 size={14} />
-                </button>
+                </button>}
               </div>
             </div>
           </div>
         ))}
       </div>
-      {!items.length && (
+      {!items.length && !archived && (
         <label className="upload-zone file-empty">
           <ImageIcon size={30} />
           <strong>上传图片或附件</strong>
@@ -5525,9 +5844,10 @@ function FileManager({
   );
 }
 function QRPanel({ part }: { part: Part }) {
+  const { id: projectId } = useContext(ProjectContext);
   const [image, setImage] = useState("");
   const [error, setError] = useState("");
-  const url = location.origin + appBase + "#parts/" + part.id;
+  const url = location.origin + appBase + workspaceHash({ projectId, view: "parts", detail: part.id });
   useEffect(() => {
     QRCode.toDataURL(url, {
       width: 600,
@@ -5572,6 +5892,7 @@ function Scanner({
   aliases: { code: string; part_id: string }[];
   onFound: (p: Part) => void;
 }) {
+  const { id: projectId } = useContext(ProjectContext);
   const [input, setInput] = useState("");
   const [camera, setCamera] = useState(false);
   const [error, setError] = useState("");
@@ -5583,6 +5904,8 @@ function Scanner({
     try {
       const u = new URL(value);
       if (u.hash.startsWith("#parts/")) id = u.hash.slice(7);
+      const [top, project, view, detail] = u.hash.slice(1).split("/");
+      if (top === "projects" && project === projectId && view === "parts") id = detail;
     } catch {}
     const p = parts.find(
       (p) =>
@@ -5747,6 +6070,7 @@ function InlineCell({
   required?: boolean;
   options?: { value: string; label: string }[];
 }) {
+  const { archived } = useContext(ProjectContext);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(String(value ?? ""));
   const [busy, setBusy] = useState(false);
@@ -5790,6 +6114,7 @@ function InlineCell({
       setBusy(false);
     }
   }
+  if (archived) return <span>{String(value ?? "") || "—"}</span>;
   if (!editing)
     return (
       <button
@@ -6383,6 +6708,7 @@ function ElectronicImportForm({
   submit: (payload: any) => Promise<void>;
   onCancel: () => void;
 }) {
+  const { id: projectId } = useContext(ProjectContext);
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<any>(null);
   const [rows, setRows] = useState<any[]>([]);
@@ -6410,7 +6736,7 @@ function ElectronicImportForm({
       const form = new FormData();
       form.append("file", f);
       if (sheet) form.append("sheet", sheet);
-      const data = await api("electronic-import/preview", "POST", form);
+      const data = await projectRequest(projectId, "electronic-import/preview", "POST", form);
       if (ticket !== generation.current) return;
       setPreview(data);
       setRows(data.rows);

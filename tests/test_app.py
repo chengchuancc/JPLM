@@ -19,12 +19,18 @@ class IntegrationTests(unittest.TestCase):
     def setUp(self):
         with app.transaction() as db:
             for t in reversed(app.TABLES): db.execute('DELETE FROM '+t)
-            db.execute('DELETE FROM sessions');db.execute('DELETE FROM activity');db.execute('DELETE FROM users');db.execute('DELETE FROM settings');db.execute('DELETE FROM import_runs')
+            for table in ('sessions', 'activity', 'import_runs', 'project_members', 'projects', 'users', 'settings'):
+                db.execute('DELETE FROM ' + table)
         app.Handler.attempts.clear();self.cookie=''
         self.request('auth/setup','POST',{'password':'test-password-1234'})
+        self.project_id = self.request('projects', 'POST', {'name': '测试项目'})['id']
         self.part=self.request('parts','POST',{'name':'测试物料','category':'电子物料','price':1.5,'unit':'个','min_stock':2})['id']
         self.code=self.state()['parts'][0]['code']
-    def request(self,path,method='GET',data=None,status=200,headers=None,raw=False):
+    def request(self,path,method='GET',data=None,status=200,headers=None,raw=False,project=None):
+        resource = path.split('/', 1)[0].split('?', 1)[0]
+        system = {'auth', 'account', 'users', 'reset-password', 'avatars', 'projects', 'backup', 'restore', 'resolve'}
+        if project is not False and resource not in system and 'kind=login' not in path:
+            path = 'projects/' + (project or self.project_id) + '/' + path
         h={'Content-Type':'application/json','Cookie':self.cookie};h.update(headers or {})
         req=urllib.request.Request(self.base+'/api/'+path,data=data if isinstance(data,bytes) else json.dumps(data).encode() if data is not None else None,headers=h,method=method)
         try: r=urllib.request.urlopen(req)
@@ -67,14 +73,7 @@ class IntegrationTests(unittest.TestCase):
         other_part = self.request('parts', 'POST', {'name': '另一个物料'})['id']
         priced = {'part_id': self.part, 'supplier_id': first, 'price': 0, 'url': 'https://example.com/item'}
         existing = self.request('quotes', 'POST', priced)['id']
-        with app.transaction() as db:
-            db.execute('ALTER TABLE quotes RENAME TO quotes_new')
-            db.execute(app.QUOTES_SCHEMA.replace('price REAL CHECK', 'price REAL NOT NULL CHECK'))
-            db.execute('INSERT INTO quotes SELECT * FROM quotes_new')
-            db.execute('DROP TABLE quotes_new')
-            db.execute('PRAGMA user_version=5')
-        app.init_db()
-        self.assertEqual(self.state()['quotes'], [{'id': existing, **priced}])
+        self.assertEqual(self.state()['quotes'], [{'id': existing, 'project_id': self.project_id, **priced}])
         unpriced = self.request('quotes', 'POST', {'part_id': self.part, 'supplier_id': second})['id']
         self.request('quotes', 'POST', {'part_id': other_part, 'supplier_id': first})
         links = self.state()['quotes']
@@ -91,6 +90,7 @@ class IntegrationTests(unittest.TestCase):
         admin_cookie = self.cookie
         account = {'name': '经办测试', 'email': 'operator@example.test', 'password': 'temporary-1234'}
         member = self.request('users', 'POST', account)['id']
+        self.request('projects/' + self.project_id, 'PUT', {'members': [member]})
         self.request('users', 'POST', {**account, 'email': 'OPERATOR@example.test'}, 409)
         self.request('auth/login', 'POST', account)
         self.request('state', status=403)
@@ -125,6 +125,7 @@ class IntegrationTests(unittest.TestCase):
         admin_cookie = self.cookie
         account = {'name': '口令测试', 'email': 'password@example.test', 'password': '甲'}
         member = self.request('users', 'POST', account)['id']
+        self.request('projects/' + self.project_id, 'PUT', {'members': [member]})
         self.request('auth/login', 'POST', account)
         self.request('account/password', 'POST', {'current_password': '甲', 'password': '甲'})
         self.assertFalse(self.request('auth/status')['user']['must_change'])
@@ -153,7 +154,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual((app.DATA / 'uploads' / restored).read_bytes(), b'backup contents')
         self.assertFalse((app.DATA / 'uploads' / fid).exists())
         self.assertTrue((app.DATA / 'before-restore.zip').is_file())
-        self.assertEqual(self.request('activity')['items'][0]['action'], '恢复备份')
+        self.assertEqual(self.request('activity', project=False)['items'][0]['action'], '恢复备份')
 
     def test_purchase_creation_rolls_back(self):
         self.request('purchases','POST',{'supplier_id':self.supplier_for(self.part),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
@@ -194,7 +195,8 @@ class IntegrationTests(unittest.TestCase):
         self.request('products/' + product, 'DELETE', {'password': 'wrong'}, 403)
         admin_cookie = self.cookie
         member = {'name': '成员', 'email': 'member@example.test', 'password': 'member-pass'}
-        self.request('users', 'POST', member)
+        member_id = self.request('users', 'POST', member)['id']
+        self.request('projects/' + self.project_id, 'PUT', {'members': [member_id]})
         self.request('auth/login', 'POST', member)
         self.request('account/password', 'POST', {'current_password': member['password'], 'password': member['password']})
         self.request('products/' + product, 'DELETE', {'password': 'test-password-1234'}, 403)
@@ -272,7 +274,7 @@ class IntegrationTests(unittest.TestCase):
     def test_concurrent_outbound_is_atomic(self):
         self.move('入库',10)
         def take(_):
-            req=urllib.request.Request(self.base+'/api/movements',data=json.dumps({'type':'出库','part_id':self.part,'qty':1}).encode(),headers={'Cookie':self.cookie,'Content-Type':'application/json'})
+            req=urllib.request.Request(self.base+'/api/projects/'+self.project_id+'/movements',data=json.dumps({'type':'出库','part_id':self.part,'qty':1}).encode(),headers={'Cookie':self.cookie,'Content-Type':'application/json'})
             try:
                 with urllib.request.urlopen(req) as response:return response.status
             except urllib.error.HTTPError as e:
@@ -382,6 +384,114 @@ class IntegrationTests(unittest.TestCase):
         self.request('demo','POST',{})
         s=self.state();self.assertEqual(len(s['products']),4);self.assertEqual(len(s['parts']),8);self.assertEqual(len(s['movements']),10)
         self.request('demo','POST',{},400)
+
+    def test_project_isolation_references_and_archive(self):
+        other = self.request('projects', 'POST', {'name': '项目乙'})['id']
+        first_product = self.request('products', 'POST', {'name': '甲产品', 'english_code': 'SAME'})['id']
+        self.request('products', 'POST', {'name': '乙产品', 'english_code': 'SAME'}, project=other)
+        other_part = self.request('parts', 'POST', {'name': '测试物料', 'material_level': 2}, project=other)['id']
+        self.request('parts', 'POST', {'name': '串账物料', 'numbering_product_id': first_product},
+                     status=404, project=other)
+        self.move('入库', 10)
+        self.request('movements', 'POST', {'type': '入库', 'part_id': self.part, 'qty': 1},
+                     status=404, project=other)
+        self.request('movements', 'POST', {'type': '入库', 'part_id': other_part, 'qty': 3}, project=other)
+        self.assertEqual(self.stock(), 10)
+        self.assertEqual(self.request('state', project=other)['parts'][0]['stock'], 3)
+        self.assertNotEqual(self.code[-4:], self.request('state', project=other)['parts'][0]['code'][-4:])
+        version = self.state()['bom_versions'][0]['id']
+        with self.assertRaises(app.sqlite3.IntegrityError), app.transaction() as db:
+            db.project_id = self.project_id
+            app.insert_bom_line(db, version, other_part, 1)
+        self.request('bom-lines', 'POST', {'version_id': version, 'part_id': other_part, 'qty': 1}, 404)
+        supplier = self.supplier()
+        self.request('quotes', 'POST', {'part_id': other_part, 'supplier_id': supplier}, 404, project=other)
+        self.request('state', status=404, project=False)
+        self.request('parts', 'POST', {'name': '绕过项目'}, 404, project=False)
+
+        # Matching and retry keys are independent even when files have identical rows.
+        payload = {'request_id': 'repeat-in-projects-001', 'rows': [{'name': '复用测试', 'qty': 1}]}
+        for project in (self.project_id, other):
+            result = self.request('electronic-import/commit', 'POST', payload, project=project)
+            self.assertEqual(result['created'], 1)
+        self.request('projects/' + other, 'PUT', {'archived': True})
+        self.assertTrue(self.request('state', project=other)['project']['archived_at'])
+        self.request('parts/' + other_part, 'PUT', {'name': '禁止修改'}, 409, project=other)
+        self.request('projects/' + other, 'PUT', {'archived': False})
+        self.request('parts/' + other_part, 'PUT', {'name': '恢复后可改'}, project=other)
+
+    def test_project_membership_protects_files_logs_and_old_links(self):
+        other = self.request('projects', 'POST', {'name': '独立项目'})['id']
+        self.request('parts', 'POST', {'name': '独立项目物料'}, project=other)
+        file_id = self.upload('project.txt', b'project private')['ids'][0]
+        admin_cookie = self.cookie
+        account = {'name': '独立项目成员', 'email': 'isolated@example.test', 'password': 'member'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('projects/' + other, 'PUT', {'members': [member]})
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+        member_cookie = self.cookie
+        self.assertEqual([project['id'] for project in self.request('projects')], [other])
+        self.request('state', status=404)
+        self.request('activity', status=404)
+        self.request('resolve/parts/' + self.part, status=404)
+        self.request('projects/' + other, 'PUT', {'members': [member]}, 403)
+        def fetch_file(status):
+            request = urllib.request.Request(self.base + '/files/' + file_id, headers={'Cookie': self.cookie})
+            if status == 200:
+                with urllib.request.urlopen(request) as response:
+                    self.assertEqual(response.read(), b'project private')
+            else:
+                with self.assertRaises(urllib.error.HTTPError) as caught:
+                    urllib.request.urlopen(request)
+                self.assertEqual(caught.exception.code, status)
+                caught.exception.close()
+        fetch_file(404)
+        self.cookie = admin_cookie
+        self.request('projects/' + self.project_id, 'PUT', {'members': [member]})
+        self.cookie = member_cookie
+        self.assertEqual(self.request('resolve/parts/' + self.part)['project_id'], self.project_id)
+        fetch_file(200)
+        self.move('入库', 2)
+        self.cookie = admin_cookie
+        self.request('projects/' + self.project_id, 'PUT', {'members': []})
+        self.assertIn({'id': member, 'name': account['name']}, self.state()['former_users'])
+        self.cookie = member_cookie
+        fetch_file(404)
+
+    def test_v8_backup_restores_as_legacy_project_with_original_business_ids(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            legacy = folder / 'legacy'
+            app.init_legacy_db(legacy, {'name': '旧管理员', 'email': 'legacy@example.test', 'password': 'legacy'})
+            with app.connect(legacy) as db:
+                stamp = app.now()
+                user = db.execute("SELECT id FROM users WHERE role='admin'").fetchone()[0]
+                db.execute("INSERT INTO products(id,code,name,created_at,updated_at) VALUES('p','P-1','旧产品',?,?)", (stamp,stamp))
+                db.execute("""INSERT INTO parts(id,code,name,category,stock,material_serial,numbering_product_id,created_at,updated_at)
+                              VALUES('m','CM110001','旧物料','结构物料',8,1,'p',?,?)""", (stamp,stamp))
+                db.execute("INSERT INTO bom_versions VALUES('v','p','V1.0','',?)", (stamp,))
+                db.execute("INSERT INTO bom_lines VALUES('l','v','m',3,'','')")
+                db.execute("INSERT INTO material_code_aliases VALUES('旧料号','m')")
+                db.execute("INSERT INTO files VALUES(?, 'parts','m','旧图纸.txt','text/plain',4,'attachment',?)", ('a'*24,stamp))
+                db.execute("INSERT INTO activity(actor_id,actor_name,action,subject_id,subject,detail,created_at) VALUES(?,'旧管理员','入库','m','旧物料','',?)", (user,stamp))
+                db.execute("INSERT INTO activity(actor_id,actor_name,action,subject_id,subject,detail,created_at) VALUES(?,'旧管理员','登录',?,'旧管理员','',?)", (user,user,stamp))
+            archive = folder / 'v8.zip'
+            with zipfile.ZipFile(archive, 'w') as output:
+                output.write(legacy / 'plm.sqlite3', 'plm.sqlite3')
+                output.writestr('uploads/' + 'a'*24, b'file')
+            restored, version = app.stage_restore(archive, folder)
+            self.assertEqual(version, 8)
+            with app.connect(restored) as db:
+                db.project_id = app.LEGACY_PROJECT_ID
+                state = app.get_state(db)
+                self.assertEqual((state['parts'][0]['id'], state['parts'][0]['stock']), ('m', 8))
+                self.assertEqual(state['bom_lines'][0]['id'], 'l')
+                self.assertEqual(state['material_code_aliases'][0]['code'], '旧料号')
+                self.assertEqual(db.execute('SELECT user_id FROM project_members').fetchone()[0], user)
+                self.assertEqual([r[0] for r in db.execute('SELECT project_id FROM activity ORDER BY id')],
+                                 [app.LEGACY_PROJECT_ID, None])
+            self.assertEqual((restored / 'uploads' / ('a'*24)).read_bytes(), b'file')
     def test_auto_codes_are_not_reused_after_deletion(self):
         m=self.request('parts','POST',{'name':'可以删除'})['id']
         previous=self.state()['parts'][-1]['code']
@@ -409,7 +519,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertTrue(all(p['sub_product_id'] is None for p in materials.values()))
                     self.assertEqual(materials['screw']['stock'],5)
                     self.assertEqual(db.execute("SELECT qty FROM bom_lines WHERE id='legacy-line'").fetchone()[0],4)
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],8)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],9)
                     self.assertTrue(all(len(p['code'])==8 and p['code'][:2].isalpha() and p['code'][2:].isdigit() for p in materials.values()))
                     self.assertEqual(db.execute("SELECT part_id FROM material_code_aliases WHERE code='screw'").fetchone()[0],'screw')
             finally: app.DATA=previous

@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as BaseThrea
 from pathlib import Path
 from urllib.parse import quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
+from projects import VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES, SCOPED_TABLES, migrate_projects
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_PATH = os.environ.get("PLM_BASE_PATH", "").rstrip("/")
@@ -85,6 +86,25 @@ def required(v, label='名称'):
     return s
 
 def init_db(directory=None, bootstrap=None):
+    directory = DATA if directory is None else directory
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / 'uploads').mkdir(exist_ok=True)
+    with connect(directory) as db:
+        version = db.execute('PRAGMA user_version').fetchone()[0]
+        if version > VERSION:
+            raise RuntimeError('数据库版本高于当前程序版本')
+        if version == VERSION:
+            if bootstrap:
+                if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+                    raise Problem('管理员已初始化')
+                create_account(db, bootstrap, 'admin')
+            return
+    if version < 8 or bootstrap:
+        init_legacy_db(directory, bootstrap)
+    with connect(directory) as db:
+        migrate_projects(db, now())
+
+def init_legacy_db(directory=None, bootstrap=None):
     directory = DATA if directory is None else directory
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'uploads').mkdir(exist_ok=True)
@@ -178,6 +198,8 @@ def init_db(directory=None, bootstrap=None):
         db.execute('PRAGMA user_version=8')
 
 class ClosingConnection(sqlite3.Connection):
+    project_id = None
+
     def __exit__(self, exc_type, exc_value, traceback):
         try: return super().__exit__(exc_type, exc_value, traceback)
         finally: self.close()
@@ -202,7 +224,10 @@ def transaction():
     finally: db.close()
 
 def exists(db, table, id):
-    r = db.execute(f'SELECT * FROM {table} WHERE id=?', (id,)).fetchone()
+    if db.project_id and table in SCOPED_TABLES:
+        r = db.execute(f'SELECT * FROM {table} WHERE id=? AND project_id=?', (id, db.project_id)).fetchone()
+    else:
+        r = db.execute(f'SELECT * FROM {table} WHERE id=?', (id,)).fetchone()
     if not r: raise Problem('关联记录不存在', 404)
     return dict(r)
 
@@ -211,6 +236,32 @@ def active_part(db, id):
     if part['deleted_at']:
         raise Problem('物料已删除，请先恢复物料', 409)
     return part
+
+def insert_scoped(db, table, values, conflict=''):
+    columns = ','.join(('project_id', *values))
+    placeholders = ','.join('?' for _ in range(len(values) + 1))
+    db.execute(f'INSERT INTO {table} ({columns}) VALUES ({placeholders}) {conflict}',
+               (db.project_id, *values.values()))
+
+def insert_bom_line(db, version, part, qty, reference='', notes='', upsert=False):
+    id = uid()
+    insert_scoped(db, 'bom_lines', dict(id=id, version_id=version, part_id=part, qty=qty,
+                                        reference=reference, notes=notes),
+                  'ON CONFLICT(version_id,part_id) DO UPDATE SET qty=excluded.qty,'
+                  'reference=excluded.reference,notes=excluded.notes' if upsert else '')
+    return id
+
+def find_part_code(db, code):
+    return db.execute(
+        '''SELECT id FROM parts WHERE code=? AND project_id=?
+           UNION ALL SELECT part_id FROM material_code_aliases WHERE code=? AND project_id=?''',
+        (code, db.project_id, code, db.project_id),
+    ).fetchone()
+
+def electronic_candidates(db):
+    return [dict(row) for row in db.execute(
+        'SELECT * FROM parts WHERE project_id=? AND material_level=2 AND deleted_at IS NULL',
+        (db.project_id,))]
 
 def image_mime(header):
     if header.startswith(b'\x89PNG\r\n\x1a\n'):
@@ -328,13 +379,17 @@ def create_account(db, data, role='member', legacy_password=None, must_change=Tr
 
 def assign_user(db, id):
     if id:
-        exists(db, 'users', id)
+        user = exists(db, 'users', id)
+        if db.project_id and user['role'] != 'admin' and not db.execute(
+            'SELECT 1 FROM project_members WHERE project_id=? AND user_id=?', (db.project_id, id),
+        ).fetchone():
+            raise Problem('请选择当前项目成员')
     return id or None
 
 def log_activity(db, actor, action, subject_id, subject, detail=''):
     if actor:
-        db.execute('INSERT INTO activity(actor_id,actor_name,action,subject_id,subject,detail,created_at) VALUES(?,?,?,?,?,?,?)',
-                   (actor['id'], actor['name'], action, subject_id, subject, detail, now()))
+        db.execute('INSERT INTO activity(actor_id,actor_name,action,subject_id,subject,detail,created_at,project_id) VALUES(?,?,?,?,?,?,?,?)',
+                   (actor['id'], actor['name'], action, subject_id, subject, detail, now(), db.project_id))
 
 def record_movement(db, data, actor=None):
     kind = data.get('type')
@@ -368,8 +423,9 @@ def record_movement(db, data, actor=None):
     db.execute('UPDATE parts SET stock=?,updated_at=? WHERE id=?',(balance,now(),part['id']))
     handler = assign_user(db, data.get('handler_id') or (actor['id'] if actor else None))
     code = next_code(db, 'ST')
-    db.execute('INSERT INTO movements(id,code,type,part_id,qty,balance,product_id,purchase_line_id,original_id,reason,created_at,handler_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-               (mid,code,kind,part['id'],qty,balance,product_id,purchase_line,original_id,reason,now(),handler))
+    insert_scoped(db, 'movements', dict(id=mid, code=code, type=kind, part_id=part['id'], qty=qty,
+                                      balance=balance, product_id=product_id, purchase_line_id=purchase_line,
+                                      original_id=original_id, reason=reason, created_at=now(), handler_id=handler))
     handler_name = exists(db, 'users', handler)['name'] if handler else ''
     log_activity(db, actor, kind, part['id'], f"{part['code']} {part['name']}",
                  f'{code} · {qty:g} {part["unit"]} · 结余 {balance:g} · 经办人 {handler_name}')
@@ -422,7 +478,9 @@ def link_material(db,parent_id,child_id,qty=1):
     parent=active_part(db,parent_id);child=active_part(db,child_id)
     if parent['material_level']!=1 or child['material_level']!=2: raise Problem('只能将一级物料关联到二级物料')
     quantity=num(qty,True);id=uid()
-    db.execute('INSERT INTO material_links(id,parent_id,child_id,qty,created_at) VALUES(?,?,?,?,?) ON CONFLICT(parent_id,child_id) DO UPDATE SET qty=excluded.qty',(id,parent_id,child_id,quantity,now()))
+    insert_scoped(db, 'material_links', dict(id=id, parent_id=parent_id, child_id=child_id,
+                                            qty=quantity, created_at=now()),
+                  'ON CONFLICT(parent_id,child_id) DO UPDATE SET qty=excluded.qty')
     db.execute('UPDATE parts SET updated_at=? WHERE id IN (?,?)',(now(),parent_id,child_id))
     return db.execute('SELECT id FROM material_links WHERE parent_id=? AND child_id=?',(parent_id,child_id)).fetchone()[0]
 
@@ -459,13 +517,14 @@ def automatic_version(db, product_id):
     while f'V{n}.0' in existing: n+=1
     return f'V{n}.0'
 
-TABLES = ('products','parts','suppliers','quotes','bom_versions','bom_lines','purchases','purchase_lines','movements','files','material_links','material_code_aliases')
+TABLES = BUSINESS_TABLES
 
 def get_state(db):
     if not db.in_transaction:
         db.execute('BEGIN')
     state = {t: [{k:r[k] for k in r.keys() if k != 'sub_product_id'}
-                 for r in db.execute(f'SELECT * FROM {t} ORDER BY rowid')] for t in TABLES}
+                 for r in db.execute(f'SELECT * FROM {t} WHERE project_id=? ORDER BY rowid',
+                                     (db.project_id,))] for t in TABLES}
     owners = {(table, row['id']): row
               for table in ('parts', 'products') for row in state[table]}
     positions = {}
@@ -478,8 +537,44 @@ def get_state(db):
             file['name'] = owner_file_name(file['name'], record['code'], record['name'], positions[owner])
     state['deleted_parts'] = [p for p in state['parts'] if p['deleted_at']]
     state['parts'] = [p for p in state['parts'] if not p['deleted_at']]
-    state['users'] = [dict(row) for row in db.execute('SELECT id,name FROM users ORDER BY name,id')]
+    state['users'] = [dict(row) for row in db.execute(
+        """SELECT id,name FROM users WHERE role='admin' OR id IN (
+               SELECT user_id FROM project_members WHERE project_id=?
+           ) ORDER BY name,id""", (db.project_id,))]
+    responsible_ids = {row.get(column) for table, column in RESPONSIBILITIES.items()
+                       for row in (state[table] + state['deleted_parts'] if table == 'parts' else state[table])}
+    current_ids = {row['id'] for row in state['users']}
+    state['former_users'] = [dict(row) for id in responsible_ids - current_ids - {None}
+                             if (row := db.execute('SELECT id,name FROM users WHERE id=?', (id,)).fetchone())]
     return state
+
+def enter_project(db, project_id, user, write=False):
+    project = db.execute('SELECT * FROM projects WHERE id=?', (project_id,)).fetchone()
+    if not project or (user['role'] != 'admin' and not db.execute(
+        'SELECT 1 FROM project_members WHERE project_id=? AND user_id=?',
+        (project_id, user['id']),
+    ).fetchone()):
+        raise Problem('项目不存在或无权访问', 404)
+    if write and project['archived_at']:
+        raise Problem('项目已归档，只能查看', 409)
+    db.project_id = project_id
+    return dict(project)
+
+def list_projects(db, user):
+    return [dict(row) for row in db.execute("""
+        SELECT p.*, u.name AS owner_name,
+            (SELECT COUNT(*) FROM purchases AS po WHERE po.project_id=p.id AND EXISTS (
+                SELECT 1 FROM purchase_lines AS l WHERE l.purchase_id=po.id AND l.received<l.qty
+            )) AS pending_purchases
+        FROM projects AS p LEFT JOIN users AS u ON u.id=p.owner_id
+        WHERE ? OR EXISTS (
+            SELECT 1 FROM project_members AS m WHERE m.project_id=p.id AND m.user_id=?
+        )
+        ORDER BY p.archived_at IS NOT NULL, p.updated_at DESC, p.code
+    """, (user['role'] == 'admin', user['id']))]
+
+def touch_project(db):
+    db.execute('UPDATE projects SET updated_at=? WHERE id=?', (now(), db.project_id))
 
 
 def write_backup(output):
@@ -503,7 +598,6 @@ def stage_restore(archive_path, directory):
     # are never installed, and ZIP paths are never extracted directly.
     unpacked = directory / 'incoming.sqlite3'
     staged = directory / 'staged'
-    init_db(staged)
     with zipfile.ZipFile(archive_path) as archive:
         entries = archive.infolist()
         names = {entry.filename for entry in entries}
@@ -521,21 +615,23 @@ def stage_restore(archive_path, directory):
             source.row_factory = sqlite3.Row
             source.execute('PRAGMA trusted_schema=OFF')
             version = source.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (6, 7, 8):
-                raise Problem('请使用数据库版本 6 至 8 的 JPLM 备份')
+            if version not in (6, 7, 8, VERSION):
+                raise Problem('请使用数据库版本 6 至 9 的 JPLM 备份')
             if source.execute('PRAGMA quick_check(1)').fetchone()[0] != 'ok':
                 raise Problem('备份数据库已损坏')
             source_tables = {row['name'] for row in source.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'")}
-            required_tables = set(TABLES) | {'settings', 'import_runs'}
+            project_tables = ('projects', 'project_members') if version == VERSION else ()
+            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
             if not required_tables <= source_tables:
                 raise Problem('备份缺少业务数据表')
+            (init_db if project_tables else init_legacy_db)(staged)
             with connect(staged) as db:
                 db.execute('BEGIN')
                 db.execute('PRAGMA defer_foreign_keys=ON')
-                for table in ('users', *TABLES, 'settings', 'import_runs', 'activity'):
+                for table in ('users', *project_tables, *TABLES, 'settings', 'import_runs', 'activity'):
                     if table not in source_tables or (version == 6 and table in ('users', 'activity')):
                         continue
                     target_columns = [row['name'] for row in db.execute(f'PRAGMA table_info({table})')]
@@ -562,6 +658,8 @@ def stage_restore(archive_path, directory):
                         raise Problem('备份附件大小不匹配')
                     with archive.open(name) as payload, (staged / name).open('wb') as target:
                         shutil.copyfileobj(payload, target, 1024 * 1024)
+    if version < VERSION:
+        init_db(staged)
     return staged, version
 
 class ThreadingHTTPServer(BaseThreadingHTTPServer):
@@ -665,6 +763,20 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem('请先登录', 401)
                 if self.user['must_change'] and path not in ('/api/auth/logout', '/api/account/password'):
                     raise Problem('请先修改初始密码', 403)
+            segments = path.strip('/').split('/')
+            if segments[:2] == ['api', 'projects']:
+                if len(segments) >= 4:
+                    return self.project_request(segments[2], '/api/' + '/'.join(segments[3:]), method)
+                return self.project_directory(segments[2] if len(segments) == 3 else None, method)
+            if segments[:2] == ['api', 'resolve'] and len(segments) == 4 and method == 'GET':
+                table, id = segments[2:]
+                if table not in ('parts', 'products', 'suppliers', 'purchases'):
+                    raise Problem('记录不存在', 404)
+                with connect() as db:
+                    db.execute('BEGIN')
+                    record = exists(db, table, id)
+                    enter_project(db, record['project_id'], self.user)
+                    return self.send({'project_id': record['project_id']})
             if path == '/api/auth/logout' and method == 'POST':
                 with FILE_LOCK, transaction() as db:
                     result = db.execute('DELETE FROM sessions WHERE token=?', (self.session_token(),))
@@ -684,14 +796,6 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/restore' and method == 'POST':
                 self.require_admin()
                 return self.restore()
-            if path == '/api/state' and method == 'GET':
-                with connect() as db:
-                    db.execute('BEGIN')
-                    user = self.authorized(db)
-                    if not user or user['must_change']:
-                        raise Problem('请先登录', 401)
-                    data = get_state(db)
-                return self.send(data)
             if path == '/api/backup' and method == 'GET':
                 with FILE_LOCK:
                     with connect() as db:
@@ -705,10 +809,7 @@ class Handler(BaseHTTPRequestHandler):
                         if not self.authorized(db):
                             raise Problem('请先登录', 401)
                     return self.serve_file(path.split('/')[-1])
-            if path == '/api/electronic-import/preview' and method == 'POST': return self.electronic_preview()
-            if path == '/api/files' and method == 'POST':
-                with FILE_LOCK: return self.upload()
-            if path.startswith('/api/') and method != 'GET':
+            if segments[:2] in (['api', 'users'], ['api', 'account'], ['api', 'reset-password']) and method != 'GET':
                 data = self.body()
                 with FILE_LOCK:
                     with transaction() as db:
@@ -721,17 +822,116 @@ class Handler(BaseHTTPRequestHandler):
                         result = self.mutate(db, path, method, data)
                     for fid in result.pop('_delete_files', []): remove_upload(fid)
                 return self.send(result)
-            if method == 'GET': return self.static(path)
+            if method == 'GET' and not path.startswith('/api/'): return self.static(path)
             raise Problem('接口不存在',404)
         except (ConnectionResetError,BrokenPipeError,TimeoutError): return
         except Problem as e: self.send({'error':e.message},e.status)
         except sqlite3.IntegrityError as e:
-            msg = '英文代号已使用' if 'products.english_code' in str(e) else '该记录仍被 BOM、采购或库存流水引用，不能删除' if 'FOREIGN KEY' in str(e) else '编码或关联物料重复，请检查输入'
+            msg = '英文代号已使用' if 'products.english_code' in str(e) else '关联记录不匹配或仍被其他记录引用' if 'FOREIGN KEY' in str(e) else '编码或关联物料重复，请检查输入'
             self.send({'error':msg},409)
         except (ValueError,TypeError,KeyError) as e: self.send({'error':'输入数据不完整或格式错误'},400)
         except Exception as e:
             print(f'Internal error: {e}',file=sys.stderr)
             self.send({'error':'服务暂时不可用，请查看服务器日志'},500)
+
+    def project_directory(self, project_id, method):
+        if method == 'GET':
+            with connect() as db:
+                db.execute('BEGIN')
+                if not project_id:
+                    return self.send(list_projects(db, self.user))
+                project = enter_project(db, project_id, self.user)
+                project['members'] = [r[0] for r in db.execute(
+                    'SELECT user_id FROM project_members WHERE project_id=? ORDER BY user_id',
+                    (project_id,))]
+                return self.send(project)
+        if method not in ('POST', 'PUT') or (method == 'PUT') != bool(project_id):
+            raise Problem('接口不存在', 404)
+        data = self.body()
+        with FILE_LOCK, transaction() as db:
+            self.user = self.authorized(db)
+            if not self.user or self.user['must_change']:
+                raise Problem('请先登录', 401)
+            is_admin = self.user['role'] == 'admin'
+            if not project_id:
+                self.require_admin()
+                name = required(data.get('name'), '项目名称')
+                project_id = uid()
+                stamp = now()
+                db.execute('INSERT INTO projects VALUES(?,?,?,?,?,?,?)',
+                           (project_id, automatic_code(db, 'projects', 'PJ'), name, self.user['id'],
+                            None, stamp, stamp))
+                db.execute('INSERT INTO project_members VALUES(?,?)', (project_id, self.user['id']))
+                db.project_id = project_id
+                log_activity(db, self.user, '新建项目', project_id, name)
+            else:
+                project = enter_project(db, project_id, self.user)
+                if not is_admin and (project['owner_id'] != self.user['id'] or set(data) != {'name'}):
+                    raise Problem('无权修改项目设置', 403)
+                archived_at = project['archived_at']
+                if 'archived' in data:
+                    if type(data['archived']) is not bool:
+                        raise Problem('项目状态格式错误')
+                    archived_at = (archived_at or now()) if data['archived'] else None
+                if archived_at and project['archived_at'] and set(data) - {'archived'}:
+                    raise Problem('请先恢复已归档的项目', 409)
+                name = required(data.get('name', project['name']), '项目名称')
+                owner = data.get('owner_id', project['owner_id']) or None
+                if owner:
+                    exists(db, 'users', owner)
+                if 'members' in data:
+                    members = data['members']
+                    if not isinstance(members, list) or any(not isinstance(id, str) for id in members):
+                        raise Problem('项目成员格式错误')
+                    member_ids = set(members)
+                    for id in member_ids:
+                        exists(db, 'users', id)
+                    current = {r[0] for r in db.execute(
+                        'SELECT user_id FROM project_members WHERE project_id=?', (project_id,))}
+                    if owner:
+                        member_ids.add(owner)
+                    db.executemany('DELETE FROM project_members WHERE project_id=? AND user_id=?',
+                                   ((project_id, id) for id in current - member_ids))
+                    db.executemany('INSERT INTO project_members VALUES(?,?)',
+                                   ((project_id, id) for id in member_ids - current))
+                if owner:
+                    db.execute('INSERT OR IGNORE INTO project_members VALUES(?,?)', (project_id, owner))
+                db.execute('UPDATE projects SET name=?,owner_id=?,archived_at=?,updated_at=? WHERE id=?',
+                           (name, owner, archived_at, now(), project_id))
+                action = ('归档项目' if archived_at else '恢复项目') if archived_at != project['archived_at'] else '修改项目设置'
+                log_activity(db, self.user, action, project_id, name)
+        self.send({'id': project_id})
+
+    def project_request(self, project_id, path, method):
+        if method == 'GET':
+            if path == '/api/activity':
+                return self.list_activity(project_id)
+            if path == '/api/state':
+                with connect() as db:
+                    db.execute('BEGIN')
+                    project = enter_project(db, project_id, self.user)
+                    return self.send({**get_state(db), 'project': project})
+            raise Problem('接口不存在', 404)
+        resource = path.split('/')[2]
+        if resource in ('users', 'account', 'reset-password'):
+            raise Problem('接口不存在', 404)
+        if path == '/api/electronic-import/preview' and method == 'POST':
+            return self.electronic_preview(project_id)
+        if path == '/api/files' and method == 'POST':
+            with FILE_LOCK:
+                return self.upload(project_id)
+        data = self.body()
+        with FILE_LOCK:
+            with transaction() as db:
+                self.user = self.authorized(db)
+                if not self.user or self.user['must_change']:
+                    raise Problem('请先登录', 401)
+                enter_project(db, project_id, self.user, write=True)
+                result = self.mutate(db, path, method, data)
+                touch_project(db)
+            for fid in result.pop('_delete_files', []):
+                remove_upload(fid)
+        self.send(result)
     def auth(self, path):
         ip = self.headers.get('X-Real-IP', self.client_address[0]) if BASE_PATH else self.client_address[0]
         recent = [stamp for stamp in self.attempts.get(ip, []) if stamp > time.time() - 600]
@@ -790,18 +990,26 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(row['avatar'])
 
-    def list_activity(self):
+    def list_activity(self, project_id=None):
         from urllib.parse import parse_qs
         query = parse_qs(urlparse(self.path).query)
         before = int(query.get('before', ['0'])[0])
         subject = query.get('part', [''])[0]
         logins = query.get('kind', [''])[0] == 'login'
         with connect() as db:
+            db.execute('BEGIN')
+            if project_id:
+                enter_project(db, project_id, self.user)
+                if logins:
+                    raise Problem('请在系统设置查看登录记录', 404)
+            elif not logins:
+                self.require_admin()
             rows = db.execute(
                 """SELECT * FROM activity WHERE (?=0 OR id<?) AND (?='' OR subject_id=?)
+                   AND project_id IS ?
                    AND (action IN ('登录','退出登录')) = ?
                    AND (?=0 OR actor_id=?) ORDER BY id DESC LIMIT 101""",
-                (before, before, subject, subject, logins,
+                (before, before, subject, subject, project_id, logins,
                  logins and self.user['role'] != 'admin', self.user['id']),
             ).fetchall()
         self.send({'items': [dict(row) for row in rows[:100]], 'more': len(rows) > 100})
@@ -858,6 +1066,8 @@ class Handler(BaseHTTPRequestHandler):
         seg=path.strip('/').split('/'); resource=seg[1]; id=seg[2] if len(seg)>2 else None
         if resource in ('users', 'account', 'reset-password'):
             return self.mutate_account(db, resource, id, method, d)
+        if not db.project_id:
+            raise Problem('请先选择项目', 404)
         if resource=='electronic-import' and id=='commit' and method=='POST': return self.commit_electronic_import(db,d)
         if resource=='material-cells' and method=='PUT':
             allowed={'spec','unit','price','min_stock','location','notes','category','material_level','external_code','brand'}
@@ -878,17 +1088,20 @@ class Handler(BaseHTTPRequestHandler):
             set_material_parents(db,id,d.get('parent_ids'));return {'ok':True}
         if resource=='movements' and method=='POST': return {'id':record_movement(db,d,self.user)}
         if resource=='demo' and method=='POST':
-            if any(db.execute(f'SELECT 1 FROM {t} LIMIT 1').fetchone() for t in ('products','parts','suppliers','purchases','movements')): raise Problem('仅空数据库可以载入示例')
+            self.require_admin()
+            if any(db.execute(f'SELECT 1 FROM {t} WHERE project_id=? LIMIT 1', (db.project_id,)).fetchone()
+                   for t in ('products','parts','suppliers','purchases','movements')):
+                raise Problem('仅空项目可以载入示例')
             seed_demo(db); log_activity(db, self.user, '载入示例', '', '示例数据'); return {'ok':True}
         if resource=='bom-versions' and method=='POST':
             exists(db,'products',d['product_id']); bid=uid()
             db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),d['product_id']))
-            db.execute('INSERT INTO bom_versions VALUES(?,?,?,?,?)',(bid,d['product_id'],automatic_version(db,d['product_id']),str(d.get('notes','')),now()))
+            insert_scoped(db, 'bom_versions', dict(id=bid, product_id=d['product_id'], name=automatic_version(db,d['product_id']), notes=str(d.get('notes','')), created_at=now()))
             if d.get('copy_from'):
                 v=exists(db,'bom_versions',d['copy_from'])
                 if v['product_id']!=d['product_id']: raise Problem('仅可复制本产品的 BOM')
                 for line in db.execute('SELECT * FROM bom_lines WHERE version_id=? ORDER BY rowid',(v['id'],)).fetchall():
-                    db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?)',(uid(),bid,line['part_id'],line['qty'],line['reference'],line['notes']))
+                    insert_bom_line(db, bid, line['part_id'], line['qty'], line['reference'], line['notes'])
             return {'id':bid}
         if resource=='bom-materials' and method=='POST':
             version=exists(db,'bom_versions',d.get('version_id'))
@@ -910,7 +1123,7 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
                 values=(d['version_id'],d['part_id'],num(d.get('qty'),True),str(d.get('reference','')),str(d.get('notes','')))
                 if method=='POST':
-                    id=uid(); db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?)',(id,*values))
+                    id = insert_bom_line(db, *values)
                 else:
                     exists(db,'bom_lines',id); db.execute('UPDATE bom_lines SET version_id=?,part_id=?,qty=?,reference=?,notes=? WHERE id=?',(*values,id))
                 log_activity(db, self.user, 'BOM 新增物料' if method=='POST' else 'BOM 修改物料',
@@ -922,10 +1135,10 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(d.get('rows'),list) or len(d['rows'])>5000: raise Problem('每次最多导入 5000 行')
             for i,row in enumerate(d['rows']):
                 code=str(row.get('code','')).strip()
-                part=db.execute('SELECT id FROM parts WHERE code=? UNION ALL SELECT part_id FROM material_code_aliases WHERE code=?',(code,code)).fetchone()
+                part=find_part_code(db, code)
                 if not part: raise Problem(f'第 {i+1} 行物料编码不存在，请先建立物料：{row.get("code","")}')
                 active_part(db, part[0])
-                db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?) ON CONFLICT(version_id,part_id) DO UPDATE SET qty=excluded.qty,reference=excluded.reference,notes=excluded.notes',(uid(),version['id'],part[0],num(row.get('qty'),True),str(row.get('reference','')),str(row.get('notes','')))); count+=1
+                insert_bom_line(db, version['id'], part[0], num(row.get('qty'), True), str(row.get('reference','')), str(row.get('notes','')), upsert=True); count+=1
             log_activity(db, self.user, '导入 BOM', version['product_id'], version['name'], f'{count} 条明细')
             return {'count':count}
         if resource == 'purchases' and method == 'PUT':
@@ -945,8 +1158,8 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError: raise Problem('采购日期格式错误')
             responsible = assign_user(db, d.get('responsible_id') or self.user['id'])
             code = next_code(db, 'PO')
-            db.execute('INSERT INTO purchases(id,code,supplier_id,date,notes,created_at,responsible_id) VALUES(?,?,?,?,?,?,?)',
-                       (id,code,supplier_id,date,str(d.get('notes','')),now(),responsible))
+            insert_scoped(db, 'purchases', dict(id=id, code=code, supplier_id=supplier_id, date=date,
+                                                notes=str(d.get('notes','')), created_at=now(), responsible_id=responsible))
             for line in d['lines']:
                 part = active_part(db, line['part_id'])
                 linked = db.execute(
@@ -955,8 +1168,8 @@ class Handler(BaseHTTPRequestHandler):
                 ).fetchone()
                 if not linked:
                     raise Problem(f'所选供应商未关联物料「{part["name"]}」', 409)
-                db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',
-                           (uid(),id,part['id'],num(line['qty'],True),num(line['price']),0))
+                insert_scoped(db, 'purchase_lines', dict(id=uid(), purchase_id=id, part_id=part['id'],
+                                                         qty=num(line['qty'], True), price=num(line['price']), received=0))
             log_activity(db, self.user, '新增采购单', id, code, exists(db, 'users', responsible)['name'])
             return {'id':id}
         if resource == 'quotes' and method == 'POST':
@@ -976,10 +1189,10 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute('UPDATE quotes SET price=?,url=? WHERE id=?', (price, url, id))
             else:
                 id = uid()
-                db.execute('INSERT INTO quotes VALUES(?,?,?,?,?)', (id, part_id, supplier_id, price, url))
+                insert_scoped(db, 'quotes', dict(id=id, part_id=part_id, supplier_id=supplier_id, price=price, url=url))
             return {'id': id}
         if resource=='quotes' and method=='DELETE':
-            db.execute('DELETE FROM quotes WHERE id=?',(id,)); return {'ok':True}
+            exists(db, 'quotes', id); db.execute('DELETE FROM quotes WHERE id=?',(id,)); return {'ok':True}
         if resource=='files' and method=='DELETE':
             f=exists(db,'files',id); db.execute('DELETE FROM files WHERE id=?',(id,))
             return {'ok':True,'_delete_files':[id]}
@@ -1041,24 +1254,25 @@ class Handler(BaseHTTPRequestHandler):
                 serial=old['material_serial'] if old else next_material_serial(db)
                 code=old['code'] if old else material_code(db,category,level,numbering_product_id,serial)
                 if old and (old['category']!=category or old['material_level']!=level or old['numbering_product_id']!=numbering_product_id):
-                    db.execute('INSERT OR IGNORE INTO material_code_aliases VALUES(?,?)',(old['code'],id))
+                    insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
                     code=material_code(db,category,level,numbering_product_id,serial)
                 values.update(code=code,material_serial=serial,numbering_product_id=numbering_product_id,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location','')),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
             else: values.update({k:str(d.get(k,'')) for k in ('contact','phone','email','address','notes')})
             if resource in RESPONSIBILITIES:
                 column = RESPONSIBILITIES[resource]
-                values[column] = assign_user(db, d.get(column))
+                values[column] = old[column] if old and old[column] == d.get(column) else assign_user(db, d.get(column))
             if method=='POST':
                 id=uid(); values.update(id=id,created_at=now())
-                cols=list(values); db.execute(f'INSERT INTO {resource} ({",".join(cols)}) VALUES({",".join("?" for _ in cols)})',tuple(values.values()))
-                if resource=='products': db.execute('INSERT INTO bom_versions VALUES(?,?,?,?,?)',(uid(),id,'V1.0','初始版本',now()))
+                insert_scoped(db, resource, values)
+                if resource=='products':
+                    insert_scoped(db, 'bom_versions', dict(id=uid(), product_id=id, name='V1.0', notes='初始版本', created_at=now()))
             else:
                 exists(db,resource,id); db.execute(f'UPDATE {resource} SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),id))
             if resource=='products' and old and old['english_code']!=values['english_code']:
                 for material in db.execute('SELECT * FROM parts WHERE numbering_product_id=?',(id,)).fetchall():
                     expected=material_prefix(material['category'],material['material_level'],product_prefix(db,id))
                     if not material['code'].startswith(expected):
-                        db.execute('INSERT OR IGNORE INTO material_code_aliases VALUES(?,?)',(material['code'],material['id']))
+                        insert_scoped(db, 'material_code_aliases', dict(code=material['code'], part_id=material['id']), 'ON CONFLICT(code) DO NOTHING')
                         db.execute('UPDATE parts SET code=?,updated_at=? WHERE id=?',(material_code(db,material['category'],material['material_level'],id,material['material_serial']),now(),material['id']))
             if resource=='parts' and parent_ids is not None:
                 if values['material_level']!=2 and parent_ids: raise Problem('只有二级物料可以选择关联一级物料')
@@ -1069,7 +1283,7 @@ class Handler(BaseHTTPRequestHandler):
                              id, f"{values['code']} {values['name']}")
             return {'id':id}
         raise Problem('接口不存在或不支持该操作',404)
-    def electronic_preview(self):
+    def electronic_preview(self, project_id):
         fields,uploads=self.multipart()
         if len(uploads)!=1: raise Problem('请选择一个 XLSX 或 CSV 文件')
         filename,mime,blob=uploads[0]
@@ -1077,7 +1291,9 @@ class Handler(BaseHTTPRequestHandler):
             result=parse_electronic_file(blob,filename,fields.get('sheet',''))
         except (ElectronicBomError,ValueError,KeyError,RuntimeError) as exc: raise Problem(str(exc))
         with connect() as db:
-            candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2 AND deleted_at IS NULL')]
+            db.execute('BEGIN')
+            enter_project(db, project_id, self.user, write=True)
+            candidates=electronic_candidates(db)
             for row in result['rows']:
                 try:
                     material=self.match_electronic_material(db,row,candidates)
@@ -1093,13 +1309,13 @@ class Handler(BaseHTTPRequestHandler):
             return material
         code=str(row.get('internal_code','')).strip()
         if code:
-            found=db.execute('SELECT id FROM parts WHERE code=? UNION ALL SELECT part_id FROM material_code_aliases WHERE code=?',(code,code)).fetchone()
+            found=find_part_code(db, code)
             if not found: raise Problem('系统物料编号不存在：'+code)
             material=active_part(db,found[0])
             if material['material_level']!=2: raise Problem('系统编号对应的不是二级物料')
             return material
         key=lambda r: tuple(str(r.get(k) or '').strip().casefold() for k in ('external_code','name','spec','brand'))
-        if candidates is None: candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2 AND deleted_at IS NULL')]
+        if candidates is None: candidates=electronic_candidates(db)
         matches=[p for p in candidates if key(p)==key(row)]
         if len(matches)>1: raise Problem('有多个匹配物料，请手动选择复用记录')
         return matches[0] if matches else None
@@ -1108,19 +1324,19 @@ class Handler(BaseHTTPRequestHandler):
         if not 16<=len(request_id)<=80 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-' for c in request_id): raise Problem('导入请求标识无效')
         body={k:v for k,v in d.items() if k!='request_id'}
         fingerprint=hashlib.sha256(json.dumps(body,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
-        previous=db.execute('SELECT * FROM import_runs WHERE id=?',(request_id,)).fetchone()
+        previous=db.execute('SELECT * FROM import_runs WHERE project_id=? AND id=?', (db.project_id, request_id)).fetchone()
         if previous:
             if previous['fingerprint']!=fingerprint: raise Problem('本次导入已完成，修改文件后请重新导入',409)
             return json.loads(previous['result'])
         rows=d.get('rows')
         if not isinstance(rows,list) or not 1<=len(rows)<=5000: raise Problem('请选择 1 至 5000 条物料')
         parent_id=d.get('parent_id') or None;version_id=d.get('version_id') or None
-        parent=exists(db,'parts',parent_id) if parent_id else None
+        parent=active_part(db,parent_id) if parent_id else None
         if parent and parent['material_level']!=1: raise Problem('关联目标必须是一级物料')
         version=exists(db,'bom_versions',version_id) if version_id else None
         source=parent['numbering_product_id'] if parent else version['product_id'] if version else d.get('numbering_product_id') or None
         if source: exists(db,'products',source)
-        candidates=[dict(r) for r in db.execute('SELECT * FROM parts WHERE material_level=2 AND deleted_at IS NULL')]
+        candidates=electronic_candidates(db)
         groups={};created=0;created_ids=set();reused=set()
         for index,raw in enumerate(rows,1):
             if not isinstance(raw,dict): raise Problem('导入行格式错误')
@@ -1149,11 +1365,11 @@ class Handler(BaseHTTPRequestHandler):
                 link_id=link_material(db,parent_id,mid,group['qty'])
                 db.execute('UPDATE material_links SET reference=?,notes=? WHERE id=?',(reference,notes,link_id))
             if version_id:
-                db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?) ON CONFLICT(version_id,part_id) DO UPDATE SET qty=excluded.qty,reference=excluded.reference,notes=excluded.notes',(uid(),version_id,mid,group['qty'],reference,notes))
+                insert_bom_line(db, version_id, mid, group['qty'], reference, notes, upsert=True)
             total+=exists(db,'parts',mid)['price']*group['qty']
         if version: db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
         result={'rows':len(rows),'materials':len(groups),'created':created,'reused':len(reused),'reference_total':round(total,6)}
-        db.execute('INSERT INTO import_runs VALUES(?,?,?,?)',(request_id,fingerprint,json.dumps(result),now()))
+        insert_scoped(db, 'import_runs', dict(id=request_id, fingerprint=fingerprint, result=json.dumps(result), created_at=now()))
         log_activity(db, self.user, '导入二级物料', parent_id or (version['product_id'] if version else ''),
                      '电子物料 BOM', f'新建 {created} 项 · 复用 {len(reused)} 项')
         return result
@@ -1167,7 +1383,7 @@ class Handler(BaseHTTPRequestHandler):
             if part.get_filename(): uploads.append((part.get_filename(),part.get_content_type(),part.get_payload(decode=True)))
             else: fields[key]=part.get_payload(decode=True).decode('utf-8')
         return fields,uploads
-    def upload(self):
+    def upload(self, project_id):
         fields,uploads=self.multipart()
         owner=fields.get('owner_type'); owner_id=fields.get('owner_id'); replace_id=fields.get('replace_id')
         if owner not in ('products','parts') or not uploads: raise Problem('请选择上传文件')
@@ -1178,6 +1394,7 @@ class Handler(BaseHTTPRequestHandler):
                 user = self.authorized(db)
                 if not user or user['must_change']:
                     raise Problem('请先登录', 401)
+                enter_project(db, project_id, user, write=True)
                 exists(db,owner,owner_id)
                 db.execute(f'UPDATE {owner} SET updated_at=? WHERE id=?',(now(),owner_id))
                 old=None
@@ -1203,8 +1420,10 @@ class Handler(BaseHTTPRequestHandler):
                         db.execute('UPDATE files SET id=?,name=?,mime=?,size=?,kind=?,created_at=? WHERE id=?',
                                    (fid, name, mime, len(blob), kind, now(), old['id']))
                     else:
-                        db.execute('INSERT INTO files VALUES(?,?,?,?,?,?,?,?)',
-                                   (fid, owner, owner_id, name, mime, len(blob), kind, now()))
+                        insert_scoped(db, 'files', dict(id=fid, owner_type=owner, owner_id=owner_id,
+                                                       name=name, mime=mime, size=len(blob),
+                                                       kind=kind, created_at=now()))
+                touch_project(db)
         except Exception:
             for fid in created:
                 remove_upload(fid)
@@ -1217,6 +1436,7 @@ class Handler(BaseHTTPRequestHandler):
         with connect() as db:
             db.execute('BEGIN')
             f = exists(db, 'files', id)
+            enter_project(db, f['project_id'], self.user)
             name = f['name']
             owner = f['owner_type']
             record = db.execute(f'SELECT code,name FROM {owner} WHERE id=?', (f['owner_id'],)).fetchone()
@@ -1291,6 +1511,10 @@ class Handler(BaseHTTPRequestHandler):
                 # Legacy archives predate user accounts. Keep the current directory.
                 recovered.executemany('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?)',
                                       live.execute('SELECT * FROM users'))
+                recovered.execute('UPDATE projects SET owner_id=? WHERE id=?',
+                                  (admin['id'], LEGACY_PROJECT_ID))
+                recovered.execute('INSERT INTO project_members SELECT p.id,u.id FROM projects p CROSS JOIN users u WHERE p.id=?',
+                                  (LEGACY_PROJECT_ID,))
             for row in live.execute("SELECT key,value FROM settings WHERE key LIKE 'sequence_%'"):
                 current = recovered.execute('SELECT value FROM settings WHERE key=?', (row['key'],)).fetchone()
                 if not current or int(row['value']) > int(current['value']):
@@ -1325,27 +1549,57 @@ class Handler(BaseHTTPRequestHandler):
 
 def seed_demo(db):
     suppliers=[('s1','立创商城','采购客服','400-830-5888','support@szlcsc.com','深圳市','电子元件采购'),('s2','精工结构件供应商','陈工','','','东莞市','结构件加工与打样')]
-    for s in suppliers: db.execute('INSERT INTO suppliers VALUES(?,?,?,?,?,?,?,?)',(*s,now()))
     products=[('p1','PRD-001','桌面空气监测仪','面向桌面环境的温湿度与空气质量监测终端','研发中'),('p2','PRD-002','便携式温控器','小型便携温度采集与控制设备','研发中'),('p3','PRD-003','无线传感节点','低功耗无线环境数据采集节点','研发中'),('p4','ASM-001','主控电路板组件','空气监测仪主控 PCB 与电子元件','已定版')]
-    for i,p in enumerate(products):
-        db.execute('INSERT INTO products(id,code,name,description,status,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',(*p,now(),now())); db.execute('INSERT INTO bom_versions VALUES(?,?,?,?,?)',('v'+p[0],p[0],'V1.0','示例初始版本',now()))
-        db.execute('UPDATE products SET english_code=? WHERE id=?',(['AIR','TEMP','NODE','CTRL'][i],p[0]))
     parts=[('m1','MEC-0001','铝合金外壳','结构物料','CNC / 6061 / 阳极氧化','件',48,10,'A-01',None),('m2','MEC-0002','亚克力显示面板','结构物料','透明 / 2 mm / 激光切割','件',8.5,20,'A-02',None),('m3','ELE-0001','主控电路板组件','电子物料','STM32 / PCB Rev.A','块',86,5,'B-01','p4'),('m4','ELE-0002','温湿度传感器','电子物料','SHT30-DIS-B / I²C','个',12.8,30,'B-02',None),('m5','ELE-0003','USB-C 连接器','电子物料','16 Pin / 沉板 / 母座','个',1.25,50,'B-03',None),('m6','MEC-0003','不锈钢螺钉','结构物料','M2 × 6 / 十字盘头','个',0.12,100,'A-03',None),('m7','ELE-0004','微控制器','电子物料','STM32G030F6P6 / TSSOP20','个',5.6,20,'B-04',None),('m8','ELE-0005','贴片电阻','电子物料','10 kΩ / 0603 / ±1%','个',0.02,200,'B-05',None)]
-    for p in parts:
-        db.execute('INSERT INTO parts(id,code,name,category,spec,unit,price,min_stock,location,sub_product_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(*p[:9],None,now(),now()))
-        level=2 if p[0] in ('m7','m8') else 1
-        serial=next_material_serial(db)
-        db.execute('UPDATE parts SET material_level=?,numbering_product_id=?,material_serial=?,code=? WHERE id=?',(level,'p1',serial,material_code(db,p[3],level,'p1',serial),p[0]))
-        db.execute('INSERT INTO quotes VALUES(?,?,?,?,?)',(uid(),p[0],'s2' if p[3]=='结构物料' else 's1',p[6],'https://www.szlcsc.com' if p[3]=='电子物料' else ''))
-    for product,lines in [('p1',[('m1',1),('m2',1),('m3',1),('m4',1),('m5',1),('m6',4),('m7',1),('m8',12)]),('p2',[('m1',1),('m4',1),('m5',1),('m6',4)]),('p3',[('m4',1),('m7',1)]),('p4',[('m7',1),('m8',12),('m5',1)])]:
-        for part,qty in lines: db.execute('INSERT INTO bom_lines VALUES(?,?,?,?,?,?)',(uid(),'v'+product,part,qty,'',''))
-    for part,qty in [('m1',24),('m2',36),('m3',8),('m4',18),('m5',120),('m6',350),('m7',45),('m8',1500)]: record_movement(db,{'type':'入库','part_id':part,'qty':qty,'reason':'示例期初入库'})
-    db.execute('INSERT INTO purchases(id,code,supplier_id,date,notes,created_at) VALUES(?,?,?,?,?,?)',('po1','PO-DEMO-001','s1',datetime.now().strftime('%Y-%m-%d'),'示例采购单',now()))
-    db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',('pl1','po1','m4',50,12.8,0))
-    db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',('pl2','po1','m5',100,1.25,0))
-    record_movement(db,{'type':'入库','part_id':'m4','qty':10,'purchase_line_id':'pl1','reason':'示例采购分批到货'})
-    record_movement(db,{'type':'出库','part_id':'m4','qty':4,'product_id':'p1','reason':'示例样机研发领料'})
-    link_material(db,'m3','m7',1);link_material(db,'m3','m8',12)
+    supplier_ids, product_ids, version_ids, part_ids = {}, {}, {}, {}
+    for key, name, contact, phone, email, address, notes in suppliers:
+        supplier_ids[key] = uid()
+        insert_scoped(db, 'suppliers', dict(id=supplier_ids[key], name=name, contact=contact,
+                                           phone=phone, email=email, address=address, notes=notes, created_at=now()))
+    for product, english_code in zip(products, ('AIR', 'TEMP', 'NODE', 'CTRL')):
+        key, _, name, description, status = product
+        product_ids[key], version_ids[key] = uid(), uid()
+        insert_scoped(db, 'products', dict(id=product_ids[key], code=automatic_code(db, 'products', 'PRD'),
+                                          english_code=english_code, name=name, description=description,
+                                          status=status, created_at=now(), updated_at=now()))
+        insert_scoped(db, 'bom_versions', dict(id=version_ids[key], product_id=product_ids[key],
+                                              name='V1.0', notes='示例初始版本', created_at=now()))
+    for key, _, name, category, spec, unit, price, minimum, location, _ in parts:
+        part_ids[key] = uid()
+        level = 2 if key in ('m7', 'm8') else 1
+        serial = next_material_serial(db)
+        owner = product_ids['p1']
+        insert_scoped(db, 'parts', dict(id=part_ids[key], code=material_code(db, category, level, owner, serial),
+                                       name=name, category=category, spec=spec, unit=unit, price=price,
+                                       min_stock=minimum, location=location, material_level=level,
+                                       numbering_product_id=owner, material_serial=serial,
+                                       created_at=now(), updated_at=now()))
+        electronic = category == '电子物料'
+        insert_scoped(db, 'quotes', dict(id=uid(), part_id=part_ids[key], price=price,
+                                        supplier_id=supplier_ids['s1' if electronic else 's2'],
+                                        url='https://www.szlcsc.com' if electronic else ''))
+    for product, lines in [
+        ('p1', [('m1', 1), ('m2', 1), ('m3', 1), ('m4', 1), ('m5', 1), ('m6', 4), ('m7', 1), ('m8', 12)]),
+        ('p2', [('m1', 1), ('m4', 1), ('m5', 1), ('m6', 4)]),
+        ('p3', [('m4', 1), ('m7', 1)]), ('p4', [('m7', 1), ('m8', 12), ('m5', 1)]),
+    ]:
+        for part, qty in lines:
+            insert_bom_line(db, version_ids[product], part_ids[part], qty)
+    for part, qty in [('m1',24), ('m2',36), ('m3',8), ('m4',18), ('m5',120), ('m6',350), ('m7',45), ('m8',1500)]:
+        record_movement(db, dict(type='入库', part_id=part_ids[part], qty=qty, reason='示例期初入库'))
+    purchase_id, first_line_id = uid(), uid()
+    insert_scoped(db, 'purchases', dict(id=purchase_id, code=next_code(db, 'PO'), supplier_id=supplier_ids['s1'],
+                                      date=datetime.now().strftime('%Y-%m-%d'), notes='示例采购单', created_at=now()))
+    insert_scoped(db, 'purchase_lines', dict(id=first_line_id, purchase_id=purchase_id, part_id=part_ids['m4'],
+                                            qty=50, price=12.8))
+    insert_scoped(db, 'purchase_lines', dict(id=uid(), purchase_id=purchase_id, part_id=part_ids['m5'],
+                                            qty=100, price=1.25))
+    record_movement(db, dict(type='入库', part_id=part_ids['m4'], qty=10,
+                             purchase_line_id=first_line_id, reason='示例采购分批到货'))
+    record_movement(db, dict(type='出库', part_id=part_ids['m4'], qty=4,
+                             product_id=product_ids['p1'], reason='示例样机研发领料'))
+    link_material(db, part_ids['m3'], part_ids['m7'], 1)
+    link_material(db, part_ids['m3'], part_ids['m8'], 12)
 
 if __name__=='__main__':
     parser = argparse.ArgumentParser()
