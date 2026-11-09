@@ -36,6 +36,10 @@ class IntegrationTests(unittest.TestCase):
     def stock(self):return self.state()['parts'][0]['stock']
     def move(self,type,qty,**kw):return self.request('movements','POST',{'type':type,'part_id':self.part,'qty':qty,**kw})
     def supplier(self):return self.request('suppliers','POST',{'name':'测试供应商'})['id']
+    def supplier_for(self, part_id):
+        supplier_id = self.supplier()
+        self.request('quotes', 'POST', {'part_id': part_id, 'supplier_id': supplier_id})
+        return supplier_id
     def product(self,code='P-1'):return self.request('products','POST',{'name':'测试产品','code':code,'status':'研发中'})['id']
     def test_stock_lifecycle_and_history(self):
         self.move('入库',10);out=self.move('出库',4)['id'];self.move('退库',2,original_id=out);self.move('报废',1,reason='损坏')
@@ -51,7 +55,7 @@ class IntegrationTests(unittest.TestCase):
         self.request('movements','POST',{'type':'报废','part_id':self.part,'qty':1},400)
         self.assertEqual(self.stock(),4)
     def test_partial_purchase_receipts(self):
-        po=self.request('purchases','POST',{'supplier_id':self.supplier(),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':10,'price':2}]})['id']
+        po=self.request('purchases','POST',{'supplier_id':self.supplier_for(self.part),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':10,'price':2}]})['id']
         line=self.state()['purchase_lines'][0]['id'];self.move('入库',4,purchase_line_id=line)
         self.assertEqual(self.state()['purchase_lines'][0]['received'],4)
         self.request('movements','POST',{'type':'入库','part_id':self.part,'qty':7,'purchase_line_id':line},400)
@@ -152,8 +156,19 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.request('activity')['items'][0]['action'], '恢复备份')
 
     def test_purchase_creation_rolls_back(self):
-        self.request('purchases','POST',{'supplier_id':self.supplier(),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
+        self.request('purchases','POST',{'supplier_id':self.supplier_for(self.part),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
         self.assertEqual(self.state()['purchases'],[]);self.assertEqual(self.state()['purchase_lines'],[])
+    def test_purchase_supplier_must_supply_all_selected_parts(self):
+        supplier_id = self.supplier_for(self.part)
+        other_part = self.request('parts', 'POST', {'name': '采购物料二'})['id']
+        order = {'supplier_id': supplier_id, 'date': '2026-11-09',
+                 'lines': [{'part_id': part, 'qty': 2, 'price': 1} for part in (self.part, other_part)]}
+        self.request('purchases', 'POST', order, 409)
+        self.assertEqual(self.state()['purchases'], [])
+        self.assertEqual(self.state()['purchase_lines'], [])
+        self.request('quotes', 'POST', {'part_id': other_part, 'supplier_id': supplier_id})
+        self.request('purchases', 'POST', order)
+        self.assertEqual(len(self.state()['purchase_lines']), 2)
     def test_delete_product_with_bom_keeps_shared_material_code_and_stock(self):
         product = self.request('products', 'POST', {'name': '产品A', 'english_code': 'AQUAMIX'})['id']
         other = self.request('products', 'POST', {'name': '产品B'})['id']
@@ -348,7 +363,7 @@ class IntegrationTests(unittest.TestCase):
         self.product()
         version = self.state()['bom_versions'][0]['id']
         self.request('bom-lines', 'POST', {'part_id': self.part, 'version_id': version, 'qty': 2})
-        self.request('purchases', 'POST', {'supplier_id': self.supplier(), 'date': '2026-11-06',
+        self.request('purchases', 'POST', {'supplier_id': self.supplier_for(self.part), 'date': '2026-11-06',
                      'lines': [{'part_id': self.part, 'qty': 2, 'price': 1}]})
         self.move('入库', 1)
         self.request('parts/' + self.part, 'DELETE', {})

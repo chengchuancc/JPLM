@@ -1503,11 +1503,98 @@ td .text-link:hover {
   margin-bottom: 19px;
   height: 37px;
 }
-.purchase-form-heading {
+.purchase-picker-toolbar,
+.purchase-picker-filters,
+.purchase-picker-footer,
+.purchase-picker-pages {
   display: flex;
   align-items: center;
+  gap: 8px;
+}
+.purchase-picker-toolbar .search-input {
+  flex: 1;
+  width: auto;
+}
+.purchase-picker-toolbar > button {
+  flex-shrink: 0;
+}
+.purchase-picker-filters {
+  margin: 8px 0;
+}
+.purchase-picker-filters select {
+  width: auto;
+  min-width: 0;
+  max-width: 100%;
+  min-height: 33px;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+.purchase-picker-results {
+  max-height: min(230px, 32dvh);
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.purchase-picker-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) minmax(120px, 0.45fr) auto;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+}
+.purchase-picker-row:last-child {
+  border-bottom: 0;
+}
+.purchase-picker-row:hover,
+.purchase-picker-row[aria-pressed="true"] {
+  background: var(--accent-soft);
+}
+.purchase-picker-row:focus-visible {
+  outline-offset: -2px;
+}
+.purchase-picker-row > svg {
+  color: var(--accent);
+}
+.purchase-material-photo {
+  width: 32px;
+  height: 32px;
+}
+.purchase-material-name,
+.purchase-material-meta {
+  min-width: 0;
+}
+.purchase-material-name strong,
+.purchase-material-name small,
+.purchase-material-meta > span,
+.purchase-material-meta > small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.purchase-material-name strong,
+.purchase-material-meta > span {
+  font-size: 12px;
+}
+.purchase-material-name small,
+.purchase-material-meta > small {
+  color: var(--muted);
+  font-size: 11px;
+}
+.purchase-picker-footer {
   justify-content: space-between;
-  margin: 25px 0 13px;
+  min-height: 28px;
+  margin-top: 4px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.purchase-form-lines {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
 }
 .purchase-line-header,
 .purchase-form-line {
@@ -1517,30 +1604,49 @@ td .text-link:hover {
   align-items: center;
 }
 .purchase-line-header {
-  font-size: 10px;
-  color: #737d73;
-  margin-bottom: 10px;
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+.purchase-line-header strong {
+  color: var(--text, #20283a);
+  font-size: 13px;
+}
+.purchase-selected-material {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
 }
 .purchase-form-line {
-  margin-bottom: 9px;
+  margin-bottom: 6px;
 }
-.purchase-form-line select,
 .purchase-form-line input {
-  font-size: 11px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 5px 8px;
 }
 .purchase-total {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  margin: 16px 0 24px;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 8px 0 0;
   font-size: 12px;
-  color: #8a9b7c;
+  color: var(--muted);
 }
 .purchase-total strong {
-  font-size: 18px;
-  color: #3b542f;
-  margin-left: 12px;
-  font-weight: 550;
+  font-size: 16px;
+  color: #20283a;
+}
+.purchase-order-fields {
+  margin: 14px 0 12px;
+  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr);
+}
+.purchase-supplier-hint {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
 }
 .confirm-copy {
   font-size: 12px;
@@ -2564,15 +2670,35 @@ td .text-link:hover {
   .purchase-form-line input {
     padding: 8px;
   }
-  .purchase-form-line select {
-    font-size: 10px;
-    padding: 8px 5px;
+  .purchase-picker-filters select {
+    flex: 1;
   }
-  .purchase-form-heading .search-input {
-    width: 160px;
+  .purchase-picker-row {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    gap: 2px 8px;
   }
-  .purchase-form-heading h3 {
-    font-size: 12px;
+  .purchase-picker-row .purchase-material-photo,
+  .purchase-picker-row > svg {
+    grid-row: span 2;
+  }
+  .purchase-picker-row > svg {
+    grid-column: 3;
+    grid-row: 1 / span 2;
+  }
+  .purchase-picker-row .purchase-material-meta {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .purchase-picker-row .purchase-material-meta > span {
+    flex-shrink: 0;
+    font-size: 11px;
+  }
+  .purchase-order-fields {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .purchase-supplier-field {
+    grid-column: 1 / -1;
   }
   .hide-mobile {
     display: none;

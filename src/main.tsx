@@ -4848,6 +4848,183 @@ function SearchPart({
     </div>
   );
 }
+const PURCHASE_MATERIAL_PAGE_SIZE = 40;
+
+function PurchaseMaterialPhoto({ imageId }: { imageId?: string }) {
+  return (
+    <span className="thumb purchase-material-photo" aria-hidden="true">
+      {imageId ? (
+        <img src={fileUrl(imageId)} alt="" loading="lazy" />
+      ) : (
+        <Package size={17} strokeWidth={1.4} />
+      )}
+    </span>
+  );
+}
+
+function PurchaseMaterialPicker({
+  state,
+  photos,
+  quotesByPart,
+  selected,
+  onToggle,
+  onAdd,
+}: {
+  state: State;
+  photos: Map<string, string>;
+  quotesByPart: Map<string, Map<string, Quote>>;
+  selected: Set<string>;
+  onToggle: (id: string) => void;
+  onAdd: (id: string) => void;
+}) {
+  const openChoice = useContext(ChoiceContext);
+  const [query, setQuery] = useState("");
+  const [category, setCategory] = useState("");
+  const [level, setLevel] = useState("");
+  const [product, setProduct] = useState("");
+  const [page, setPage] = useState(0);
+  const productById = new Map(state.products.map((item) => [item.id, item]));
+  const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
+  const matches = state.parts.filter((part) => {
+    if (category && part.category !== category) return false;
+    if (level && part.material_level !== Number(level)) return false;
+    if (product && (part.numbering_product_id || "common") !== product)
+      return false;
+    const searchText = [part.code, part.name, part.spec, part.external_code, part.brand]
+      .join(" ")
+      .toLowerCase();
+    return terms.every((term) => searchText.includes(term));
+  });
+  const lastPage = Math.max(0, Math.ceil(matches.length / PURCHASE_MATERIAL_PAGE_SIZE) - 1);
+  const currentPage = Math.min(page, lastPage);
+  const start = currentPage * PURCHASE_MATERIAL_PAGE_SIZE;
+  const updateFilter = (setter: (value: string) => void, value: string) => {
+    setter(value);
+    setPage(0);
+  };
+
+  return (
+    <section aria-label="选择采购物料">
+      <div className="purchase-picker-toolbar">
+        <div className="search-input">
+          <Search size={15} />
+          <input
+            type="search"
+            aria-label="搜索采购物料"
+            placeholder="搜索料号、名称、规格、外部料号…"
+            value={query}
+            onChange={(event) => updateFilter(setQuery, event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.preventDefault();
+            }}
+          />
+        </div>
+        {openChoice && (
+          <Button
+            small
+            type="button"
+            onClick={() =>
+              openChoice({
+                resource: "parts",
+                level: level ? Number(level) : undefined,
+                productId: product && product !== "common" ? product : undefined,
+                select: onAdd,
+              })
+            }
+          >
+            <Plus size={15} />
+            新建物料
+          </Button>
+        )}
+      </div>
+      <div className="purchase-picker-filters">
+        <select
+          aria-label="物料类别"
+          value={category}
+          onChange={(event) => updateFilter(setCategory, event.target.value)}
+        >
+          <option value="">全部类别</option>
+          {materialCategories.map((item) => <option key={item}>{item}</option>)}
+        </select>
+        <select
+          aria-label="物料级别"
+          value={level}
+          onChange={(event) => updateFilter(setLevel, event.target.value)}
+        >
+          <option value="">全部级别</option>
+          <option value="1">一级物料</option>
+          <option value="2">二级物料</option>
+        </select>
+        <select
+          aria-label="归属产品"
+          value={product}
+          onChange={(event) => updateFilter(setProduct, event.target.value)}
+        >
+          <option value="">全部产品</option>
+          <option value="common">通用物料</option>
+          {state.products.map((item) => (
+            <option key={item.id} value={item.id}>
+              {item.name} · {item.english_code || item.code}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div className="purchase-picker-results" key={JSON.stringify([query, category, level, product, currentPage])}>
+        {matches.slice(start, start + PURCHASE_MATERIAL_PAGE_SIZE).map((part) => {
+          const checked = selected.has(part.id);
+          const owner = part.numbering_product_id
+            ? productById.get(part.numbering_product_id)
+            : undefined;
+          return (
+            <button
+              type="button"
+              className="purchase-picker-row"
+              aria-pressed={checked}
+              key={part.id}
+              onClick={() => onToggle(part.id)}
+            >
+              <PurchaseMaterialPhoto imageId={photos.get(part.id)} />
+              <span className="purchase-material-name">
+                <strong>{part.name}</strong>
+                <small>{[part.code, part.spec, part.external_code].filter(Boolean).join(" · ")}</small>
+              </span>
+              <span className="purchase-material-meta">
+                <span>{part.category} · {part.material_level === 1 ? "一级" : "二级"}</span>
+                <small>
+                  {owner?.name || "通用物料"}
+                  {!quotesByPart.get(part.id)?.size && " · 未关联供应商"}
+                </small>
+              </span>
+              {checked ? <Check size={16} /> : <Plus size={16} />}
+            </button>
+          );
+        })}
+        {!matches.length && <p className="no-options">没有符合条件的物料</p>}
+      </div>
+      <div className="purchase-picker-footer">
+        <span aria-live="polite">共 {matches.length} 项 · 已选 {selected.size} 项</span>
+        {lastPage > 0 && (
+          <div className="purchase-picker-pages">
+            <Button small type="button" disabled={currentPage === 0} onClick={() => setPage(currentPage - 1)}>
+              上一页
+            </Button>
+            <span>{currentPage + 1} / {lastPage + 1}</span>
+            <Button small type="button" disabled={currentPage === lastPage} onClick={() => setPage(currentPage + 1)}>
+              下一页
+            </Button>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+type PurchaseDraftLine = {
+  partId: string;
+  qty: string;
+  priceOverride?: { supplierId: string; value: string };
+};
+
 function PurchaseForm({
   state,
   defaultOwner,
@@ -4860,34 +5037,81 @@ function PurchaseForm({
   onCancel: () => void;
 }) {
   const [owner, setOwner] = useState(defaultOwner);
-  const [supplier, setSupplier] = useState("");
-  const [date, setDate] = useState(
-    new Date().getFullYear() +
-      "-" +
-      String(new Date().getMonth() + 1).padStart(2, "0") +
-      "-" +
-      String(new Date().getDate()).padStart(2, "0"),
-  );
+  const [preferredSupplier, setPreferredSupplier] = useState("");
+  const [date, setDate] = useState(() => {
+    const today = new Date();
+    return [
+      today.getFullYear(),
+      String(today.getMonth() + 1).padStart(2, "0"),
+      String(today.getDate()).padStart(2, "0"),
+    ].join("-");
+  });
   const [notes, setNotes] = useState("");
-  const [lines, setLines] = useState([{ part_id: "", qty: 1, price: 0 }]);
+  const [lines, setLines] = useState<PurchaseDraftLine[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const [q, setQ] = useState("");
-  const change = (i: number, k: string, v: any) =>
-    setLines((ls) => ls.map((l, j) => (j === i ? { ...l, [k]: v } : l)));
+  const { partsById, photos, quotesByPart } = React.useMemo(() => {
+    const partsById = new Map(state.parts.map((part) => [part.id, part]));
+    const photos = new Map<string, string>();
+    for (const file of state.files) {
+      if (file.owner_type === "parts" && file.kind === "image" && !photos.has(file.owner_id))
+        photos.set(file.owner_id, file.id);
+    }
+    const quotesByPart = new Map<string, Map<string, Quote>>();
+    for (const quote of state.quotes) {
+      if (!quotesByPart.has(quote.part_id)) quotesByPart.set(quote.part_id, new Map());
+      quotesByPart.get(quote.part_id)?.set(quote.supplier_id, quote);
+    }
+    return { partsById, photos, quotesByPart };
+  }, [state.parts, state.files, state.quotes]);
+  const selected = new Set(lines.map((line) => line.partId));
+  const suppliersById = new Map(state.suppliers.map((supplier) => [supplier.id, supplier]));
+  const firstQuotes = lines.length ? quotesByPart.get(lines[0].partId) : undefined;
+  const supplierOptions = Array.from(firstQuotes?.keys() || []).filter(
+    (id) =>
+      suppliersById.has(id) &&
+      lines.every((line) => quotesByPart.get(line.partId)?.has(id)),
+  );
+  const supplierId = supplierOptions.includes(preferredSupplier)
+    ? preferredSupplier
+    : supplierOptions[0] || "";
+  const pricedLines = lines.map(({ partId, qty, priceOverride }) => {
+    const part = partsById.get(partId);
+    const quote = quotesByPart.get(partId)?.get(supplierId);
+    const price = priceOverride?.supplierId === supplierId
+      ? priceOverride.value
+      : quote?.price ?? part?.price ?? 0;
+    return { part_id: partId, qty, price };
+  });
+  const total = pricedLines.reduce((sum, line) => sum + Number(line.qty) * Number(line.price), 0);
+  const addPart = (partId: string) => setLines((current) =>
+    current.some((line) => line.partId === partId)
+      ? current
+      : [...current, { partId, qty: "1" }],
+  );
+  const removePart = (partId: string) =>
+    setLines((current) => current.filter((line) => line.partId !== partId));
+  const updateLine = (partId: string, fields: Partial<PurchaseDraftLine>) =>
+    setLines((current) => current.map((line) =>
+      line.partId === partId ? { ...line, ...fields } : line,
+    ));
+  const missingSupplier = lines.some((line) => !quotesByPart.get(line.partId)?.size);
+
   return (
     <form
-      onSubmit={async (e) => {
-        e.preventDefault();
+      className="purchase-form"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        if (!supplierId || !pricedLines.length || busy) return;
         setError("");
         setBusy(true);
         try {
           await submit({
-            supplier_id: supplier,
+            supplier_id: supplierId,
             responsible_id: owner,
             date,
             notes,
-            lines,
+            lines: pricedLines,
           });
         } catch (e) {
           setError((e as Error).message);
@@ -4896,176 +5120,122 @@ function PurchaseForm({
         }
       }}
     >
-      <div className="form-grid">
+      <PurchaseMaterialPicker
+        state={state}
+        photos={photos}
+        quotesByPart={quotesByPart}
+        selected={selected}
+        onToggle={(id) => selected.has(id) ? removePart(id) : addPart(id)}
+        onAdd={addPart}
+      />
+      {!!lines.length && (
+        <section aria-label="已选物料" className="purchase-form-lines">
+          <div className="purchase-line-header">
+            <strong>已选物料</strong>
+            <span>数量</span>
+            <span>单价（元）</span>
+          </div>
+          {lines.map((line, index) => {
+            const part = partsById.get(line.partId);
+            if (!part) return null;
+            return (
+              <div className="purchase-form-line" key={line.partId}>
+                <div className="purchase-selected-material">
+                  <PurchaseMaterialPhoto imageId={photos.get(part.id)} />
+                  <span className="purchase-material-name">
+                    <strong>{part.name}</strong>
+                    <small>
+                      {part.code} · {part.unit}
+                      {!quotesByPart.get(part.id)?.size && " · 未关联供应商"}
+                    </small>
+                  </span>
+                </div>
+                <input
+                  aria-label={part.name + " 数量"}
+                  type="number"
+                  required
+                  min="0.000001"
+                  step="any"
+                  value={line.qty}
+                  onChange={(event) => updateLine(part.id, { qty: event.target.value })}
+                />
+                <input
+                  aria-label={part.name + " 单价"}
+                  type="number"
+                  required
+                  min="0"
+                  step="any"
+                  value={pricedLines[index].price}
+                  onChange={(event) =>
+                    updateLine(part.id, {
+                      priceOverride: { supplierId, value: event.target.value },
+                    })
+                  }
+                />
+                <button
+                  className="icon-btn"
+                  type="button"
+                  aria-label={"移除" + part.name}
+                  onClick={() => removePart(part.id)}
+                >
+                  <Trash2 size={16} />
+                </button>
+              </div>
+            );
+          })}
+          <div className="purchase-total">
+            采购总额 <strong>{money(total)}</strong>
+          </div>
+        </section>
+      )}
+      <div className="form-grid purchase-order-fields">
+        <label className="purchase-supplier-field">
+          供应商 *
+          <select
+            required
+            disabled={!supplierOptions.length}
+            value={supplierId}
+            onChange={(event) => setPreferredSupplier(event.target.value)}
+          >
+            {!supplierOptions.length && (
+              <option value="">{lines.length ? "无可选供应商" : "请先选择物料"}</option>
+            )}
+            {supplierOptions.map((id) => (
+              <option key={id} value={id}>{suppliersById.get(id)?.name}</option>
+            ))}
+          </select>
+          {!!lines.length && !supplierOptions.length && (
+            <small className="purchase-supplier-hint" role="status">
+              {missingSupplier
+                ? "请先在物料库为未关联的物料添加供应商。"
+                : "所选物料没有共同供应商，请分开下单。"}
+            </small>
+          )}
+        </label>
         <PersonSelect
           users={state.users}
           label="采购负责人"
           value={owner}
           onChange={setOwner}
         />
-
-        <label>
-          供应商 *
-          <ChoiceSelect
-            create={{ resource: "suppliers" }}
-            required
-            value={supplier}
-            onValueChange={(id, updated = state) => {
-              setSupplier(id);
-              setLines((ls) =>
-                ls.map((l) => ({
-                  ...l,
-                  price:
-                    updated.quotes.find(
-                      (q) => q.part_id === l.part_id && q.supplier_id === id,
-                    )?.price ?? l.price,
-                })),
-              );
-            }}
-          >
-            <option value="">请选择供应商</option>
-            {state.suppliers.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </ChoiceSelect>
-        </label>
         <label>
           采购日期 *
           <input
             type="date"
             required
             value={date}
-            onChange={(e) => setDate(e.target.value)}
+            onChange={(event) => setDate(event.target.value)}
           />
         </label>
       </div>
-      <div className="purchase-form-heading">
-        <h3>采购物料</h3>
-        <div className="search-input">
-          <Search size={14} />
-          <input
-            placeholder="筛选物料…"
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-          />
-        </div>
-      </div>
-      <div className="purchase-form-lines">
-        <div className="purchase-line-header">
-          <span>物料 *</span>
-          <span>数量 *</span>
-          <span>单价（元）*</span>
-          <span />
-        </div>
-        {lines.map((l, i) => (
-          <div className="purchase-form-line" key={i}>
-            <ChoiceSelect
-              create={{ resource: "parts" }}
-              aria-label={"第 " + (i + 1) + " 行物料"}
-              required
-              value={l.part_id}
-              onValueChange={(id, updated = state) => {
-                setLines((ls) =>
-                  ls.map((l, j) =>
-                    j === i
-                      ? {
-                          ...l,
-                          part_id: id,
-                          price:
-                            updated.quotes.find(
-                              (q) =>
-                                q.part_id === id && q.supplier_id === supplier,
-                            )?.price ??
-                            updated.parts.find((p) => p.id === id)?.price ??
-                            0,
-                        }
-                      : l,
-                  ),
-                );
-              }}
-            >
-              <option value="">请选择物料</option>
-              {state.parts
-                .filter(
-                  (p) =>
-                    p.id === l.part_id ||
-                    [p.code, p.name, p.spec]
-                      .join(" ")
-                      .toLowerCase()
-                      .includes(q.toLowerCase()),
-                )
-                .map((p) => (
-                  <option value={p.id} key={p.id}>
-                    {p.code} · {p.name}
-                  </option>
-                ))}
-            </ChoiceSelect>
-            <input
-              aria-label={"第 " + (i + 1) + " 行数量"}
-              type="number"
-              required
-              min="0.000001"
-              step="any"
-              value={l.qty}
-              onChange={(e) => change(i, "qty", e.target.value)}
-            />
-            <input
-              aria-label={"第 " + (i + 1) + " 行单价"}
-              type="number"
-              required
-              min="0"
-              step="any"
-              value={l.price}
-              onChange={(e) => change(i, "price", e.target.value)}
-            />
-            <button
-              className="icon-btn"
-              type="button"
-              aria-label="移除此采购行"
-              disabled={lines.length === 1}
-              onClick={() => setLines((ls) => ls.filter((_, j) => j !== i))}
-            >
-              <Trash2 size={16} />
-            </button>
-          </div>
-        ))}
-      </div>
-      <div className="purchase-total">
-        <Button
-          small
-          type="button"
-          onClick={() =>
-            setLines([...lines, { part_id: "", qty: 1, price: 0 }])
-          }
-        >
-          <Plus size={14} />
-          添加一行
-        </Button>
-        <span>
-          采购总额{" "}
-          <strong>
-            {money(
-              lines.reduce((s, l) => s + Number(l.qty) * Number(l.price), 0),
-            )}
-          </strong>
-        </span>
-      </div>
       <label className="form-label">
         采购备注
-        <textarea
-          rows={2}
-          value={notes}
-          onChange={(e) => setNotes(e.target.value)}
-        />
+        <textarea rows={2} value={notes} onChange={(event) => setNotes(event.target.value)} />
       </label>
-      {error && <div className="form-error">{error}</div>}
+      {error && <div className="form-error" role="alert">{error}</div>}
       <div className="dialog-actions">
-        <Button type="button" onClick={onCancel}>
-          取消
-        </Button>
-        <Button primary type="submit" disabled={busy}>
+        <Button type="button" onClick={onCancel}>取消</Button>
+        <Button primary type="submit" disabled={busy || !supplierId}>
           {busy && <Loader2 size={16} className="spin" />}创建采购单
         </Button>
       </div>

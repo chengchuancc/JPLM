@@ -937,7 +937,8 @@ class Handler(BaseHTTPRequestHandler):
             log_activity(db, self.user, '修改采购负责人', id, purchase['code'], exists(db, 'users', owner)['name'])
             return {'id': id}
         if resource=='purchases' and method=='POST':
-            exists(db,'suppliers',d['supplier_id']); id=uid()
+            supplier_id = exists(db, 'suppliers', d['supplier_id'])['id']
+            id = uid()
             if not d.get('lines'): raise Problem('请至少添加一个采购物料')
             date=required(d.get('date'),'采购日期')
             try: datetime.strptime(date,'%Y-%m-%d')
@@ -945,9 +946,17 @@ class Handler(BaseHTTPRequestHandler):
             responsible = assign_user(db, d.get('responsible_id') or self.user['id'])
             code = next_code(db, 'PO')
             db.execute('INSERT INTO purchases(id,code,supplier_id,date,notes,created_at,responsible_id) VALUES(?,?,?,?,?,?,?)',
-                       (id,code,d['supplier_id'],date,str(d.get('notes','')),now(),responsible))
-            for l in d['lines']:
-                active_part(db,l['part_id']); db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',(uid(),id,l['part_id'],num(l['qty'],True),num(l['price']),0))
+                       (id,code,supplier_id,date,str(d.get('notes','')),now(),responsible))
+            for line in d['lines']:
+                part = active_part(db, line['part_id'])
+                linked = db.execute(
+                    'SELECT 1 FROM quotes WHERE part_id=? AND supplier_id=?',
+                    (part['id'], supplier_id),
+                ).fetchone()
+                if not linked:
+                    raise Problem(f'所选供应商未关联物料「{part["name"]}」', 409)
+                db.execute('INSERT INTO purchase_lines VALUES(?,?,?,?,?,?)',
+                           (uid(),id,part['id'],num(line['qty'],True),num(line['price']),0))
             log_activity(db, self.user, '新增采购单', id, code, exists(db, 'users', responsible)['name'])
             return {'id':id}
         if resource == 'quotes' and method == 'POST':
