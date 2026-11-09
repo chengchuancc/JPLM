@@ -492,6 +492,48 @@ class IntegrationTests(unittest.TestCase):
         self.request('projects/' + self.project_id, 'PUT', {'archived': True})
         self.request('cover', 'DELETE', status=409)
 
+    def test_only_admin_with_current_password_can_delete_archived_project(self):
+        project_path = 'projects/' + self.project_id
+        credentials = {'password': 'test-password-1234'}
+        self.move('入库', 8)
+        fid = self.upload('project.txt', b'deleted project file')['ids'][0]
+        self.request(project_path, 'DELETE', credentials, 409)
+        self.request(project_path, 'PUT', {'archived': True})
+        self.request(project_path, 'DELETE', {}, 400)
+        self.request(project_path, 'DELETE', {'password': 'wrong'}, 403)
+        self.assertEqual(len(self.request('projects')), 1)
+
+        admin_cookie = self.cookie
+        account = {'name': '普通成员', 'email': 'project-delete@example.test', 'password': 'member'}
+        member = self.request('users', 'POST', account)['id']
+        self.request(project_path, 'PUT', {'archived': False, 'members': [member]})
+        self.request(project_path, 'PUT', {'archived': True})
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+        member_cookie = self.cookie
+        self.request(project_path, 'DELETE', credentials, 403)
+        self.request('projects?deleted=1', status=403)
+        self.cookie = admin_cookie
+
+        self.request(project_path, 'DELETE', credentials)
+        self.assertEqual(self.request('projects'), [])
+        self.assertEqual(self.request('projects?deleted=1')[0]['id'], self.project_id)
+        self.request('state', status=404)
+        self.request('resolve/parts/' + self.part, status=404)
+        self.request(project_path, 'PUT', {'archived': False}, 404)
+        self.assertEqual((app.DATA / 'uploads' / fid).read_bytes(), b'deleted project file')
+        self.assertEqual(self.request('activity', project=False)['items'][0]['action'], '删除项目')
+        self.cookie = member_cookie
+        self.request('recover', 'POST', status=403)
+        self.request('state', status=404)
+        self.cookie = admin_cookie
+
+        self.request('recover', 'POST')
+        self.assertEqual(self.request('projects?deleted=1'), [])
+        self.assertTrue(self.state()['project']['archived_at'])
+        self.assertEqual(self.stock(), 8)
+        self.assertEqual(self.state()['files'][0]['id'], fid)
+
     def test_v8_backup_restores_as_legacy_project_with_original_business_ids(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -552,7 +594,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertTrue(all(p['sub_product_id'] is None for p in materials.values()))
                     self.assertEqual(materials['screw']['stock'],5)
                     self.assertEqual(db.execute("SELECT qty FROM bom_lines WHERE id='legacy-line'").fetchone()[0],4)
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],10)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],app.VERSION)
                     self.assertTrue(all(len(p['code'])==8 and p['code'][:2].isalpha() and p['code'][2:].isdigit() for p in materials.values()))
                     self.assertEqual(db.execute("SELECT part_id FROM material_code_aliases WHERE code='screw'").fetchone()[0],'screw')
             finally: app.DATA=previous

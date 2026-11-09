@@ -147,6 +147,7 @@ type Field = {
   name: string;
   label: string;
   type?: string;
+  autoComplete?: string;
   required?: boolean;
   options?: { value: string; label: string }[];
   placeholder?: string;
@@ -442,6 +443,7 @@ function EntityForm({
               <input
                 required={f.required}
                 type={f.type || "text"}
+                autoComplete={f.autoComplete}
                 min={f.min ?? (f.type === "number" ? 0 : undefined)}
                 step={f.step || (f.type === "number" ? "any" : undefined)}
                 placeholder={f.placeholder}
@@ -1193,17 +1195,37 @@ function ProjectCover({ project }: { project: ProjectSummary }) {
   );
 }
 
-function ProjectDirectory({ projects, open, create }: {
+type DeletedProject = Pick<ProjectSummary, "id" | "code" | "name"> & { deleted_at: string };
+
+function ProjectDirectory({ projects, open, create, onRecovered }: {
   projects: ProjectSummary[];
   open: (id: string) => void;
   create?: (name: string) => Promise<void>;
+  onRecovered: () => Promise<unknown>;
 }) {
   const [query, setQuery] = useState("");
-  const [archived, setArchived] = useState(false);
+  const [status, setStatus] = useState<"active" | "archived" | "deleted">("active");
   const [creating, setCreating] = useState(false);
+  const [deleted, setDeleted] = useState<DeletedProject[] | null>(null);
+  const [deletedError, setDeletedError] = useState("");
+  const [recovering, setRecovering] = useState<DeletedProject | null>(null);
+  useEffect(() => {
+    if (status !== "deleted" || !create) return;
+    let active = true;
+    setDeleted(null);
+    setDeletedError("");
+    api("projects?deleted=1").then(
+      (rows) => { if (active) setDeleted(rows); },
+      (error) => { if (active) setDeletedError(error.message); },
+    );
+    return () => { active = false; };
+  }, [status, !!create]);
   const term = query.trim().toLowerCase();
-  const rows = projects.filter((project) => !!project.archived_at === archived &&
-    [project.name, project.code].some((value) => value.toLowerCase().includes(term)));
+  const matches = (project: Pick<ProjectSummary, "name" | "code">) =>
+    [project.name, project.code].some((value) => value.toLowerCase().includes(term));
+  const archived = status === "archived";
+  const rows = projects.filter((project) => !!project.archived_at === archived && matches(project));
+  const deletedRows = deleted?.filter(matches);
   const activeCount = projects.filter((project) => !project.archived_at).length;
   return (
     <section className="project-directory">
@@ -1226,10 +1248,12 @@ function ProjectDirectory({ projects, open, create }: {
 
       <div className="section-toolbar project-directory-toolbar">
         <div className="tabs" aria-label="项目状态">
-          <button className={!archived ? "selected" : ""} aria-pressed={!archived}
-            onClick={() => setArchived(false)}>进行中</button>
+          <button className={status === "active" ? "selected" : ""} aria-pressed={status === "active"}
+            onClick={() => setStatus("active")}>进行中</button>
           <button className={archived ? "selected" : ""} aria-pressed={archived}
-            onClick={() => setArchived(true)}>已归档</button>
+            onClick={() => setStatus("archived")}>已归档</button>
+          {create && <button className={status === "deleted" ? "selected" : ""} aria-pressed={status === "deleted"}
+            onClick={() => setStatus("deleted")}>已删除</button>}
         </div>
         <div className="search-input">
           <Search size={15} />
@@ -1237,7 +1261,24 @@ function ProjectDirectory({ projects, open, create }: {
             onChange={(event) => setQuery(event.target.value)} />
         </div>
       </div>
-      {rows.length ? (
+      {status === "deleted" ? (
+        <div className="table-wrap">
+          {deletedError ? <p className="form-error" role="alert">{deletedError}</p> :
+            !deletedRows ? <p className="project-deleted-loading muted" role="status">加载中…</p> :
+            deletedRows.length ? (
+              <table>
+                <thead><tr><th>项目</th><th>删除时间</th><th>操作</th></tr></thead>
+                <tbody>{deletedRows.map((project) => (
+                  <tr key={project.id}>
+                    <td>{project.name}<small className="mono">{project.code}</small></td>
+                    <td>{datetime(project.deleted_at)}</td>
+                    <td><Button small onClick={() => setRecovering(project)}>撤销删除</Button></td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            ) : <Empty title={term ? "没有符合条件的项目" : "暂无已删除项目"} />}
+        </div>
+      ) : rows.length ? (
         <ul className="project-card-grid" aria-label="项目">
           {rows.map((project) => (
             <li key={project.id}>
@@ -1271,6 +1312,17 @@ function ProjectDirectory({ projects, open, create }: {
           <Empty title={term ? "没有符合条件的项目" : archived ? "暂无归档项目" : "暂无项目"}
             action={term ? <Button small onClick={() => setQuery("")}>清除搜索</Button> : undefined} />
         </div>
+      )}
+      {recovering && (
+        <Dialog title="撤销删除项目" onClose={() => setRecovering(null)}>
+          <p className="confirm-copy">「{recovering.name}」将回到「已归档」。</p>
+          <AsyncAction label="撤销删除" onCancel={() => setRecovering(null)} action={async () => {
+            await projectRequest(recovering.id, "recover", "POST");
+            setDeleted((previous) => previous?.filter((project) => project.id !== recovering.id) ?? []);
+            setRecovering(null);
+            await onRecovered();
+          }} />
+        </Dialog>
       )}
       {creating && create && (
         <Dialog title="新建项目" onClose={() => setCreating(false)}>
@@ -1356,10 +1408,11 @@ function ProjectCoverSettings({ project, editable, onSaved }: {
   );
 }
 
-function ProjectSettings({ project, user, onSaved, canSeed, onSeed }: {
+function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }: {
   project: ProjectSummary;
   user: User;
   onSaved: () => Promise<void>;
+  onDeleted: () => void;
   canSeed: boolean;
   onSeed: () => void;
 }) {
@@ -1371,6 +1424,7 @@ function ProjectSettings({ project, user, onSaved, canSeed, onSeed }: {
   const [members, setMembers] = useState<string[]>([]);
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
+  const [lifecycle, setLifecycle] = useState<"archive" | "restore" | "delete" | null>(null);
   const admin = user.role === "admin";
   const canEdit = !project.archived_at && (admin || project.owner_id === user.id);
   const projectPath = "projects/" + project.id;
@@ -1403,7 +1457,18 @@ function ProjectSettings({ project, user, onSaved, canSeed, onSeed }: {
   }
   return (
     <>
-      <div className="page-heading"><h1>项目设置</h1></div>
+      <div className="page-heading">
+        <h1>项目设置</h1>
+        {admin && <div className="project-lifecycle-actions">
+          {project.archived_at ? <>
+            <Button type="button" disabled={busy} onClick={() => setLifecycle("restore")}>恢复项目</Button>
+            <Button type="button" className="project-delete-action" disabled={busy}
+              onClick={() => setLifecycle("delete")}><Trash2 size={15} />删除项目</Button>
+          </> : <Button type="button" disabled={busy} onClick={() => setLifecycle("archive")}>
+            <Archive size={15} />归档项目
+          </Button>}
+        </div>}
+      </div>
       <div className="tabs page-tabs">
         <button className={tab === "settings" ? "selected" : ""} onClick={() => setTab("settings")}>项目资料</button>
         <button className={tab === "activity" ? "selected" : ""} onClick={() => setTab("activity")}>操作记录</button>
@@ -1444,14 +1509,34 @@ function ProjectSettings({ project, user, onSaved, canSeed, onSeed }: {
             {error && <p className="form-error" role="alert">{error}</p>}
             {canEdit && <Button primary type="submit" disabled={busy || !details}>保存项目设置</Button>}
           </form>
-          {admin && <div className="project-settings-actions">
-            {canSeed && <Button type="button" disabled={busy} onClick={onSeed}>载入示例数据</Button>}
-            <Button type="button" disabled={busy} onClick={() => {
-              if (project.archived_at || window.confirm("归档后项目只能查看。确认归档？"))
-                void save({ archived: !project.archived_at });
-            }}>{project.archived_at ? "恢复项目" : "归档项目"}</Button>
+          {admin && canSeed && <div className="project-settings-actions">
+            <Button type="button" disabled={busy} onClick={onSeed}>载入示例数据</Button>
           </div>}
         </section>
+      )}
+      {lifecycle === "delete" && (
+        <Dialog title="删除项目" onClose={() => setLifecycle(null)}>
+          <p className="confirm-copy">删除「{project.name}」后，可在项目工作台的「已删除」中撤销。</p>
+          <EntityForm
+            fields={[{ name: "password", label: "当前管理员密码", type: "password", autoComplete: "current-password", required: true, wide: true }]}
+            label="确认删除" onCancel={() => setLifecycle(null)}
+            submit={async ({ password }) => {
+              await api(projectPath, "DELETE", { password });
+              onDeleted();
+            }}
+          />
+        </Dialog>
+      )}
+      {(lifecycle === "archive" || lifecycle === "restore") && (
+        <Dialog title={lifecycle === "archive" ? "归档项目" : "恢复项目"} onClose={() => setLifecycle(null)}>
+          <p className="confirm-copy">「{project.name}」{lifecycle === "archive" ? "归档后只能查看。" : "将恢复为进行中。"}</p>
+          <AsyncAction label={lifecycle === "archive" ? "确认归档" : "确认恢复"}
+            onCancel={() => setLifecycle(null)} action={async () => {
+              await api(projectPath, "PUT", { archived: lifecycle === "archive" });
+              await onSaved();
+              setLifecycle(null);
+            }} />
+        </Dialog>
       )}
     </>
   );
@@ -2374,6 +2459,7 @@ function Workspace({
           {projectReady && !fatal && <>
           {view === "projects" && <ProjectDirectory projects={projects}
             open={(id) => navigate({ projectId: id, view: "products", detail: "" })}
+            onRecovered={reloadProjects}
             create={currentUser.role === "admin" ? async (name) => {
               const result = await api("projects", "POST", { name });
               await reloadProjects();
@@ -2381,7 +2467,8 @@ function Workspace({
             } : undefined}
           />}
           {view === "project-settings" && project && (
-            <ProjectSettings project={{ ...project, ...state.project }} user={currentUser} onSaved={async () => {
+            <ProjectSettings project={{ ...project, ...state.project }} user={currentUser}
+              onDeleted={() => go("projects")} onSaved={async () => {
               await reloadProjects();
               await refresh();
             }} canSeed={!archived && !state.products.length && !state.parts.length &&

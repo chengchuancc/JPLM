@@ -8,7 +8,7 @@ from email.policy import default
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as BaseThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import quote, urlparse, unquote
+from urllib.parse import parse_qs, quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
@@ -110,6 +110,9 @@ def init_db(directory=None, bootstrap=None):
             migrate_projects(db, now())
         db.execute('BEGIN IMMEDIATE')
         db.execute(COVER_TABLE)
+        if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(projects)')}:
+            db.execute('ALTER TABLE projects ADD COLUMN deleted_at TEXT '
+                       'CHECK(deleted_at IS NULL OR archived_at IS NOT NULL)')
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -561,7 +564,7 @@ def get_state(db):
     return state
 
 def enter_project(db, project_id, user, write=False):
-    project = db.execute('SELECT * FROM projects WHERE id=?', (project_id,)).fetchone()
+    project = db.execute('SELECT * FROM projects WHERE id=? AND deleted_at IS NULL', (project_id,)).fetchone()
     if not project or (user['role'] != 'admin' and not db.execute(
         'SELECT 1 FROM project_members WHERE project_id=? AND user_id=?',
         (project_id, user['id']),
@@ -585,9 +588,9 @@ def list_projects(db, user):
             )) AS pending_purchases
         FROM projects AS p LEFT JOIN users AS u ON u.id=p.owner_id
         LEFT JOIN project_covers AS c ON c.project_id=p.id
-        WHERE ? OR EXISTS (
+        WHERE p.deleted_at IS NULL AND (? OR EXISTS (
             SELECT 1 FROM project_members AS m WHERE m.project_id=p.id AND m.user_id=?
-        )
+        ))
         ORDER BY p.archived_at IS NOT NULL, p.updated_at DESC, p.code
     """, (user['role'] == 'admin', user['id']))]
 
@@ -658,6 +661,8 @@ def stage_restore(archive_path, directory):
                     source_columns = {row['name'] for row in source.execute(f'PRAGMA table_info({table})')}
                     optional = {RESPONSIBILITIES.get(table)} if version == 6 else set()
                     if table == 'parts' and version < 8:
+                        optional.add('deleted_at')
+                    if table == 'projects' and version < 11:
                         optional.add('deleted_at')
                     if not set(target_columns) - optional <= source_columns:
                         raise Problem('备份数据结构不完整')
@@ -737,7 +742,7 @@ class Handler(BaseHTTPRequestHandler):
         self.require_admin()
         if not isinstance(password, str) or not password:
             raise Problem('请输入当前管理员密码')
-        key = ('delete-product', self.user['id'])
+        key = ('admin-password-confirmation', self.user['id'])
         current_time = time.time()
         recent = [stamp for stamp in self.attempts.get(key, []) if stamp > current_time - 600]
         if len(recent) >= 12:
@@ -859,12 +864,19 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as db:
                 db.execute('BEGIN')
                 if not project_id:
+                    if parse_qs(urlparse(self.path).query).get('deleted') == ['1']:
+                        self.require_admin()
+                        rows = db.execute('SELECT id,code,name,deleted_at FROM projects '
+                                          'WHERE deleted_at IS NOT NULL ORDER BY deleted_at DESC')
+                        return self.send([dict(row) for row in rows])
                     return self.send(list_projects(db, self.user))
                 project = enter_project(db, project_id, self.user)
                 project['members'] = [r[0] for r in db.execute(
                     'SELECT user_id FROM project_members WHERE project_id=? ORDER BY user_id',
                     (project_id,))]
                 return self.send(project)
+        if method == 'DELETE' and project_id:
+            return self.set_project_deleted(project_id, deleted=True)
         if method not in ('POST', 'PUT') or (method == 'PUT') != bool(project_id):
             raise Problem('接口不存在', 404)
         data = self.body()
@@ -878,7 +890,7 @@ class Handler(BaseHTTPRequestHandler):
                 name = required(data.get('name'), '项目名称')
                 project_id = uid()
                 stamp = now()
-                db.execute('INSERT INTO projects VALUES(?,?,?,?,?,?,?)',
+                db.execute('INSERT INTO projects(id,code,name,owner_id,archived_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
                            (project_id, automatic_code(db, 'projects', 'PJ'), name, self.user['id'],
                             None, stamp, stamp))
                 db.execute('INSERT INTO project_members VALUES(?,?)', (project_id, self.user['id']))
@@ -922,7 +934,32 @@ class Handler(BaseHTTPRequestHandler):
                 log_activity(db, self.user, action, project_id, name)
         self.send({'id': project_id})
 
+    def set_project_deleted(self, project_id, deleted):
+        data = self.body()
+        with FILE_LOCK, transaction() as db:
+            self.user = self.authorized(db)
+            if not self.user or self.user['must_change']:
+                raise Problem('请先登录', 401)
+            self.require_admin()
+            project = exists(db, 'projects', project_id)
+            if deleted:
+                if not project['archived_at']:
+                    raise Problem('请先归档项目', 409)
+                if project['deleted_at']:
+                    raise Problem('项目已删除', 409)
+                self.require_admin_password(db, data.get('password'))
+            elif not project['deleted_at']:
+                raise Problem('项目不在已删除列表中', 409)
+            stamp = now()
+            db.execute('UPDATE projects SET deleted_at=?,updated_at=? WHERE id=?',
+                       (stamp if deleted else None, stamp, project_id))
+            log_activity(db, self.user, '删除项目' if deleted else '撤销删除项目',
+                         project_id, project['name'], project['code'])
+        self.send({'id': project_id})
+
     def project_request(self, project_id, path, method):
+        if path == '/api/recover' and method == 'POST':
+            return self.set_project_deleted(project_id, deleted=False)
         if path == '/api/cover' and method in ('GET', 'POST', 'DELETE'):
             return self.project_cover(project_id, method)
         if method == 'GET':
@@ -1067,7 +1104,6 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(row['avatar'])
 
     def list_activity(self, project_id=None):
-        from urllib.parse import parse_qs
         query = parse_qs(urlparse(self.path).query)
         before = int(query.get('before', ['0'])[0])
         subject = query.get('part', [''])[0]

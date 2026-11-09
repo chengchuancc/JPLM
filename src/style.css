@@ -4276,3 +4276,20 @@ button.material-photo {
     transform: none;
   }
 }
+
+.project-lifecycle-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 7px;
+}
+.project-delete-action {
+  color: #a52e33;
+}
+.project-delete-action:hover {
+  color: #8b262b;
+  border-color: #d7b2b4;
+}
+.project-deleted-loading {
+  padding: 18px;
+}
