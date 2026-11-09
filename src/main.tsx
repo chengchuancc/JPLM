@@ -1176,6 +1176,23 @@ function App() {
   );
 }
 
+function ProjectCover({ project }: { project: ProjectSummary }) {
+  const [failed, setFailed] = useState("");
+  const source = project.cover_version
+    ? appBase + "api/projects/" + encodeURIComponent(project.id) + "/cover?v=" + encodeURIComponent(project.cover_version)
+    : project.cover_file_id ? fileUrl(project.cover_file_id) : "";
+  const hasPhoto = !!source && failed !== source;
+  return (
+    <div className={"project-cover" + (hasPhoto ? " has-photo" : "")}>
+      {hasPhoto ? (
+        <img key={source} src={source} alt={project.name + " 封面"} loading="lazy" onError={() => setFailed(source)} />
+      ) : (
+        <img src={appBase + "project-drawing.svg"} alt="" aria-hidden="true" />
+      )}
+    </div>
+  );
+}
+
 function ProjectDirectory({ projects, open, create }: {
   projects: ProjectSummary[];
   open: (id: string) => void;
@@ -1187,42 +1204,74 @@ function ProjectDirectory({ projects, open, create }: {
   const term = query.trim().toLowerCase();
   const rows = projects.filter((project) => !!project.archived_at === archived &&
     [project.name, project.code].some((value) => value.toLowerCase().includes(term)));
+  const activeCount = projects.filter((project) => !project.archived_at).length;
   return (
-    <>
-      <div className="page-heading">
-        <h1>项目 <span className="heading-count">{rows.length}</span></h1>
-        {create && <Button primary onClick={() => setCreating(true)}><Plus size={17} />新建项目</Button>}
-      </div>
-      <div className="section-toolbar">
-        <div className="tabs">
-          <button className={!archived ? "selected" : ""} onClick={() => setArchived(false)}>进行中</button>
-          <button className={archived ? "selected" : ""} onClick={() => setArchived(true)}>已归档</button>
+    <section className="project-directory">
+      <header className="project-directory-hero">
+        <img className="project-hero-art" src={appBase + "project-drawing.svg"} alt="" />
+        <div className="project-hero-content">
+          <p className="project-hero-eyebrow">捷程未来 PLM</p>
+          <h1>项目工作台</h1>
+          <div className="project-hero-summary">
+            <span><strong>{activeCount}</strong> 进行中</span>
+            <span><strong>{projects.length - activeCount}</strong> 已归档</span>
+          </div>
+        </div>
+        {create && (
+          <Button primary className="project-create" onClick={() => setCreating(true)}>
+            <Plus size={17} />新建项目
+          </Button>
+        )}
+      </header>
+
+      <div className="section-toolbar project-directory-toolbar">
+        <div className="tabs" aria-label="项目状态">
+          <button className={!archived ? "selected" : ""} aria-pressed={!archived}
+            onClick={() => setArchived(false)}>进行中</button>
+          <button className={archived ? "selected" : ""} aria-pressed={archived}
+            onClick={() => setArchived(true)}>已归档</button>
         </div>
         <div className="search-input">
           <Search size={15} />
-          <input aria-label="搜索项目" placeholder="搜索项目名称、代号…" value={query}
+          <input aria-label="搜索项目" placeholder="搜索项目名称、代号…" type="search" value={query}
             onChange={(event) => setQuery(event.target.value)} />
         </div>
       </div>
-      <div className="table-wrap">
-        <table>
-          <thead><tr><th>项目</th><th>代号</th><th>负责人</th><th>状态</th>
-            <th className="num">待入库单数</th><th>更新时间</th></tr></thead>
-          <tbody>
-            {rows.map((project) => (
-              <tr key={project.id}>
-                <td><button className="text-link" onClick={() => open(project.id)}>
-                  {project.name}<ArrowUpRight size={13} />
-                </button></td>
-                <td className="mono">{project.code}</td><td>{project.owner_name || "—"}</td>
-                <td>{project.archived_at ? "已归档" : "进行中"}</td>
-                <td className="num">{project.pending_purchases}</td><td>{datetime(project.updated_at)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-        {!rows.length && <Empty title={term ? "没有符合条件的项目" : archived ? "暂无归档项目" : "暂无项目"} />}
-      </div>
+      {rows.length ? (
+        <ul className="project-card-grid" aria-label="项目">
+          {rows.map((project) => (
+            <li key={project.id}>
+              <a className="project-card" href={workspaceHash({ projectId: project.id, view: "products", detail: "" })}
+                onClick={(event) => {
+                  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+                  event.preventDefault();
+                  open(project.id);
+                }}>
+                <div className="project-card-media">
+                  <ProjectCover project={project} />
+                  <span className="project-card-code">{project.code}</span>
+                </div>
+                <div className="project-card-body">
+                  <div className="project-card-title">
+                    <h2>{project.name}</h2>
+                    <ArrowUpRight size={20} aria-hidden="true" />
+                  </div>
+                  <div className="project-card-meta">
+                    <span title={project.owner_name || "未指定负责人"}>{project.owner_name || "未指定负责人"}</span>
+                    <span>待入库 <b>{project.pending_purchases}</b> 单</span>
+                  </div>
+                  <time dateTime={project.updated_at}>更新于 {date(project.updated_at)}</time>
+                </div>
+              </a>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <div className="project-directory-empty">
+          <Empty title={term ? "没有符合条件的项目" : archived ? "暂无归档项目" : "暂无项目"}
+            action={term ? <Button small onClick={() => setQuery("")}>清除搜索</Button> : undefined} />
+        </div>
+      )}
       {creating && create && (
         <Dialog title="新建项目" onClose={() => setCreating(false)}>
           <EntityForm fields={[{ name: "name", label: "项目名称", required: true, wide: true }]}
@@ -1230,7 +1279,80 @@ function ProjectDirectory({ projects, open, create }: {
             submit={async ({ name }) => { await create(name); setCreating(false); }} />
         </Dialog>
       )}
-    </>
+    </section>
+  );
+}
+
+function ProjectCoverSettings({ project, editable, onSaved }: {
+  project: ProjectSummary;
+  editable: boolean;
+  onSaved: () => Promise<void>;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const input = useRef<HTMLInputElement>(null);
+
+  async function change(file?: File) {
+    if (!editable || busy) return;
+    setError("");
+    if (file && file.size > 4 * 1024 * 1024) {
+      setError("项目封面不能超过 4 MB");
+      return;
+    }
+    setBusy(true);
+    try {
+      const form = file ? new FormData() : undefined;
+      if (file) form?.append("file", file);
+      await projectRequest(project.id, "cover", file ? "POST" : "DELETE", form);
+      await onSaved();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="project-cover-settings" onPaste={(event) => {
+      if (!editable || busy) return;
+      const [file] = pasteEventImages(event);
+      if (!file) return;
+      event.preventDefault();
+      void change(file);
+    }}>
+      <ProjectCover project={project} />
+      <div>
+        <h3>项目封面</h3>
+        {editable && <>
+          <p className="muted">JPG、PNG、WebP，最大 4 MB</p>
+          <div className="project-cover-actions">
+            <input ref={input} type="file" accept="image/jpeg,image/png,image/webp"
+              aria-label="选择项目封面文件" hidden onChange={(event) => {
+                const file = event.target.files?.[0];
+                event.target.value = "";
+                if (file) void change(file);
+              }} />
+            <Button type="button" small disabled={busy} onClick={() => input.current?.click()}>
+              <ImageIcon size={15} />{project.cover_version ? "更换封面" : "上传封面"}
+            </Button>
+            <Button type="button" small disabled={busy} onClick={async () => {
+              try {
+                const [file] = await readClipboardImages();
+                await change(file);
+              } catch (e) {
+                setError((e as Error).message);
+              }
+            }}>粘贴图片</Button>
+            {project.cover_version && (
+              <button type="button" className="text-link" disabled={busy}
+                onClick={() => { if (window.confirm("移除自定义封面？")) void change(); }}>移除</button>
+            )}
+          </div>
+        </>}
+        {busy && <p className="muted" role="status">正在保存封面…</p>}
+        {error && <p className="form-error" role="alert">{error}</p>}
+      </div>
+    </section>
   );
 }
 
@@ -1288,6 +1410,7 @@ function ProjectSettings({ project, user, onSaved, canSeed, onSeed }: {
       </div>
       {tab === "activity" ? <ActivityPanel /> : (
         <section className="panel project-settings">
+          <ProjectCoverSettings project={project} editable={canEdit} onSaved={onSaved} />
           <form onSubmit={(event) => {
             event.preventDefault();
             void save(admin ? { name, owner_id: owner, members } : { name });

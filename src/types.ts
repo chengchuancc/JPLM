@@ -121,10 +121,12 @@ export type ProjectSummary = {
   owner_id: string | null;
   owner_name: string | null;
   archived_at: string | null;
+  cover_version: string | null;
+  cover_file_id: string | null;
   pending_purchases: number;
   updated_at: string;
 };
-export type ProjectDetails = Omit<ProjectSummary, "owner_name" | "pending_purchases"> & {
+export type ProjectDetails = Omit<ProjectSummary, "owner_name" | "pending_purchases" | "cover_version" | "cover_file_id"> & {
   members: string[];
 };
 export type User = UserOption & {

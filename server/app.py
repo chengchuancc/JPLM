@@ -10,7 +10,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as BaseThrea
 from pathlib import Path
 from urllib.parse import quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
-from projects import VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES, SCOPED_TABLES, migrate_projects
+from projects import (
+    VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
+    SCOPED_TABLES, COVER_TABLE, migrate_projects,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 BASE_PATH = os.environ.get("PLM_BASE_PATH", "").rstrip("/")
@@ -18,6 +21,7 @@ SESSION_COOKIE = ('plm_session_' + hashlib.sha256(BASE_PATH.encode()).hexdigest(
                   if BASE_PATH else 'plm_session')
 DATA = Path(os.environ.get('PLM_DATA_DIR', str(ROOT / 'data'))).resolve()
 MAX_UPLOAD = 20 * 1024 * 1024
+MAX_COVER = 4 * 1024 * 1024
 MAX_RESTORE = 1024 ** 3
 FILE_LOCK = threading.RLock()
 IMAGE_MIMES = {
@@ -99,10 +103,18 @@ def init_db(directory=None, bootstrap=None):
                     raise Problem('管理员已初始化')
                 create_account(db, bootstrap, 'admin')
             return
-    if version < 8 or bootstrap:
+    if version < 8 or (version == 8 and bootstrap):
         init_legacy_db(directory, bootstrap)
     with connect(directory) as db:
-        migrate_projects(db, now())
+        if version < PROJECT_VERSION:
+            migrate_projects(db, now())
+        db.execute('BEGIN IMMEDIATE')
+        db.execute(COVER_TABLE)
+        db.execute(f'PRAGMA user_version={VERSION}')
+        if bootstrap and version >= PROJECT_VERSION:
+            if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
+                raise Problem('管理员已初始化')
+            create_account(db, bootstrap, 'admin')
 
 def init_legacy_db(directory=None, bootstrap=None):
     directory = DATA if directory is None else directory
@@ -562,11 +574,17 @@ def enter_project(db, project_id, user, write=False):
 
 def list_projects(db, user):
     return [dict(row) for row in db.execute("""
-        SELECT p.*, u.name AS owner_name,
+        SELECT p.*, u.name AS owner_name, c.updated_at AS cover_version,
+            CASE WHEN c.project_id IS NULL THEN (
+                SELECT f.id FROM files AS f
+                WHERE f.project_id=p.id AND f.owner_type='products' AND f.kind='image'
+                ORDER BY f.rowid DESC LIMIT 1
+            ) END AS cover_file_id,
             (SELECT COUNT(*) FROM purchases AS po WHERE po.project_id=p.id AND EXISTS (
                 SELECT 1 FROM purchase_lines AS l WHERE l.purchase_id=po.id AND l.received<l.qty
             )) AS pending_purchases
         FROM projects AS p LEFT JOIN users AS u ON u.id=p.owner_id
+        LEFT JOIN project_covers AS c ON c.project_id=p.id
         WHERE ? OR EXISTS (
             SELECT 1 FROM project_members AS m WHERE m.project_id=p.id AND m.user_id=?
         )
@@ -615,13 +633,15 @@ def stage_restore(archive_path, directory):
             source.row_factory = sqlite3.Row
             source.execute('PRAGMA trusted_schema=OFF')
             version = source.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (6, 7, 8, VERSION):
-                raise Problem('请使用数据库版本 6 至 9 的 JPLM 备份')
+            if not 6 <= version <= VERSION:
+                raise Problem(f'请使用数据库版本 6 至 {VERSION} 的 JPLM 备份')
             if source.execute('PRAGMA quick_check(1)').fetchone()[0] != 'ok':
                 raise Problem('备份数据库已损坏')
             source_tables = {row['name'] for row in source.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND sql NOT LIKE 'CREATE VIRTUAL TABLE%'")}
-            project_tables = ('projects', 'project_members') if version == VERSION else ()
+            project_tables = ('projects', 'project_members') if version >= PROJECT_VERSION else ()
+            if version >= 10:
+                project_tables += ('project_covers',)
             required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
@@ -658,7 +678,7 @@ def stage_restore(archive_path, directory):
                         raise Problem('备份附件大小不匹配')
                     with archive.open(name) as payload, (staged / name).open('wb') as target:
                         shutil.copyfileobj(payload, target, 1024 * 1024)
-    if version < VERSION:
+    if version < PROJECT_VERSION:
         init_db(staged)
     return staged, version
 
@@ -903,6 +923,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send({'id': project_id})
 
     def project_request(self, project_id, path, method):
+        if path == '/api/cover' and method in ('GET', 'POST', 'DELETE'):
+            return self.project_cover(project_id, method)
         if method == 'GET':
             if path == '/api/activity':
                 return self.list_activity(project_id)
@@ -932,6 +954,60 @@ class Handler(BaseHTTPRequestHandler):
             for fid in result.pop('_delete_files', []):
                 remove_upload(fid)
         self.send(result)
+
+    def project_cover(self, project_id, method):
+        if method == 'GET':
+            with connect() as db:
+                db.execute('BEGIN')
+                enter_project(db, project_id, self.user)
+                row = db.execute('SELECT mime,image FROM project_covers WHERE project_id=?',
+                                 (project_id,)).fetchone()
+                if not row:
+                    raise Problem('未设置项目封面', 404)
+            self.send_response(200)
+            self.send_header('Content-Type', row['mime'])
+            self.send_header('Content-Length', str(len(row['image'])))
+            self.send_header('Cache-Control', 'private, no-cache')
+            self.security_headers()
+            self.end_headers()
+            self.wfile.write(row['image'])
+            return
+        if method == 'POST':
+            with connect() as db:
+                db.execute('BEGIN')
+                project = enter_project(db, project_id, self.user, write=True)
+                if self.user['role'] != 'admin' and project['owner_id'] != self.user['id']:
+                    raise Problem('无权修改项目封面', 403)
+            if int(self.headers.get('Content-Length', '0')) > MAX_COVER + 65536:
+                raise Problem('项目封面不能超过 4 MB', 413)
+            _, uploads = self.multipart()
+            if len(uploads) != 1:
+                raise Problem('请选择一张封面图片')
+            _, _, image = uploads[0]
+            mime = image_mime(image[:12])
+            if mime not in ('image/jpeg', 'image/png', 'image/webp'):
+                raise Problem('请选择 JPG、PNG 或 WebP 图片')
+            if len(image) > MAX_COVER:
+                raise Problem('项目封面不能超过 4 MB', 413)
+        with FILE_LOCK, transaction() as db:
+            user = self.authorized(db)
+            if not user or user['must_change']:
+                raise Problem('请先登录', 401)
+            project = enter_project(db, project_id, user, write=True)
+            if user['role'] != 'admin' and project['owner_id'] != user['id']:
+                raise Problem('无权修改项目封面', 403)
+            if method == 'POST':
+                db.execute('''INSERT INTO project_covers VALUES(?,?,?,?)
+                              ON CONFLICT(project_id) DO UPDATE SET mime=excluded.mime,
+                              image=excluded.image, updated_at=excluded.updated_at''',
+                           (project_id, mime, image, now()))
+            else:
+                db.execute('DELETE FROM project_covers WHERE project_id=?', (project_id,))
+            touch_project(db)
+            log_activity(db, user, '更新项目封面' if method == 'POST' else '移除项目封面',
+                         project_id, project['name'])
+        self.send({'ok': True})
+
     def auth(self, path):
         ip = self.headers.get('X-Real-IP', self.client_address[0]) if BASE_PATH else self.client_address[0]
         recent = [stamp for stamp in self.attempts.get(ip, []) if stamp > time.time() - 600]

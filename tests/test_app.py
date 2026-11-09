@@ -19,7 +19,7 @@ class IntegrationTests(unittest.TestCase):
     def setUp(self):
         with app.transaction() as db:
             for t in reversed(app.TABLES): db.execute('DELETE FROM '+t)
-            for table in ('sessions', 'activity', 'import_runs', 'project_members', 'projects', 'users', 'settings'):
+            for table in ('sessions', 'activity', 'import_runs', 'project_covers', 'project_members', 'projects', 'users', 'settings'):
                 db.execute('DELETE FROM ' + table)
         app.Handler.attempts.clear();self.cookie=''
         self.request('auth/setup','POST',{'password':'test-password-1234'})
@@ -459,6 +459,39 @@ class IntegrationTests(unittest.TestCase):
         self.cookie = member_cookie
         fetch_file(404)
 
+    def test_project_cover_permissions_and_backup(self):
+        png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j0i8AAAAASUVORK5CYII=')
+        headers = {'Content-Type': 'multipart/form-data; boundary=cover-test'}
+        body = (b'--cover-test\r\nContent-Disposition: form-data; name="file"; filename="cover.png"\r\n'
+                b'Content-Type: image/png\r\n\r\n' + png + b'\r\n--cover-test--\r\n')
+        self.request('cover', 'POST', body, headers=headers)
+        self.assertEqual(self.request('cover', raw=True), png)
+        self.assertTrue(self.request('projects')[0]['cover_version'])
+        backup = self.request('backup', raw=True)
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            archive = folder / 'backup.zip'
+            archive.write_bytes(backup)
+            staged, version = app.stage_restore(archive, folder)
+            self.assertEqual(version, app.VERSION)
+            with app.connect(staged) as db:
+                self.assertEqual(db.execute('SELECT image FROM project_covers').fetchone()[0], png)
+        admin_cookie = self.cookie
+        account = {'name': '封面测试成员', 'email': 'cover@example.test', 'password': 'cover'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': 'cover', 'password': 'cover'})
+        member_cookie = self.cookie
+        self.request('cover', status=404)
+        self.cookie = admin_cookie
+        self.request('projects/' + self.project_id, 'PUT', {'members': [member]})
+        self.cookie = member_cookie
+        self.assertEqual(self.request('cover', raw=True), png)
+        self.request('cover', 'POST', body, 403, headers)
+        self.cookie = admin_cookie
+        self.request('projects/' + self.project_id, 'PUT', {'archived': True})
+        self.request('cover', 'DELETE', status=409)
+
     def test_v8_backup_restores_as_legacy_project_with_original_business_ids(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
@@ -519,7 +552,7 @@ class IntegrationTests(unittest.TestCase):
                     self.assertTrue(all(p['sub_product_id'] is None for p in materials.values()))
                     self.assertEqual(materials['screw']['stock'],5)
                     self.assertEqual(db.execute("SELECT qty FROM bom_lines WHERE id='legacy-line'").fetchone()[0],4)
-                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],9)
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0],10)
                     self.assertTrue(all(len(p['code'])==8 and p['code'][:2].isalpha() and p['code'][2:].isdigit() for p in materials.values()))
                     self.assertEqual(db.execute("SELECT part_id FROM material_code_aliases WHERE code='screw'").fetchone()[0],'screw')
             finally: app.DATA=previous

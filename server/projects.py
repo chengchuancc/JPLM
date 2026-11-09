@@ -1,6 +1,7 @@
 """SQLite project ownership and the v8 to v9 migration."""
 
-VERSION = 9
+PROJECT_VERSION = 9
+VERSION = 10
 LEGACY_PROJECT_ID = 'legacy'
 BUSINESS_TABLES = (
     'products', 'parts', 'suppliers', 'quotes', 'bom_versions', 'bom_lines',
@@ -40,6 +41,14 @@ CREATE TABLE project_members (
     PRIMARY KEY (project_id, user_id)
 )
 """
+COVER_TABLE = """
+CREATE TABLE IF NOT EXISTS project_covers (
+    project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id),
+    mime TEXT NOT NULL CHECK(mime IN ('image/jpeg','image/png','image/webp')),
+    image BLOB NOT NULL CHECK(length(image) BETWEEN 1 AND 4194304),
+    updated_at TEXT NOT NULL
+)
+"""
 
 
 def _scoped_schema(table, legacy_sql):
@@ -69,7 +78,7 @@ def migrate_projects(db, stamp):
     db.execute('PRAGMA legacy_alter_table=ON')
     try:
         db.execute('BEGIN IMMEDIATE')
-        if db.execute('PRAGMA user_version').fetchone()[0] == VERSION:
+        if db.execute('PRAGMA user_version').fetchone()[0] >= PROJECT_VERSION:
             db.commit()
             return
         if db.execute('PRAGMA foreign_key_check').fetchone():
@@ -123,7 +132,7 @@ def migrate_projects(db, stamp):
             ''')
         if db.execute('PRAGMA foreign_key_check').fetchone():
             raise RuntimeError('项目迁移后的关联校验未通过')
-        db.execute(f'PRAGMA user_version={VERSION}')
+        db.execute(f'PRAGMA user_version={PROJECT_VERSION}')
         db.commit()
     except Exception:
         db.rollback()
