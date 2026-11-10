@@ -62,10 +62,10 @@ class InspectionError(ValueError):
 
 
 def item(key, label, group, kind, *, required=False, options=(), fail=(), unit='',
-         minimum=None, maximum=None, custom=False):
+         minimum=None, maximum=None, custom=False, display='buttons', block='', auto_from=''):
     return dict(key=key, label=label, group=group, type=kind, required=required,
                 options=list(options), fail=list(fail), unit=unit, minimum=minimum,
-                maximum=maximum, custom=custom)
+                maximum=maximum, custom=custom, display=display, block=block, auto_from=auto_from)
 
 
 BASE_HEADERS = {
@@ -77,6 +77,7 @@ BASE_HEADERS = {
     'source_id': ('原记录 ID', 'ID', 'source_id'),
 }
 L7_HEADERS = {
+    'interaction_test': ('交互检测', '功能与反馈'),
     'far_distance_legacy': ('远距离测量检测', '远距离检测'),
     'space_value_1': ('数据1',), 'space_value_2': ('数据2',), 'space_value_3': ('数据3',),
     'quality_grade': ('等级',), 'other_note': ('其他', '备注'),
@@ -135,6 +136,11 @@ def clean_config(data):
             raise InspectionError(f'第 {index} 个检测项名称重复、保留或为空')
         if kind not in ('choice', 'multi', 'number', 'text'):
             raise InspectionError(f'第 {index} 个检测项类型无效')
+        display = field.get('display', 'buttons')
+        if display not in ('buttons', 'dropdown'):
+            raise InspectionError(f'「{label}」选择样式无效')
+        block = text(field.get('block'), 60)
+        auto_from = text(field.get('auto_from'), 40)
         options, fail = [], []
         custom = kind == 'multi' and field.get('custom') is True
         if kind in ('choice', 'multi'):
@@ -151,9 +157,25 @@ def clean_config(data):
             raise InspectionError(f'「{label}」下限不能大于上限')
         result.append(item(key, label, group, kind, required=field.get('required') is True,
                            options=options, fail=fail, unit=text(field.get('unit'), 24) if kind == 'number' else '',
-                           minimum=minimum, maximum=maximum, custom=custom))
+                           minimum=minimum, maximum=maximum, custom=custom,
+                           display=display if kind in ('choice', 'multi') else 'buttons', block=block,
+                           auto_from=auto_from))
         keys.add(key)
         labels.add(label_key)
+    by_key = {field['key']: field for field in result}
+    automatic_sources = set()
+    for field in result:
+        source_key = field['auto_from']
+        if not source_key:
+            continue
+        source = by_key.get(source_key)
+        if (field['type'] != 'choice' or set(field['options']) != {'OK', 'NG'} or field['fail'] != ['NG']
+                or not source or source['type'] != 'number'
+                or (source['minimum'] is None and source['maximum'] is None)
+                or (field['group'], field['block']) != (source['group'], source['block'])
+                or source_key in automatic_sources):
+            raise InspectionError(f'「{field["label"]}」自动判定需要同一组合内有合格范围的数值项')
+        automatic_sources.add(source_key)
     return dict(name=name, serial_mode=mode, fields=result)
 
 
@@ -225,6 +247,8 @@ def clean_values(config, values, previous=None, historical=False):
     result = {}
     for field in config['fields']:
         key, kind = field['key'], field['type']
+        if field.get('auto_from'):
+            continue
         value = values.get(key)
         if value in (None, '', []):
             continue
@@ -248,7 +272,26 @@ def clean_values(config, values, previous=None, historical=False):
                     result[key] = entered
         except InspectionError as exc:
             raise InspectionError(f'「{field["label"]}」{exc}') from None
+    by_key = {field['key']: field for field in config['fields']}
+    for field in config['fields']:
+        source = field.get('auto_from')
+        if not source:
+            continue
+        key = field['key']
+        if historical and values.get(key):
+            if values[key] not in field['options']:
+                raise InspectionError(f'「{field["label"]}」判定无效')
+            result[key] = values[key]
+        elif previous.get(source) == values.get(source) and key in previous:
+            result[key] = previous[key]
+        elif source in result:
+            result[key] = 'NG' if outside_range(by_key[source], result[source]) else 'OK'
     return result
+
+
+def outside_range(field, value):
+    return ((field['minimum'] is not None and value < field['minimum'])
+            or (field['maximum'] is not None and value > field['maximum']))
 
 
 def grade(config, values):
@@ -258,8 +301,7 @@ def grade(config, values):
         if value in (None, '', []):
             incomplete |= field['required']
         elif field['type'] == 'number':
-            if ((field['minimum'] is not None and value < field['minimum']) or
-                    (field['maximum'] is not None and value > field['maximum'])):
+            if outside_range(field, value):
                 return '不良'
         else:
             choices = value if isinstance(value, list) else [value]
@@ -366,7 +408,7 @@ def timestamp(value, fallback):
         raise InspectionError('记录时间格式无效') from None
 
 
-def split_options(value):
+def split_options(value, options=(), *, legacy=False):
     if value.startswith('['):
         try:
             parsed = json.loads(value)
@@ -374,6 +416,10 @@ def split_options(value):
                 return parsed
         except ValueError:
             pass
+    if value in options:
+        return [value]
+    if legacy:
+        return [item.strip() for item in value.split(' / ') if item.strip()]
     return [option.strip() for option in re.split(r'[;；、\n]|\s*/\s*', value) if option.strip()]
 
 
@@ -397,10 +443,15 @@ def spreadsheet_rows(blob, filename, config):
         target = canonical if canonical in fields else None
         if not target:
             standard_labels = {
+                'interaction_test': '功能与反馈',
                 'space_value_1': '空间测量1', 'space_value_2': '空间测量2',
                 'space_value_3': '空间测量3', 'quality_grade': '品质等级', 'other_note': '其他说明',
             }
             target = aliases.get(normalized(standard_labels.get(canonical, canonical)))
+            if not target and canonical == 'interaction_test':
+                target = aliases.get(normalized('交互检测'))
+            if not target and canonical == 'other_note':
+                target = aliases.get(normalized('备注'))
         if canonical == 'far_distance_legacy' and any(
             normalized(label) in aliases for label in ('远距离检测判定', '远距离测量值')
         ):
@@ -436,6 +487,8 @@ def import_batch(db, project_id, config, blob, filename, stamp):
         (project_id, config['id']),
     )}
     fields = {field['key']: field for field in config['fields']}
+    legacy_l7 = ({'charging_value', 'charging_status', 'far_distance_status'} <= fields.keys()
+                 and fields['charging_value']['type'] == 'number')
     errors, ready, duplicates = [], [], 0
     for row_number, values in rows:
         if not any(value not in (None, '') for value in values):
@@ -455,10 +508,12 @@ def import_batch(db, project_id, config, blob, filename, stamp):
                 if not value:
                     continue
                 if field['type'] == 'multi':
-                    value = split_options(value)
+                    value = split_options(value, field['options'], legacy=legacy_l7)
                 if field['type'] == 'choice' and set(field['options']) == {'是', '否'}:
                     value = {'1': '是', '0': '否'}.get(value, value)
                 raw[key] = value
+            if legacy_l7 and raw.get('charging_value', '').upper() in ('OK', 'NG'):
+                raw.setdefault('charging_status', raw.pop('charging_value').upper())
             far = cells.get('far_distance_legacy')
             if far:
                 status_key = aliases.get(normalized('远距离检测判定'))

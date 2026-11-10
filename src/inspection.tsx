@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { Camera, Download, Plus, Search, Upload, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Camera, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-react";
 import type { IScannerControls } from "@zxing/browser";
 import "./inspection.css";
 
@@ -20,6 +20,9 @@ type InspectionField = {
   minimum: number | null;
   maximum: number | null;
   custom: boolean;
+  display?: "buttons" | "dropdown";
+  block?: string;
+  auto_from?: string;
 };
 type Template = {
   id: string;
@@ -92,13 +95,30 @@ function decision(fields: InspectionField[], values: Values) {
     }
     if (field.type === "number") {
       const numeric = Number(value);
-      if ((field.minimum !== null && numeric < field.minimum) ||
-          (field.maximum !== null && numeric > field.maximum)) return "不良";
+      if (outsideRange(field, numeric)) return "不良";
     } else if ((Array.isArray(value) ? value : [String(value)]).some((choice) => field.fail.includes(choice))) {
       return "不良";
     }
   }
   return incomplete || !Object.keys(values).length ? "未完成" : "合格";
+}
+
+function outsideRange(field: InspectionField, value: number) {
+  return (field.minimum !== null && value < field.minimum) ||
+    (field.maximum !== null && value > field.maximum);
+}
+
+function automaticValues(fields: InspectionField[], values: Values, original?: Values) {
+  const result = { ...values };
+  for (const field of fields) {
+    if (!field.auto_from) continue;
+    const source = fields.find((item) => item.key === field.auto_from);
+    const value = values[field.auto_from];
+    if (original && value === original[field.auto_from]) continue;
+    if (!source || value === undefined || value === "") delete result[field.key];
+    else result[field.key] = outsideRange(source, Number(value)) ? "NG" : "OK";
+  }
+  return result;
 }
 
 function ResultLabel({ value }: { value: string }) {
@@ -231,60 +251,97 @@ function CameraReader({ live, onRead, close }: {
   );
 }
 
-function FieldInput({ field, value, suggestions, onChange }: {
+function FieldInput({ field, value, suggestions, hidden, automatic, onChange }: {
   field: InspectionField;
   value?: Value;
   suggestions: string[];
+  hidden: string[];
+  automatic?: { field: InspectionField; value?: Value };
   onChange: (value: Value | undefined) => void;
 }) {
-  const [custom, setCustom] = useState("");
+  const [search, setSearch] = useState("");
+  const dropdown = field.display === "dropdown";
+  const details = useRef<HTMLDetailsElement>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    if (!dropdown) return;
+    function outside(event: PointerEvent) {
+      const panel = details.current;
+      if (panel?.open && event.target instanceof Node && !panel.contains(event.target)) panel.open = false;
+    }
+    document.addEventListener("pointerdown", outside);
+    return () => document.removeEventListener("pointerdown", outside);
+  }, [dropdown]);
   const selected = Array.isArray(value) ? value : value === undefined ? [] : [String(value)];
-  const options = Array.from(new Set([...field.options, ...suggestions, ...selected]));
-  const term = custom.trim().toLowerCase();
-  const filtered = field.custom && term
-    ? options.filter((option) => option.toLowerCase().includes(term) || selected.includes(option)) : options;
+  const options = Array.from(new Set([...field.options.filter((item) => !hidden.includes(item)), ...suggestions, ...selected]));
+  const entered = search.trim();
+  const term = entered.toLowerCase();
+  const filtered = term ? options.filter((option) => option.toLowerCase().includes(term)) : options;
   const numeric = typeof value === "number" || (typeof value === "string" && value.trim() !== "") ? Number(value) : null;
   const hasLimit = field.minimum !== null || field.maximum !== null;
-  const failed = numeric !== null &&
-    ((field.minimum !== null && numeric < field.minimum) || (field.maximum !== null && numeric > field.maximum));
+  const verdict = automatic ? automatic.value : numeric === null ? undefined : outsideRange(field, numeric) ? "NG" : "OK";
   function addChoice() {
-    const entered = custom.trim();
     if (!entered) return;
     onChange(Array.from(new Set([...selected, entered])));
-    setCustom("");
+    setSearch("");
   }
+  function choose(option: string) {
+    if (field.type === "choice") {
+      onChange(value === option ? undefined : option);
+      if (details.current) details.current.open = false;
+    } else {
+      onChange(selected.includes(option) ? selected.filter((item) => item !== option) : [...selected, option]);
+    }
+  }
+  const choices = <div className="inspection-choices">
+    {filtered.map((option) => <button key={option} type="button"
+      className={"inspection-choice" + (field.fail.includes(option) ? " is-fail" : "")}
+      aria-pressed={selected.includes(option)} onClick={() => choose(option)}>{option}</button>)}
+    {!filtered.length && term && <small className="muted">无匹配选项</small>}
+  </div>;
+  const searchBox = <div className="inspection-custom">
+    <input ref={searchInput} aria-label={field.label + " 搜索选项"} placeholder={field.custom ? "搜索或输入新选项" : "搜索选项"}
+      maxLength={250} value={search} onChange={(event) => setSearch(event.target.value)}
+      onKeyDown={(event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          if (field.custom) addChoice();
+          else if (filtered.length === 1) choose(filtered[0]);
+        }
+      }} />
+    {field.custom && <button type="button" className="btn small" disabled={!entered} onClick={addChoice}>新增当前输入</button>}
+  </div>;
   return (
     <fieldset className="inspection-field">
-      <legend>{field.label}{field.required && <span className="required"> *</span>}</legend>
+      <legend>{field.label}{(field.required || automatic?.field.required) && <span className="required"> *</span>}</legend>
       {(field.type === "choice" || field.type === "multi") ? (
-        <>
-          <div className="inspection-choices">
-            {filtered.map((option) => (
-              <button key={option} type="button"
-                className={"inspection-choice" + (field.fail.includes(option) ? " is-fail" : "")}
-                aria-pressed={selected.includes(option)} onClick={() => {
-                  if (field.type === "choice") onChange(value === option ? undefined : option);
-                  else onChange(selected.includes(option) ? selected.filter((item) => item !== option) : [...selected, option]);
-                }}>
-                {option}
-              </button>
-            ))}
-          </div>
-          {field.custom && <div className="inspection-custom">
-            <input aria-label={field.label + " 自定义选项"} placeholder="搜索或新增选项…" maxLength={250} value={custom}
-              onChange={(event) => setCustom(event.target.value)}
-              onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addChoice(); } }} />
-            <button type="button" className="btn small" disabled={!custom.trim()} onClick={addChoice}>添加</button>
-          </div>}
-        </>
+        dropdown ? <details ref={details} className="inspection-dropdown" onToggle={(event) => {
+          if (event.currentTarget.open) searchInput.current?.focus();
+          else setSearch("");
+        }} onKeyDown={(event) => {
+          if (event.key === "Escape" && details.current?.open) {
+            event.preventDefault();
+            details.current.open = false;
+            details.current.querySelector("summary")?.focus();
+          }
+        }}>
+          <summary aria-label={field.label + " 选项"}>
+            <span className={selected.length ? "" : "muted"}>
+              {selected.join(" / ") || (field.type === "multi" ? "请选择一项或多项" : "请选择")}
+            </span><ChevronDown size={16} />
+          </summary>
+          <div className="inspection-dropdown-panel">{searchBox}{choices}</div>
+        </details> : <>{choices}{field.custom && searchBox}</>
       ) : field.type === "number" ? (
         <>
           <div className="inspection-measurement">
             <input type="number" step="any" aria-label={field.label} value={value === undefined ? "" : String(value)}
               onChange={(event) => onChange(event.target.value === "" ? undefined : event.target.value)} />
             {field.unit && <span>{field.unit}</span>}
-            {hasLimit && numeric !== null && <span className={"inspection-result " + (failed ? "fail" : "pass")}>
-              {failed ? "NG" : "OK"}
+            {hasLimit && (automatic || numeric !== null) && <span
+              aria-label={automatic?.field.label} className={"inspection-result " +
+                (verdict === "NG" ? "fail" : verdict === "OK" ? "pass" : "pending")}>
+              {verdict === "NG" || verdict === "OK" ? verdict : "未判定"}
             </span>}
           </div>
           {hasLimit && <small className="muted">
@@ -300,117 +357,294 @@ function FieldInput({ field, value, suggestions, onChange }: {
   );
 }
 
-type EditableField = Omit<InspectionField, "options" | "fail" | "minimum" | "maximum"> & {
-  options: string; fail: string; minimum: string; maximum: string;
-};
-function editable(field: InspectionField): EditableField {
-  return { ...field, options: field.options.join("\n"), fail: field.fail.join("\n"),
-    minimum: field.minimum?.toString() || "", maximum: field.maximum?.toString() || "" };
+function sections(fields: InspectionField[]) {
+  const groups = new Map<string, InspectionField[]>();
+  for (const field of fields) {
+    const group = field.group || "检测项";
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group)!.push(field);
+  }
+  return [...groups];
 }
-function newField(label = "", type: FieldType = "choice"): EditableField {
+
+function InspectionFields({ form, values, original, savedOptions = [], onChange }: {
+  form: Template; values: Values; original?: Values; savedOptions?: SavedOption[];
+  onChange: (key: string, value: Value | undefined) => void;
+}) {
+  const computed = automaticValues(form.fields, values, original);
+  function render(field: InspectionField) {
+    const automatic = form.fields.find((item) => item.auto_from === field.key);
+    const options = savedOptions.filter((item) => item.field_key === field.key);
+    return <FieldInput key={form.id + ":" + form.revision + ":" + field.key}
+      field={field} value={values[field.key]}
+      automatic={automatic && { field: automatic, value: computed[automatic.key] }}
+      suggestions={options.filter((item) => !item.hidden_at).map((item) => item.value)}
+      hidden={options.filter((item) => item.hidden_at).map((item) => item.value)}
+      onChange={(value) => onChange(field.key, value)} />;
+  }
+  return sections(form.fields).map(([group, fields]) => {
+    const blocks = new Map<string, InspectionField[]>();
+    for (const field of fields) {
+      if (field.auto_from) continue;
+      const key = field.block ? "block:" + field.block : "field:" + field.key;
+      if (!blocks.has(key)) blocks.set(key, []);
+      blocks.get(key)!.push(field);
+    }
+    if (!blocks.size) return null;
+    return <section className="panel inspection-field-group" key={group}>
+      <h3>{group}</h3>
+      <div className="inspection-field-grid">
+        {[...blocks].map(([key, items]) => items[0].block
+          ? <div className="inspection-block" key={key}>
+              {(items.length > 1 || items[0].label !== items[0].block) && <h4>{items[0].block}</h4>}
+              <div className="inspection-field-grid">{items.map(render)}</div>
+            </div>
+          : render(items[0]))}
+      </div>
+    </section>;
+  });
+}
+
+function withValue(values: Values, key: string, value: Value | undefined) {
+  const next = { ...values };
+  if (value === undefined || (Array.isArray(value) && !value.length)) delete next[key];
+  else next[key] = value;
+  return next;
+}
+
+function newField(group: string, label = "", type: FieldType = "choice"): InspectionField {
   return {
-    key: "field_" + crypto.randomUUID().replaceAll("-", ""), label, group: "检测项", type,
-    options: "OK\nNG", fail: "NG", minimum: "", maximum: "", unit: "", custom: false, required: true,
+    key: "field_" + crypto.randomUUID().replaceAll("-", ""), label, group, type,
+    options: type === "choice" ? ["OK", "NG"] : [], fail: type === "choice" ? ["NG"] : [],
+    minimum: null, maximum: null, unit: "", custom: false, required: type !== "text",
+    display: type === "multi" ? "dropdown" : "buttons", block: "", auto_from: "",
   };
 }
-const fieldTypes: [FieldType, string][] = [["choice", "单选"], ["multi", "多选"], ["number", "数值"], ["text", "文本"]];
-const lines = (value: string) => value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 
-function TemplateEditor({ template, save, cancel, onDirty }: {
-  template: Template | null; save: (data: unknown) => Promise<void>; cancel: () => void;
+const fieldTypes: [FieldType, string][] = [["choice", "单选"], ["multi", "多选"], ["number", "数值"], ["text", "文本"]];
+const lines = (value: string) => [...new Set(value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean))];
+
+function FieldSettings({ field, fields, update }: {
+  field: InspectionField; fields: InspectionField[]; update: (patch: Partial<InspectionField>) => void;
+}) {
+  const selectable = field.type === "choice" || field.type === "multi";
+  const candidates = fields.filter((item) => item.key !== field.key && item.type === "number" &&
+    (item.minimum !== null || item.maximum !== null) &&
+    !fields.some((other) => other.key !== field.key && other.auto_from === item.key));
+  const [optionText, setOptionText] = useState(field.options.join("\n"));
+  const setOptions = (value: string) => {
+    setOptionText(value);
+    const options = lines(value);
+    update({ options, fail: field.fail.filter((item) => options.includes(item)) });
+  };
+  return <>
+    <div className="inspection-config-grid">
+      <label>检测项名称<input required maxLength={80} value={field.label} onChange={(e) => update({ label: e.target.value })} /></label>
+      <label>类型<select aria-label="类型" value={field.auto_from ? "automatic" : field.type} onChange={(e) => {
+        const type = e.target.value;
+        if (type === "automatic") {
+          const source = candidates[0];
+          update({ type: "choice", options: ["OK", "NG"], fail: ["NG"], display: "buttons",
+            custom: false, auto_from: source.key });
+          setOptionText("OK\nNG");
+        } else {
+          const defaults = newField(field.group, field.label, type as FieldType);
+          update({ type: defaults.type, options: defaults.options, fail: defaults.fail,
+            display: defaults.display, custom: false, auto_from: "", minimum: null, maximum: null, unit: "" });
+          setOptionText(defaults.options.join("\n"));
+        }
+      }}>
+        {fieldTypes.map(([type, label]) => <option key={type} value={type}>{label}</option>)}
+        <option value="automatic" disabled={!candidates.length && !field.auto_from}>
+          {!candidates.length && !field.auto_from ? "自动判定（先配置数值范围）" : "自动判定"}
+        </option>
+      </select></label>
+      <label>分组<input required maxLength={60} list="inspection-group-names" value={field.group}
+        disabled={!!field.auto_from} onChange={(e) => update({ group: e.target.value })} /></label>
+      <datalist id="inspection-group-names">{sections(fields).map(([group]) => <option key={group} value={group} />)}</datalist>
+      <label>组合名称<input maxLength={60} value={field.block || ""} placeholder="选填，如空间测量"
+        disabled={!!field.auto_from} list="inspection-block-names" onChange={(e) => update({ block: e.target.value })} /></label>
+      <datalist id="inspection-block-names">{[...new Set(fields.filter((item) => item.group === field.group && item.block)
+        .map((item) => item.block!))].map((block) => <option key={block} value={block} />)}</datalist>
+      {field.auto_from && <label>取值来源<select aria-label="取值来源" value={field.auto_from} onChange={(e) => update({ auto_from: e.target.value })}>
+        {!candidates.some((item) => item.key === field.auto_from) &&
+          <option value={field.auto_from}>请选择有效的数值项</option>}
+        {candidates.map((item) => <option key={item.key} value={item.key}>{item.group} · {item.label || "数值项"}</option>)}
+      </select></label>}
+      {field.type === "number" && <>
+        <label>单位<input value={field.unit} maxLength={24} onChange={(e) => update({ unit: e.target.value })} /></label>
+        <label>合格下限<input type="number" step="any" value={field.minimum ?? ""}
+          onChange={(e) => update({ minimum: e.target.value === "" ? null : Number(e.target.value) })} /></label>
+        <label>合格上限<input type="number" step="any" value={field.maximum ?? ""}
+          onChange={(e) => update({ maximum: e.target.value === "" ? null : Number(e.target.value) })} /></label>
+      </>}
+      {selectable && !field.auto_from && <label>选择样式<select value={field.display || "buttons"}
+        onChange={(e) => update({ display: e.target.value as InspectionField["display"] })}>
+        <option value="buttons">平铺按钮</option><option value="dropdown">搜索下拉</option>
+      </select></label>}
+    </div>
+    {selectable && !field.auto_from && <div className="inspection-editor-main">
+      <label>选项（每行一个）<textarea rows={4} value={optionText} onChange={(e) => setOptions(e.target.value)} /></label>
+      <div className="inspection-fail-options">
+        <span>判为不良的选项</span>
+        {field.options.map((option) => <label key={option}>
+          <input type="checkbox" checked={field.fail.includes(option)} onChange={(e) => update({
+            fail: e.target.checked ? [...field.fail, option] : field.fail.filter((value) => value !== option),
+          })} />{option}
+        </label>)}
+      </div>
+    </div>}
+    <div className="inspection-checks">
+      <label><input type="checkbox" checked={field.required} onChange={(e) => update({ required: e.target.checked })} />必检项</label>
+      {field.type === "multi" && <label><input type="checkbox" checked={field.custom}
+        onChange={(e) => update({ custom: e.target.checked })} />允许现场添加选项</label>}
+    </div>
+  </>;
+}
+
+function TemplateEditor({ template, copy, save, cancel, onDirty }: {
+  template: Template | null; copy?: Template; save: (data: unknown) => Promise<void>; cancel: () => void;
   onDirty: () => void;
 }) {
-  const [name, setName] = useState(template?.name || "出厂检测");
-  const [mode, setMode] = useState<SerialMode>(template?.serial_mode || "text");
-  const [fields, setFields] = useState<EditableField[]>(() => template ? template.fields.map(editable) :
-    [newField("功能检测"), newField("外观检测"), { ...newField("备注", "text"), required: false }]);
+  const [name, setName] = useState(template?.name || (copy ? copy.name + " 副本" : "出厂检测"));
+  const [mode, setMode] = useState<SerialMode>(template?.serial_mode || copy?.serial_mode || "text");
+  const [fields, setFields] = useState<InspectionField[]>(() => template?.fields || copy?.fields ||
+    [newField("功能与反馈", "功能检测"), newField("外观", "外观检测"), newField("其他说明", "备注", "text")]);
+  const [selected, setSelected] = useState(() => fields[0].key);
+  const [preview, setPreview] = useState(false);
+  const [sample, setSample] = useState<Values>({});
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const update = (key: string, patch: Partial<EditableField>) =>
-    setFields((previous) => previous.map((field) => field.key === key ? { ...field, ...patch } : field));
-  function move(index: number, direction: number) {
-    setFields((previous) => {
-      const next = [...previous];
-      [next[index], next[index + direction]] = [next[index + direction], next[index]];
+  const field = fields.find((item) => item.key === selected) || fields[0];
+  const groups = sections(fields);
+  const fieldGroup = groups.findIndex(([, items]) => items.includes(field));
+  const groupItems = groups[fieldGroup][1];
+  const fieldIndex = groupItems.indexOf(field);
+  function update(patch: Partial<InspectionField>) {
+    setFields((previous) => previous.map((item) => {
+      if (item.key !== field.key) return item;
+      const next = { ...item, ...patch };
+      if (patch.auto_from) {
+        const source = previous.find((candidate) => candidate.key === patch.auto_from)!;
+        next.group = source.group;
+        next.block = source.block || source.label || "测量";
+      }
       return next;
-    });
+    }).map((item) => {
+      const linked = patch.auto_from && item.key === patch.auto_from;
+      if (linked && !item.block) return { ...item, block: item.label || "测量" };
+      if (item.auto_from === field.key) {
+        return { ...item, group: patch.group ?? item.group, block: patch.block ?? item.block,
+          auto_from: patch.type && patch.type !== "number" ? "" : item.auto_from };
+      }
+      return item;
+    }));
     onDirty();
   }
-  return (
-    <form className="inspection-editor" onChange={onDirty} onSubmit={async (event) => {
-      event.preventDefault();
-      if (busy) return;
-      setBusy(true);
-      setError("");
-      try {
-        await save({
-          name, serial_mode: mode, revision: template?.revision,
-          fields: fields.map((field) => ({ ...field, options: lines(field.options), fail: lines(field.fail) })),
-        });
-      } catch (e) { setError((e as Error).message); }
-      finally { setBusy(false); }
+  function move(groupIndex: number, index: number, direction: number) {
+    if (index === -1) {
+      [groups[groupIndex], groups[groupIndex + direction]] = [groups[groupIndex + direction], groups[groupIndex]];
+    } else {
+      const items = groups[groupIndex][1];
+      [items[index], items[index + direction]] = [items[index + direction], items[index]];
+    }
+    setFields(groups.flatMap(([, items]) => items));
+    onDirty();
+  }
+  function add(group: string) {
+    const next = newField(group);
+    setFields([...fields, next]);
+    setSelected(next.key);
+    onDirty();
+  }
+  function remove() {
+    const next = fields.filter((item) => item.key !== field.key).map((item) =>
+      item.auto_from === field.key ? { ...item, auto_from: "" } : item);
+    setFields(next);
+    setSelected(next[Math.min(fields.indexOf(field), next.length - 1)].key);
+    onDirty();
+  }
+  return <form className="inspection-editor" onSubmit={async (event) => {
+    event.preventDefault();
+    if (busy) return;
+    const invalid = fields.find((item) => !item.label.trim() || !item.group.trim());
+    if (invalid) {
+      setSelected(invalid.key);
+      setPreview(false);
+      setError("请填写检测项名称和分组");
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      await save({ name, serial_mode: mode, revision: template?.revision, fields });
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(false); }
+  }}>
+    <section className="panel inspection-editor-main">
+      <label>检测表名称<input required maxLength={80} value={name} onChange={(e) => { setName(e.target.value); onDirty(); }} /></label>
+      <label>编号规则<select value={mode} onChange={(e) => { setMode(e.target.value as SerialMode); onDirty(); }}>
+        <option value="text">通用 S/N</option>
+        <option value="dated">16 位数字（前 6 位＋日期＋尾号）</option>
+      </select></label>
+    </section>
+    <div className="inspection-editor-tools">
+      <button type="button" className={action} aria-pressed={!preview} onClick={() => setPreview(false)}>配置检测项</button>
+      <button type="button" className={action} aria-pressed={preview} onClick={() => {
+        setSample({});
+        setPreview(true);
+      }}>预览录入</button>
+    </div>
+    {preview ? <div className="inspection-preview" onKeyDown={(event) => {
+      if (event.key === "Enter" && event.target instanceof HTMLInputElement) event.preventDefault();
     }}>
-      <section className="panel inspection-editor-main">
-        <label>检测表名称<input required maxLength={80} value={name} onChange={(e) => setName(e.target.value)} /></label>
-        <label>编号规则<select value={mode} onChange={(e) => setMode(e.target.value as SerialMode)}>
-          <option value="text">通用 S/N</option>
-          <option value="dated">16 位数字（前 6 位＋日期＋尾号）</option>
-        </select></label>
-      </section>
-      {fields.map((field, index) => (
-        <section className="panel inspection-config-field" key={field.key}>
-          <div className="inspection-config-head">
-            <h3>{index + 1}. {field.label || "检测项"}</h3>
-            <div>
-              <button type="button" className="btn small" disabled={index === 0} onClick={() => move(index, -1)}>上移</button>
-              <button type="button" className="btn small" disabled={index === fields.length - 1} onClick={() => move(index, 1)}>下移</button>
-              <button type="button" className="btn small" disabled={fields.length === 1} onClick={() => {
-                setFields((previous) => previous.filter((item) => item.key !== field.key));
-                onDirty();
-              }}>移除</button>
-            </div>
+      <InspectionFields form={{ id: "preview", name, serial_mode: mode, fields, revision: 1 }}
+        values={sample} onChange={(key, value) => setSample((previous) => withValue(previous, key, value))} />
+      <ResultLabel value={decision(fields, automaticValues(fields, sample))} />
+    </div> : <div className="inspection-editor-layout">
+      <section className="panel inspection-editor-nav" aria-label="检测项列表">
+        {groups.map(([group, items], groupIndex) => <div className="inspection-editor-section" key={group}>
+          <div className="inspection-editor-group">
+            <strong>{group}</strong>
+            <button type="button" className="icon-btn" title="分组上移" aria-label={group + " 分组上移"}
+              disabled={groupIndex === 0} onClick={() => move(groupIndex, -1, -1)}><ArrowUp size={15} /></button>
+            <button type="button" className="icon-btn" title="分组下移" aria-label={group + " 分组下移"}
+              disabled={groupIndex === groups.length - 1} onClick={() => move(groupIndex, -1, 1)}><ArrowDown size={15} /></button>
+            <button type="button" className="icon-btn" title="添加检测项" aria-label={group + " 添加检测项"}
+              disabled={fields.length >= 60} onClick={() => add(group)}><Plus size={16} /></button>
           </div>
-          <div className="inspection-config-grid">
-            <label>检测项名称<input required maxLength={80} value={field.label}
-              onChange={(e) => update(field.key, { label: e.target.value })} /></label>
-            <label>分组<input maxLength={60} value={field.group}
-              onChange={(e) => update(field.key, { group: e.target.value })} /></label>
-            <label>类型<select value={field.type} onChange={(e) => update(field.key, { type: e.target.value as FieldType })}>
-              {fieldTypes.map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-            </select></label>
-            {field.type === "number" && <>
-              <label>单位<input value={field.unit} maxLength={24} onChange={(e) => update(field.key, { unit: e.target.value })} /></label>
-              <label>合格下限<input type="number" step="any" value={field.minimum}
-                onChange={(e) => update(field.key, { minimum: e.target.value })} /></label>
-              <label>合格上限<input type="number" step="any" value={field.maximum}
-                onChange={(e) => update(field.key, { maximum: e.target.value })} /></label>
-            </>}
-          </div>
-          {(field.type === "choice" || field.type === "multi") && <div className="inspection-editor-main">
-            <label>选项（每行一个）<textarea rows={3} value={field.options}
-              onChange={(e) => update(field.key, { options: e.target.value })} /></label>
-            <label>判为不良的选项（每行一个）<textarea rows={3} value={field.fail}
-              onChange={(e) => update(field.key, { fail: e.target.value })} /></label>
-          </div>}
-          <div className="inspection-checks">
-            <label><input type="checkbox" checked={field.required}
-              onChange={(e) => update(field.key, { required: e.target.checked })} />必检项</label>
-            {field.type === "multi" && <label><input type="checkbox" checked={field.custom}
-              onChange={(e) => update(field.key, { custom: e.target.checked })} />允许现场添加选项</label>}
-          </div>
-        </section>
-      ))}
-      {error && <div className="form-error" role="alert">{error}</div>}
-      <div className="inspection-edit-actions">
+          {items.map((item) => <button key={item.key} type="button" className="inspection-editor-item"
+            aria-pressed={item.key === field.key} onClick={() => setSelected(item.key)}>
+            <span>{item.label || "新检测项"}</span>
+            <small>{item.auto_from ? "自动判定" : fieldTypes.find(([type]) => type === item.type)?.[1]}</small>
+          </button>)}
+        </div>)}
         <button type="button" className={action} disabled={fields.length >= 60} onClick={() => {
-          setFields((previous) => [...previous, newField()]);
-          onDirty();
-        }}><Plus size={16} />添加检测项</button>
-        <button type="button" className={action} onClick={cancel}>取消</button>
-        <button className={primary} type="submit" disabled={busy}>{busy ? "保存中…" : "保存检测表"}</button>
-      </div>
-    </form>
-  );
+          let group = "新分组";
+          for (let i = 2; fields.some((item) => item.group === group); i++) group = "新分组 " + i;
+          add(group);
+        }}><Plus size={16} />添加分组</button>
+      </section>
+      <section className="panel inspection-config-field">
+        <div className="inspection-config-head">
+          <h3>{field.label || "新检测项"}</h3>
+          <div>
+            <button type="button" className="btn small" disabled={fieldIndex === 0}
+              onClick={() => move(fieldGroup, fieldIndex, -1)}>上移</button>
+            <button type="button" className="btn small" disabled={fieldIndex === groupItems.length - 1}
+              onClick={() => move(fieldGroup, fieldIndex, 1)}>下移</button>
+            <button type="button" className="btn small" disabled={fields.length === 1} onClick={remove}>移除</button>
+          </div>
+        </div>
+        <FieldSettings key={field.key} field={field} fields={fields} update={update} />
+      </section>
+    </div>}
+    {error && <div className="form-error" role="alert">{error}</div>}
+    <div className="inspection-edit-actions">
+      <button type="button" className={action} disabled={busy} onClick={cancel}>取消</button>
+      <button className={primary} type="submit" disabled={busy}>{busy ? "保存中…" : "保存检测表"}</button>
+    </div>
+  </form>;
 }
 
 function InspectionImport({ template, request, baseUrl, onImported }: {
@@ -698,6 +932,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
   const [templateId, setTemplateId] = useState("");
   const [tab, setTab] = useState<"entry" | "devices" | "history" | "settings">("entry");
   const [editor, setEditor] = useState<Template | null | undefined>(undefined);
+  const [copy, setCopy] = useState<Template>();
   const [serial, setSerial] = useState("");
   const [prefix, setPrefix] = useState("");
   const [historyPrefix, setHistoryPrefix] = useState("");
@@ -705,6 +940,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
   const [record, setRecord] = useState<RecordRow | null>(null);
   const [device, setDevice] = useState<Device | null>(null);
   const [savedOptions, setSavedOptions] = useState<SavedOption[]>([]);
+  const [optionSearch, setOptionSearch] = useState("");
   const [dirty, setDirty] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
   const [camera, setCamera] = useState<"live" | "photo" | null>(null);
@@ -717,10 +953,10 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
   const serialInput = useRef<HTMLInputElement>(null);
   const template = templates.find((item) => item.id === templateId);
   const form = record?.form || template;
-  const groups = new Map<string, InspectionField[]>();
-  for (const field of form?.fields || []) {
-    groups.set(field.group, [...(groups.get(field.group) || []), field]);
-  }
+  const visibleOptions = savedOptions.filter((item) => {
+    const label = template?.fields.find((field) => field.key === item.field_key)?.label || "";
+    return (label + " " + item.value).toLowerCase().includes(optionSearch.trim().toLowerCase());
+  });
 
   useEffect(() => {
     let active = true;
@@ -873,7 +1109,10 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
   function changeTab(next: typeof tab) {
     if (configDirty && !discard()) return;
     if (configDirty) setConfigDirty(false);
-    if (next !== "settings") setEditor(undefined);
+    if (next !== "settings") {
+      setEditor(undefined);
+      setCopy(undefined);
+    }
     setError("");
     setTab(next);
   }
@@ -888,6 +1127,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
             if (!discard()) return;
             setTemplateId(event.target.value);
             setEditor(undefined);
+            setCopy(undefined);
             setConfigDirty(false);
             setHistoryPrefix("");
             setRecord(null);
@@ -922,9 +1162,9 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
         </div>
       )}
       {tab === "settings" && admin && !readOnly && (
-        editor !== undefined ? <TemplateEditor key={editor?.id || "new"} template={editor}
+        editor !== undefined ? <TemplateEditor key={editor?.id || copy?.id || "new"} template={editor} copy={copy}
           onDirty={() => setConfigDirty(true)}
-          cancel={() => { if (discard()) { setEditor(undefined); setConfigDirty(false); } }}
+          cancel={() => { if (discard()) { setEditor(undefined); setCopy(undefined); setConfigDirty(false); } }}
           save={async (data) => {
             const saved: Template = await request(inspectionPath + "templates" + (editor ? "/" + editor.id : ""),
               editor ? "PUT" : "POST", data);
@@ -932,6 +1172,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
               ? previous.map((item) => item.id === saved.id ? saved : item) : [...previous, saved]);
             setTemplateId(saved.id);
             setEditor(undefined);
+            setCopy(undefined);
             setConfigDirty(false);
             setRecord(null);
             setValues({});
@@ -944,33 +1185,43 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
                 if (discard()) { setDirty(false); setEditor(null); }
               }}><Plus size={16} />新建检测表</button>
             </div>
-            {templates.map((item) => <div className="inspection-template-row" key={item.id}>
+            {templates.map((item) => <div className="inspection-template-row inspection-template-actions" key={item.id}>
               <strong>{item.name}</strong><span className="muted">{item.fields.length} 项 · 版本 {item.revision}</span>
               <button type="button" className="btn small" onClick={() => {
                 if (discard()) { setDirty(false); setEditor(item); }
               }}>编辑</button>
+              <button type="button" className="btn small" onClick={() => {
+                if (discard()) { setDirty(false); setCopy(item); setEditor(null); }
+              }}>复制</button>
             </div>)}
           </section>
       )}
       {tab === "settings" && editor === undefined && template && savedOptions.length > 0 && (
         <section className="panel inspection-site-options">
-          <h3>现场新增选项</h3>
-          {savedOptions.map((item) => (
-            <div className="inspection-template-row" key={item.field_key + ":" + item.value}>
-              <span className="muted">{template.fields.find((field) => field.key === item.field_key)?.label}</span>
-              <strong>{item.value}</strong>
-              <button type="button" className="btn small" disabled={busy} onClick={async () => {
-                setBusy(true);
-                setError("");
-                try {
-                  setSavedOptions(await request(inspectionPath + "options", "PUT", {
-                    template_id: template.id, field_key: item.field_key, value: item.value, hidden: !item.hidden_at,
-                  }));
-                } catch (e) { setError((e as Error).message); }
-                finally { setBusy(false); }
-              }}>{item.hidden_at ? "恢复选项" : "隐藏选项"}</button>
-            </div>
-          ))}
+          <div className="inspection-config-head">
+            <h3>现场新增选项 <small className="muted">{savedOptions.length} 项</small></h3>
+            <input aria-label="搜索现场选项" placeholder="搜索检测项或选项" value={optionSearch}
+              onChange={(event) => setOptionSearch(event.target.value)} />
+          </div>
+          <div className="inspection-site-option-list">
+            {visibleOptions.map((item) => (
+              <div className="inspection-template-row" key={item.field_key + ":" + item.value}>
+                <span className="muted">{template.fields.find((field) => field.key === item.field_key)?.label}</span>
+                <strong>{item.value}</strong>
+                <button type="button" className="btn small" disabled={busy} onClick={async () => {
+                  setBusy(true);
+                  setError("");
+                  try {
+                    setSavedOptions(await request(inspectionPath + "options", "PUT", {
+                      template_id: template.id, field_key: item.field_key, value: item.value, hidden: !item.hidden_at,
+                    }));
+                  } catch (e) { setError((e as Error).message); }
+                  finally { setBusy(false); }
+                }}>{item.hidden_at ? "恢复选项" : "隐藏选项"}</button>
+              </div>
+            ))}
+            {!visibleOptions.length && <p className="muted">无匹配选项</p>}
+          </div>
         </section>
       )}
       {tab === "devices" && <DeviceRegistry key={historyPrefix} request={request} prefix={historyPrefix}
@@ -1045,34 +1296,21 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
             }}><Plus size={16} />新建检测表</button> : <p className="muted">请联系管理员配置检测表。</p>}
           </section>}
           {form && <fieldset className="inspection-entry-fields" disabled={readOnly || busy}>
-            {Array.from(groups, ([group, fields]) => (
-              <section className="panel inspection-field-group" key={group}>
-                <h3>{group}</h3>
-                <div className="inspection-field-grid">
-                  {fields.map((field) => <FieldInput key={form.id + ":" + form.revision + ":" + field.key}
-                    field={field} value={values[field.key]} suggestions={savedOptions
-                      .filter((item) => item.field_key === field.key && !item.hidden_at).map((item) => item.value)}
-                    onChange={(value) => {
-                      setValues((previous) => {
-                        const next = { ...previous };
-                        if (value === undefined || (Array.isArray(value) && !value.length)) delete next[field.key];
-                        else next[field.key] = value;
-                        return next;
-                      });
-                      setDirty(true);
-                    }} />)}
-                </div>
-              </section>
-            ))}
+            <InspectionFields key={serial && (record?.id || "new")} form={form} values={values}
+              original={record?.values} savedOptions={savedOptions} onChange={(key, value) => {
+                setValues((previous) => withValue(previous, key, value));
+                setDirty(true);
+              }} />
           </fieldset>}
           <div className="inspection-submit">
             <div>{form && (!lastResult || serial) &&
-              <ResultLabel value={record && !dirty ? record.result : decision(form.fields, values)} />}</div>
+              <ResultLabel value={record && !dirty ? record.result :
+                decision(form.fields, automaticValues(form.fields, values, record?.values))} />}</div>
             <div>
               <button type="button" className={action} disabled={busy} onClick={() => {
                 if (discard()) clearEntry(true);
               }}>{record || device ? "下一台" : "清空表单"}</button>
-              {form && !readOnly && <button type="button" className={primary} disabled={busy || !serial.trim()}
+              {form && !readOnly && <button type="button" className={primary} disabled={busy || !serial.trim() || (!!record && !dirty)}
                 onClick={() => void saveRecord()}>{busy ? "处理中…" : "保存检测"}</button>}
             </div>
           </div>

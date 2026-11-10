@@ -103,6 +103,36 @@ class IntegrationTests(unittest.TestCase):
         self.request('projects/'+self.project_id, 'PUT', {'archived': True})
         self.request('inspection/records', 'POST', entry('0000012611100004', {'pressure': 3}, revision=2), 409)
 
+    def test_inspection_linked_automatic_verdict_and_manual_measurement(self):
+        fields = [
+            {'key': 'voltage', 'label': '电压', 'group': '测量', 'block': '电源',
+             'type': 'number', 'minimum': 3, 'maximum': 4},
+            {'key': 'verdict', 'label': '电压判定', 'group': '测量', 'block': '电源',
+             'type': 'choice', 'options': ['OK', 'NG'], 'fail': ['NG'],
+             'auto_from': 'voltage', 'required': True},
+            {'key': 'manual', 'label': '功能测试', 'group': '功能', 'type': 'multi',
+             'display': 'dropdown', 'custom': True, 'required': True},
+        ]
+        config = {'name': '通用组合检测', 'serial_mode': 'text', 'fields': fields}
+        self.request('inspection/templates', 'POST', {
+            **config, 'fields': [fields[0], {**fields[1], 'block': '另一组'}, fields[2]],
+        }, 400)
+        template = self.request('inspection/templates', 'POST', config)
+        self.assertEqual(template['fields'][2]['display'], 'dropdown')
+        def save(serial, values, version=None):
+            return self.request('inspection/records', 'POST', {
+                'serial': serial, 'template_id': template['id'], 'revision': 1,
+                'version': version, 'values': values,
+            })
+        pending = save('TEST-01', {'manual': ['通过'], 'verdict': 'OK'})
+        self.assertEqual((pending['result'], pending['values']), ('未完成', {'manual': ['通过']}))
+        passed = save('TEST-01', {'voltage': 3, 'manual': ['通过'], 'verdict': 'NG'}, pending['updated_at'])
+        self.assertEqual((passed['result'], passed['values']['verdict']), ('合格', 'OK'))
+        failed = save('TEST-02', {'voltage': 4.01, 'verdict': 'OK'})
+        self.assertEqual((failed['result'], failed['values']['verdict']), ('不良', 'NG'))
+        cleared = save('TEST-01', {'manual': ['通过'], 'verdict': 'OK'}, passed['updated_at'])
+        self.assertEqual((cleared['result'], cleared['values']), ('未完成', {'manual': ['通过']}))
+
     def test_inspection_excel_and_csv_round_trip(self):
         from urllib.parse import urlencode
         from electronic_import import read_xlsx
