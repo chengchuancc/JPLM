@@ -1,11 +1,39 @@
+.main-shell:has(> main > .shipping-management) {
+  display: flex; flex-direction: column; height: 100dvh;
+}
+.main-shell:has(> main > .shipping-management) > .topbar { flex-shrink: 0; }
+main:has(> .shipping-management) {
+  display: flex; flex-direction: column; flex: 1; min-height: 0; width: 100%; padding-top: 10px;
+}
+main:has(> .shipping-management) > :not(.shipping-management) { flex-shrink: 0; }
+main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 6px; }
+.shipping-management {
+  display: flex; flex-direction: column; flex: 1; min-height: 0;
+}
+.shipping-management > :not(.shipping-table) { flex-shrink: 0; }
+.shipping-header {
+  display: flex; align-items: center; gap: 18px; margin-bottom: 8px; border-bottom: 1px solid var(--border);
+}
+.shipping-header h1 { flex-shrink: 0; font-size: 18px; line-height: 1.25; }
+.shipping-header .tabs { gap: 16px; }
+.shipping-header .tabs > button { height: 34px; font-size: 12px; }
 .shipping-toolbar, .shipping-tools {
   display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
 }
-.shipping-toolbar { justify-content: space-between; margin-bottom: 12px; }
+.shipping-toolbar { justify-content: space-between; margin-bottom: 8px; gap: 6px 12px; }
 .shipping-tools input { width: min(260px, 100%); }
 .shipping-tools select { width: auto; }
+.shipping-toolbar > .shipping-tools { gap: 6px; }
+.shipping-toolbar > form {
+  flex: 1 1 335px; min-width: 0; max-width: 465px; flex-wrap: nowrap;
+}
+.shipping-toolbar > form > input { flex: 1 1 0; width: 0; min-width: 0; }
+.shipping-toolbar > form > select, .shipping-toolbar .btn { flex-shrink: 0; }
+.shipping-toolbar > form > :is(input, select), .shipping-toolbar .btn {
+  height: 32px; min-height: 32px; padding: 0 9px; font-size: 12px;
+}
 .shipping-table {
-  position: relative; max-height: max(300px, calc(100dvh - 240px)); overflow: auto;
+  position: relative; overflow: auto;
   overscroll-behavior: contain; scrollbar-gutter: stable;
 }
 .shipping-table table { table-layout: fixed; border-collapse: separate; border-spacing: 0; min-width: 100%; }
@@ -142,6 +170,9 @@
   .shipping-details { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .shipping-record-fields .shipping-details { grid-template-columns: minmax(0, 1fr); }
   .shipping-toolbar .column-visibility-menu { left: 0; right: auto; }
-  .shipping-toolbar form { width: 100%; }
-  .shipping-toolbar form input { flex: 1 1 100%; }
+  .shipping-header { gap: 12px; }
+  .shipping-header h1 { font-size: 16px; }
+  .shipping-header .tabs { gap: 12px; }
+  .shipping-toolbar > form { flex-basis: 100%; max-width: none; }
+  .shipping-toolbar > form > :is(input, select), .shipping-toolbar .btn { height: 36px; }
 }

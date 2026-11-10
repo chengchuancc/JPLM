@@ -722,10 +722,12 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     </Fragment>;
   };
   return <section className="shipping-management">
-    <div className="page-heading"><h1>发货管理</h1></div>
-    <div className="tabs page-tabs" aria-label="发货渠道">
-      <button type="button" className={channel === "other" ? "selected" : ""} onClick={() => select("other")}>其他发货管理</button>
-      <button type="button" className={channel === "ks" ? "selected" : ""} onClick={() => select("ks")}>KS 发货管理</button>
+    <div className="shipping-header">
+      <h1>发货管理</h1>
+      <div className="tabs" aria-label="发货渠道">
+        <button type="button" className={channel === "other" ? "selected" : ""} onClick={() => select("other")}>其他发货管理</button>
+        <button type="button" className={channel === "ks" ? "selected" : ""} onClick={() => select("ks")}>KS 发货管理</button>
+      </div>
     </div>
     <div className="shipping-toolbar">
       <form className="shipping-tools" onSubmit={(event) => {
