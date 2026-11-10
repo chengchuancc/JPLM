@@ -39,6 +39,7 @@ import {
   ArrowUpFromLine,
   RotateCcw,
   CircleHelp,
+  ClipboardCheck,
   CheckCircle2,
   AlertCircle,
   ExternalLink,
@@ -75,6 +76,7 @@ import {
   type Column,
 } from "./material-table";
 import "./style.css";
+import { ProductionInspection } from "./inspection";
 
 const money = (n: number) =>
   new Intl.NumberFormat("zh-CN", {
@@ -141,6 +143,7 @@ const navs = [
   { id: "purchases", name: "采购管理", icon: ShoppingCart },
   { id: "inventory", name: "库存查询", icon: Warehouse },
   { id: "movements", name: "库存流水", icon: ArrowLeftRight },
+  { id: "inspection", name: "生产检测", icon: ClipboardCheck },
 ];
 type Modal = { kind: string; item?: any; extra?: any } | null;
 type Field = {
@@ -1081,7 +1084,8 @@ function App() {
     }
   }
   function navigate(next: WorkspaceRoute, replace = false) {
-    if (currentRoute.current.projectId !== next.projectId && draftOpen.current &&
+    if ((currentRoute.current.projectId !== next.projectId ||
+        (currentRoute.current.view === "inspection" && next.view !== "inspection")) && draftOpen.current &&
         !window.confirm("有未保存的内容。离开当前项目？")) return;
     if (location.hash !== workspaceHash(next)) {
       if (replace) history.replaceState(null, "", workspaceHash(next));
@@ -1094,7 +1098,8 @@ function App() {
     void load();
     const changed = () => {
       const next = readWorkspaceRoute();
-      if (currentRoute.current.projectId !== next.projectId && draftOpen.current &&
+      if ((currentRoute.current.projectId !== next.projectId ||
+          (currentRoute.current.view === "inspection" && next.view !== "inspection")) && draftOpen.current &&
           !window.confirm("有未保存的内容。离开当前项目？")) {
         history.replaceState(null, "", workspaceHash(currentRoute.current));
         return;
@@ -2465,6 +2470,13 @@ function Workspace({
               await reloadProjects();
               navigate({ projectId: result.id, view: "products", detail: "" });
             } : undefined}
+          />}
+          {view === "inspection" && project && <ProductionInspection
+            request={businessApi}
+            baseUrl={appBase + "api/projects/" + encodeURIComponent(project.id) + "/"}
+            admin={currentUser.role === "admin"}
+            readOnly={archived}
+            onDraftChange={(dirty) => { draftOpen.current = dirty; }}
           />}
           {view === "project-settings" && project && (
             <ProjectSettings project={{ ...project, ...state.project }} user={currentUser}

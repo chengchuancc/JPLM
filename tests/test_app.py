@@ -18,6 +18,7 @@ class IntegrationTests(unittest.TestCase):
         cls.server.shutdown();cls.server.server_close();cls.thread.join();cls.tmp.cleanup()
     def setUp(self):
         with app.transaction() as db:
+            for table in reversed(app.inspection.TABLES): db.execute('DELETE FROM '+table)
             for t in reversed(app.TABLES): db.execute('DELETE FROM '+t)
             for table in ('sessions', 'activity', 'import_runs', 'project_covers', 'project_members', 'projects', 'users', 'settings'):
                 db.execute('DELETE FROM ' + table)
@@ -50,6 +51,100 @@ class IntegrationTests(unittest.TestCase):
     def test_stock_lifecycle_and_history(self):
         self.move('入库',10);out=self.move('出库',4)['id'];self.move('退库',2,original_id=out);self.move('报废',1,reason='损坏')
         self.assertEqual(self.stock(),7);self.assertEqual([m['balance'] for m in self.state()['movements']],[10,6,8,7])
+
+    def test_inspection_templates_rules_and_project_permissions(self):
+        config = {'name': '压力测试', 'serial_mode': 'dated', 'fields': [
+            {'key': 'pressure', 'label': '压力', 'group': '性能', 'type': 'number', 'unit': 'kPa',
+             'required': True, 'minimum': 2, 'maximum': 4},
+            {'key': 'surface', 'label': '外观', 'type': 'choice', 'required': True,
+             'options': ['正常', '划痕'], 'fail': ['划痕']},
+        ]}
+        created = self.request('inspection/templates', 'POST', config)
+        template_id = created['id']
+        serial1, serial2 = '0000012611100001', '0000012611100002'
+        def entry(serial, values, version=None, revision=1):
+            return {'serial': serial, 'template_id': template_id, 'values': values,
+                    'version': version, 'revision': revision}
+        partial = self.request('inspection/records', 'POST', entry(serial1, {'pressure': 2}))
+        self.assertEqual(partial['result'], '未完成')
+        self.assertEqual(partial['production_date'], '2026-11-10')
+        self.request('inspection/records', 'POST', entry(serial1, {'pressure': 5}), 409)
+        failed = self.request('inspection/records', 'POST', entry(serial1, {'pressure': 5}, partial['updated_at']))
+        self.assertEqual(failed['result'], '不良')
+        self.assertEqual(self.request('inspection/lookup?template='+template_id+'&serial='+serial2), {'record': None})
+        passed = self.request('inspection/records', 'POST', entry(serial2, {'pressure': 4, 'surface': '正常'}))
+        self.assertEqual(passed['result'], '合格')
+        history = self.request('inspection/records?template='+template_id+'&prefix=000001')
+        self.assertEqual({r['serial'] for r in history['records']}, {serial1, serial2})
+
+        updated = self.request('inspection/templates/'+template_id, 'PUT', {
+            **config, 'revision': 1, 'fields': [{**config['fields'][0], 'maximum': 3}],
+        })
+        self.assertEqual(updated['revision'], 2)
+        original = self.request('inspection/lookup?template='+template_id+'&serial='+serial2)['record']
+        self.assertEqual(original['form']['revision'], 1)
+        self.assertIn('surface', original['values'])
+        self.request('inspection/records', 'POST', entry('0000012611100003', {'pressure': 3}), 409)
+
+        other = self.request('projects', 'POST', {'name': '另一项目'})['id']
+        self.assertEqual(self.request('inspection/templates', project=other), [])
+        self.request('inspection/records?template='+template_id, status=404, project=other)
+        admin_cookie = self.cookie
+        account = {'name':'检测员', 'email':'inspection@example.test','password':'inspector'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('projects/'+self.project_id, 'PUT', {'members': [member]})
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password':'inspector','password':'inspector'})
+        self.request('inspection/templates', 'POST', config, 403)
+        self.request('inspection/import-preview', 'POST', {}, 403)
+        saved = self.request('inspection/records', 'POST', entry('0000012611100003', {'pressure': 3}, revision=2))
+        self.assertEqual(saved['operator_name'], '检测员')
+        self.cookie = admin_cookie
+        self.request('projects/'+self.project_id, 'PUT', {'archived': True})
+        self.request('inspection/records', 'POST', entry('0000012611100004', {'pressure': 3}, revision=2), 409)
+
+    def test_inspection_excel_and_csv_round_trip(self):
+        from urllib.parse import urlencode
+        from electronic_import import read_xlsx
+        config = {'name':'通用出厂检测', 'serial_mode':'dated', 'fields': [
+            {'key':'appearance', 'label':'外观检测', 'type':'multi', 'options':['正常','有划痕'],
+             'fail':['有划痕'], 'required':True},
+            {'key':'notes', 'label':'说明', 'type':'text'},
+        ]}
+        source = self.request('inspection/templates', 'POST', config)['id']
+        target = self.request('inspection/templates', 'POST', {**config, 'name':'第二套检测表'})['id']
+        code = '0000012611100001'
+        self.request('inspection/records', 'POST', {
+            'template_id':source, 'serial':code, 'revision':1, 'version':None,
+            'values':{'appearance':['有划痕'],'notes':'=2+2'},
+        })
+        exported = self.request('inspection/export?template='+source, raw=True)
+        _, _, worksheet = read_xlsx(exported)
+        self.assertEqual(worksheet[1][1][0], code)
+        self.assertIn('=2+2', worksheet[1][1])
+        csv_bytes = self.request('inspection/export?'+urlencode({'template':source,'format':'csv'}), raw=True)
+        self.assertIn("'=2+2", csv_bytes.decode('utf-8-sig'))
+
+        def upload(resource, payload, filename, form_id, revision=None):
+            fields = {'template': form_id}
+            if revision is not None: fields['revision'] = str(revision)
+            body = b''.join(
+                f'--inspection-boundary\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+                for name, value in fields.items()
+            )
+            body += (f'--inspection-boundary\r\nContent-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                     'Content-Type: application/octet-stream\r\n\r\n').encode() + payload + b'\r\n--inspection-boundary--\r\n'
+            return self.request('inspection/'+resource, 'POST', body,
+                                headers={'Content-Type':'multipart/form-data; boundary=inspection-boundary'})
+        preview = upload('import-preview', exported, 'inspection.xlsx', target)
+        self.assertEqual((preview['ready'], preview['duplicates']), (1, 0))
+        self.assertEqual(self.request('inspection/records?template='+target)['total'], 0)
+        imported = upload('import', exported, 'inspection.xlsx', target, preview['revision'])
+        self.assertEqual(imported['ready'], 1)
+        again = upload('import-preview', csv_bytes, 'inspection.csv', target)
+        self.assertEqual((again['ready'], again['duplicates']), (0, 1))
+        row = self.request('inspection/lookup?template='+target+'&serial='+code)['record']
+        self.assertEqual((row['result'], row['values']), ('不良', {'appearance':['有划痕'],'notes':'=2+2'}))
     def test_insufficient_stock_and_invalid_qty(self):
         for qty in (-1,0,'NaN','Infinity',1e12): self.request('movements','POST',{'type':'入库','part_id':self.part,'qty':qty},400)
         self.request('movements','POST',{'type':'出库','part_id':self.part,'qty':1},400)

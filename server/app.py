@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as BaseThrea
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
+import inspection
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, migrate_projects,
@@ -113,6 +114,8 @@ def init_db(directory=None, bootstrap=None):
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(projects)')}:
             db.execute('ALTER TABLE projects ADD COLUMN deleted_at TEXT '
                        'CHECK(deleted_at IS NULL OR archived_at IS NOT NULL)')
+        for statement in inspection.SCHEMA:
+            db.execute(statement)
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -645,7 +648,8 @@ def stage_restore(archive_path, directory):
             project_tables = ('projects', 'project_members') if version >= PROJECT_VERSION else ()
             if version >= 10:
                 project_tables += ('project_covers',)
-            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables}
+            inspection_tables = inspection.TABLES if version >= 12 else ()
+            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
             if not required_tables <= source_tables:
@@ -654,7 +658,7 @@ def stage_restore(archive_path, directory):
             with connect(staged) as db:
                 db.execute('BEGIN')
                 db.execute('PRAGMA defer_foreign_keys=ON')
-                for table in ('users', *project_tables, *TABLES, 'settings', 'import_runs', 'activity'):
+                for table in ('users', *project_tables, *TABLES, *inspection_tables, 'settings', 'import_runs', 'activity'):
                     if table not in source_tables or (version == 6 and table in ('users', 'activity')):
                         continue
                     target_columns = [row['name'] for row in db.execute(f'PRAGMA table_info({table})')]
@@ -851,6 +855,7 @@ class Handler(BaseHTTPRequestHandler):
             raise Problem('接口不存在',404)
         except (ConnectionResetError,BrokenPipeError,TimeoutError): return
         except Problem as e: self.send({'error':e.message},e.status)
+        except inspection.InspectionError as e: self.send({'error':str(e)},e.status)
         except sqlite3.IntegrityError as e:
             msg = '英文代号已使用' if 'products.english_code' in str(e) else '关联记录不匹配或仍被其他记录引用' if 'FOREIGN KEY' in str(e) else '编码或关联物料重复，请检查输入'
             self.send({'error':msg},409)
@@ -958,6 +963,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send({'id': project_id})
 
     def project_request(self, project_id, path, method):
+        if path.startswith('/api/inspection/'):
+            return self.inspection_request(project_id, path.removeprefix('/api/inspection/'), method)
         if path == '/api/recover' and method == 'POST':
             return self.set_project_deleted(project_id, deleted=False)
         if path == '/api/cover' and method in ('GET', 'POST', 'DELETE'):
@@ -991,6 +998,103 @@ class Handler(BaseHTTPRequestHandler):
             for fid in result.pop('_delete_files', []):
                 remove_upload(fid)
         self.send(result)
+
+    def inspection_request(self, project_id, resource, method):
+        query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
+        if method == 'GET':
+            with connect() as db:
+                db.execute('BEGIN')
+                enter_project(db, project_id, self.user)
+                if resource == 'templates':
+                    return self.send(inspection.templates(db, project_id))
+                if resource not in ('records', 'lookup', 'export', 'import-template'):
+                    raise Problem('接口不存在', 404)
+                config = inspection.template(db, project_id, query.get('template'))
+                if resource == 'lookup':
+                    serial, _, _ = inspection.parse_serial(query.get('serial'), config['serial_mode'])
+                    return self.send({'record': inspection.exact_record(db, project_id, config['id'], serial)})
+                if resource == 'records':
+                    return self.send(inspection.list_records(db, project_id, config['id'], query))
+                records = (inspection.list_records(db, project_id, config['id'], query, exporting=True)['records']
+                           if resource == 'export' else [])
+            rows = inspection.export_rows(config, records)
+            as_csv = query.get('format') == 'csv'
+            payload = inspection.csv_file(rows) if as_csv else inspection.xlsx_file(rows)
+            name = ('生产检测模板' if resource == 'import-template' else '生产检测记录') + (
+                '.csv' if as_csv else '.xlsx'
+            )
+            return self.inspection_download(payload, name, as_csv)
+
+        if resource in ('import-preview', 'import') and method == 'POST':
+            self.require_admin()
+            with connect() as db:
+                enter_project(db, project_id, self.user, write=True)
+            fields, uploads = self.multipart()
+            if len(uploads) != 1:
+                raise Problem('请选择一个检测数据文件')
+            filename, _, blob = uploads[0]
+            if method == 'POST' and resource == 'import-preview':
+                with connect() as db:
+                    db.execute('BEGIN')
+                    enter_project(db, project_id, self.user, write=True)
+                    config = inspection.template(db, project_id, fields.get('template'))
+                    _, report = inspection.import_batch(db, project_id, config, blob, filename, now())
+                    return self.send({**report, 'revision': config['revision']})
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                self.require_admin()
+                config = inspection.template(db, project_id, fields.get('template'))
+                if fields.get('revision') != str(config['revision']):
+                    raise Problem('检测表已更新，请重新预览后再导入', 409)
+                ready, report = inspection.import_batch(db, project_id, config, blob, filename, now())
+                for serial, prefix, produced, result, values, operator, source, created, updated in ready:
+                    inspection.insert_record(db, project_id, config, uid(), serial, prefix, produced,
+                                             result, values, None, operator, source, created, updated)
+                if ready:
+                    touch_project(db)
+                    log_activity(db, self.user, '导入生产检测记录', config['id'], config['name'], f'{len(ready)} 条')
+            return self.send(report)
+
+        editing = resource.startswith('templates/') and '/' not in resource[len('templates/'):]
+        if (resource == 'records' and method == 'POST') or (
+            (resource == 'templates' and method == 'POST') or (editing and method == 'PUT')
+        ):
+            data = self.body()
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                if resource == 'records':
+                    config = inspection.template(db, project_id, data.get('template_id'))
+                    record = inspection.save_record(db, project_id, config, data, self.user, now(), uid())
+                    log_activity(db, self.user, '保存生产检测', record['id'], record['serial'], record['result'])
+                    response = record
+                else:
+                    self.require_admin()
+                    template_id = resource.split('/')[1] if editing else uid()
+                    existing = inspection.template(db, project_id, template_id) if editing else None
+                    response = inspection.save_template(db, project_id, template_id, data, now(), existing)
+                    log_activity(db, self.user, '设置生产检测表', template_id, response['name'],
+                                 f"版本 {response['revision']}")
+                touch_project(db)
+            return self.send(response)
+        raise Problem('接口不存在', 404)
+
+    def inspection_writer(self, db, project_id):
+        self.user = self.authorized(db)
+        if not self.user or self.user['must_change']:
+            raise Problem('请先登录', 401)
+        enter_project(db, project_id, self.user, write=True)
+
+    def inspection_download(self, payload, name, as_csv):
+        content_type = ('text/csv; charset=utf-8' if as_csv else
+                        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        self.send_response(200)
+        self.send_header('Content-Type', content_type)
+        self.send_header('Content-Length', str(len(payload)))
+        self.send_header('Content-Disposition', f"attachment; filename*=UTF-8''{quote(name)}")
+        self.send_header('Cache-Control', 'no-store')
+        self.security_headers()
+        self.end_headers()
+        self.wfile.write(payload)
 
     def project_cover(self, project_id, method):
         if method == 'GET':
