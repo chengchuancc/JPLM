@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 import { Dialog } from "./dialog";
 import type { RecordRow } from "./inspection";
-import { contactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList, shipmentLabel,
+import { contactFields, otherContactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList, isShipped, shipmentLabel,
   type Request, type Order, type Shipment } from "./shipping-data";
 import "./shipping.css";
 
@@ -148,7 +148,7 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
     <div className="inspection-record-summary">
       <div><span>{title}</span> <strong className="mono">{row.reference || "—"}</strong></div>
       {row.deleted_at ? <span className="muted">已删除 · {formatTime(row.deleted_at)}</span>
-        : <Status sent={!!(row.shipped_on || row.tracking)} />}
+        : <Status sent={isShipped(row)} />}
     </div>
     <div className="shipping-record-fields">
     <section className="shipping-detail-section">
@@ -176,12 +176,13 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
         <ChildShipmentLinks id={id} request={request} open={open} /></>}
     </section>}
     <section className="shipping-detail-section"><h3>收件资料</h3>
-      <DetailsList fields={row.channel === "ks" ? [...contactFields, ["address_status", "地址确认"]] : contactFields}
-        details={{ ...row.order_details, ...row.details }} showEmpty />
+      <DetailsList fields={row.channel === "ks" ? [...contactFields, ["address_status", "地址确认"]] : otherContactFields}
+        details={row.channel === "ks" ? row.order_details : row.details} showEmpty />
     </section>
-    <section className="shipping-detail-section"><h3>发货数量</h3>
-      <DetailsList fields={items} details={row.details} showEmpty />
-    </section>
+    {row.channel === "other" &&
+      <section className="shipping-detail-section"><h3>发货数量</h3>
+        <DetailsList fields={items} details={row.details} showEmpty />
+      </section>}
     {row.ks_order_id && <section className="shipping-detail-section"><h3>KS 订单数量</h3>
       <DetailsList fields={[["sku", "SKU"], ...items]} details={row.order_details} showEmpty />
     </section>}

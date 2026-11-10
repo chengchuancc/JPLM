@@ -1,7 +1,7 @@
 """SQLite project ownership and the v8 to v9 migration."""
 
 PROJECT_VERSION = 9
-VERSION = 16
+VERSION = 17
 LEGACY_PROJECT_ID = 'legacy'
 BUSINESS_TABLES = (
     'products', 'parts', 'suppliers', 'quotes', 'bom_versions', 'bom_lines',

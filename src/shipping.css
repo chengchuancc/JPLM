@@ -26,12 +26,14 @@
   display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
 }
 .shipping-table tbody tr.shipping-row-editing td { background: #edf3ff; }
-.shipping-table td input, .shipping-table td textarea {
+.shipping-table td input, .shipping-table td select, .shipping-table td textarea {
   width: 100%; min-width: 0; min-height: 27px; margin: 0; padding: 2px 4px;
   font-size: 12px; border-radius: 3px;
 }
 .shipping-table td textarea { display: block; resize: vertical; min-height: 42px; }
-.shipping-table td input:focus, .shipping-table td textarea:focus { box-shadow: inset 0 0 0 1px var(--accent); }
+.shipping-table td input:focus, .shipping-table td select:focus, .shipping-table td textarea:focus {
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
 .shipping-table .shipping-paste-row td { background: #f5f8fe; }
 .shipping-table td.shipping-cell-selected { box-shadow: inset 0 0 0 2px var(--accent); background: #eef4ff; }
 .shipping-paste-hint { margin: 0 0 8px; font-size: 12px; }
@@ -96,6 +98,13 @@
 .shipping-carrier-options label { display: flex; align-items: center; gap: 6px; padding: 4px; cursor: pointer; }
 .shipping-carrier-options label:hover { background: #f3f7ff; }
 .shipping-carrier-options input { width: 15px; height: 15px; min-height: 0; flex: 0 0 auto; }
+.shipping-carrier-options button {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  width: 100%; padding: 5px 6px; text-align: left; border-radius: 4px;
+}
+.shipping-carrier-options button:hover { background: #f3f7ff; }
+.shipping-carrier-options button[aria-pressed="true"] { background: #e8f0ff; font-weight: 600; }
+.shipping-carrier-options button small { color: var(--muted); }
 .shipping-device-picker h3 { margin-bottom: 7px; }
 .shipping-details { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 14px; margin: 9px 0; }
 .shipping-details dt { color: var(--muted); font-size: 12px; }

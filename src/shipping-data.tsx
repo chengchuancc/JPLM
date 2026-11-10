@@ -20,6 +20,7 @@ export const contactFields = [
   ["region", "州 / 省"], ["city", "城市"], ["postcode", "邮编"],
   ["address", "地址"], ["address2", "地址补充"],
 ];
+export const otherContactFields = contactFields.filter(([key]) => !["region", "city", "postcode"].includes(key));
 export const items = [["main_unit", "主机"], ["base", "底座"], ["case", "收纳包"], ["strip", "条形反光贴"], ["patch", "块状反光贴"]];
 export const costs = [["domestic_cost", "国内运费"], ["international_cost", "海外运费"], ["warehouse_cost", "海外仓运费"], ["weight", "包裹重量（g）"]];
 export const orderFields = [...contactFields, ["country_code", "国家代码"], ["pb", "PB 编号"], ["sku", "SKU"],
@@ -56,6 +57,13 @@ export function CarrierTags({ value }: { value: string | number | undefined }) {
   return names.length ? <span className="shipping-carrier-tags">
     {names.map((name) => <CarrierTag name={name} key={name} />)}
   </span> : <>—</>;
+}
+
+export function isShipped(row: Pick<Shipment, "shipped_on" | "tracking" | "details">) {
+  const status = row.details.shipment_status;
+  if (status === "shipped") return true;
+  if (status === "pending") return false;
+  return !!(row.shipped_on || row.tracking);
 }
 
 export function Status({ sent }: { sent: boolean }) {

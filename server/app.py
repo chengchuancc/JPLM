@@ -655,7 +655,8 @@ def stage_restore(archive_path, directory):
             if version >= 10:
                 project_tables += ('project_covers',)
             inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
-            shipping_tables = (shipping.TABLES if version >= shipping.CREATED_AT_VERSION else
+            shipping_tables = (shipping.TABLES if version >= shipping.SOURCES_VERSION else
+                               shipping.CARRIER_TABLES if version >= shipping.CREATED_AT_VERSION else
                                shipping.LEGACY_TABLES if version >= shipping.VERSION else ())
             required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables, *shipping_tables}
             if version >= 7:
@@ -692,6 +693,8 @@ def stage_restore(archive_path, directory):
                     inspection.backfill_from_records(db)
                 if shipping.VERSION <= version < shipping.CREATED_AT_VERSION:
                     shipping.fill_created_at(db)
+                if shipping.VERSION <= version < shipping.SOURCES_VERSION:
+                    shipping.repair_imported_times(db)
                 if shipping_tables and not shipping.valid_parent_links(db):
                     raise Problem('备份中的发货父子关系无效')
                 db.execute("DELETE FROM settings WHERE key='password'")
@@ -1047,6 +1050,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(shipping.find_devices(db, project_id, query))
                 if resource == 'carriers':
                     return self.send(shipping.list_carriers(db, project_id))
+                if resource == 'sources':
+                    return self.send(shipping.list_sources(db, project_id))
                 if resource == 'device-records':
                     serial = shipping.string(query.get('serial'), 100)
                     return self.send(shipping.for_device(db, project_id, serial))

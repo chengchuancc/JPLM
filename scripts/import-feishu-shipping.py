@@ -45,7 +45,7 @@ def require(condition, message):
 
 
 def timestamp(value, zone=timezone.utc):
-    return datetime.fromtimestamp(value / 1000, zone)
+    return datetime.fromtimestamp(value / 1000 if abs(value) >= 100_000_000_000 else value, zone)
 
 
 class Table:

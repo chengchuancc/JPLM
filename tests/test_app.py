@@ -161,6 +161,30 @@ class IntegrationTests(unittest.TestCase):
         self.request(child_path, 'PUT', {**payload, 'parent_id': None, 'version': restored['updated_at']})
         self.assertEqual(self.request(records + '?channel=other&roots=1')['total'], 2)
 
+    def test_ks_shipment_uses_order_details_and_explicit_shipping_status(self):
+        self.request('shipping/orders/paste', 'POST', {
+            'clipboard': 'Backer Number\t收件人\t主机\t底座\n88\t订单收件人\t2\t1\n89\t另一个收件人\t1\t0',
+        })
+        order = self.request('shipping/orders?q=88')['rows'][0]
+        other = self.request('shipping/orders?q=89')['rows'][0]
+        payload = {'channel': 'ks', 'ks_order_id': order['id'], 'tracking': 'YT-TEST',
+                   'details': {'name': '错误的收件人', 'main_unit': 10, 'shipment_status': 'pending'}}
+        row = self.request('shipping/records', 'POST', payload)
+        self.assertEqual(row['details'], {'shipment_status': 'pending'})
+        self.assertEqual((row['order_details']['name'], row['order_details']['main_unit']), ('订单收件人', 2))
+        self.assertEqual(self.request('shipping/orders?status=shipped')['total'], 0)
+        self.assertEqual(self.request('shipping/records?channel=ks&status=pending')['total'], 1)
+        path = 'shipping/records/' + row['id']
+        self.request(path, 'PUT', {**payload, 'ks_order_id': other['id'], 'version': row['updated_at']}, 409)
+        self.request('shipping/orders/' + order['id'], 'PUT', {'version': order['updated_at'],
+                                                              'details': {'main_unit': 3}})
+        self.assertEqual(self.request(path)['order_details']['main_unit'], 3)
+        self.request(path, 'PUT', {**payload, 'reference': '改编号', 'version': row['updated_at'],
+                                   'tracking': '', 'details': {'shipment_status': 'shipped'}})
+        self.assertEqual(self.request(path)['reference'], row['reference'])
+        self.assertEqual(self.request('shipping/orders?status=shipped')['total'], 1)
+        self.assertEqual(self.request('shipping/records?channel=ks&status=shipped')['total'], 1)
+
     def test_shipping_clipboard_paste_and_creation_order(self):
         paste = 'shipping/orders/paste'
         result = self.request(paste, 'POST', {

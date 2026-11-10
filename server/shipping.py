@@ -3,15 +3,17 @@ import csv
 import io
 import json
 import math
-from datetime import date
+from datetime import date, datetime, timezone
 
 from electronic_import import ElectronicBomError, normalized, read_csv, read_xlsx
 
 VERSION = 14
 CREATED_AT_VERSION = 15
 RECORD_RELATIONS_VERSION = 16
+SOURCES_VERSION = 17
 LEGACY_TABLES = ('shipping_ks_orders', 'shipping_records', 'shipping_devices')
-TABLES = (*LEGACY_TABLES, 'shipping_carriers')
+CARRIER_TABLES = (*LEGACY_TABLES, 'shipping_carriers')
+TABLES = (*CARRIER_TABLES, 'shipping_sources')
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS shipping_ks_orders (
         project_id TEXT NOT NULL REFERENCES projects(id), id TEXT NOT NULL,
@@ -40,6 +42,11 @@ SCHEMA = (
         name TEXT NOT NULL COLLATE NOCASE,
         PRIMARY KEY (project_id,name)
     )""",
+    """CREATE TABLE IF NOT EXISTS shipping_sources (
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        name TEXT NOT NULL COLLATE NOCASE,
+        PRIMARY KEY (project_id,name)
+    )""",
     'CREATE INDEX IF NOT EXISTS idx_shipping_channel ON shipping_records(project_id,channel,shipped_on DESC,created_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_shipping_backer ON shipping_records(project_id,ks_order_id)',
     'CREATE INDEX IF NOT EXISTS idx_shipping_serial ON shipping_devices(project_id,serial)',
@@ -47,7 +54,8 @@ SCHEMA = (
 CONTACT = ('name', 'email', 'phone', 'country', 'region', 'city', 'postcode', 'address', 'address2')
 ITEMS = ('main_unit', 'base', 'case', 'strip', 'patch')
 COSTS = ('domestic_cost', 'international_cost', 'warehouse_cost', 'weight')
-DETAIL_KEYS = (*CONTACT, *ITEMS, *COSTS, 'source', 'carrier', 'notes')
+SHIPPING_FIELDS = (*COSTS, 'carrier', 'notes', 'shipment_status')
+DETAIL_KEYS = (*CONTACT, *ITEMS, *SHIPPING_FIELDS, 'source')
 ORDER_KEYS = (*CONTACT, *ITEMS, 'pb', 'sku', 'country_code', 'address_status', 'notes',
               'pledged', 'amount_due', 'paid', 'balance')
 PAGE_SIZE = 50
@@ -70,6 +78,8 @@ def initialize(db, version):
     if VERSION <= version < RECORD_RELATIONS_VERSION:
         db.execute('ALTER TABLE shipping_records ADD COLUMN parent_id TEXT')
         db.execute('ALTER TABLE shipping_records ADD COLUMN deleted_at TEXT')
+    if VERSION <= version < SOURCES_VERSION:
+        repair_imported_times(db)
     db.execute('CREATE INDEX IF NOT EXISTS idx_shipping_orders_created ON shipping_ks_orders(project_id,created_at DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_shipping_records_created ON shipping_records(project_id,channel,created_at DESC,id DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_shipping_parent ON shipping_records(project_id,parent_id,deleted_at,created_at DESC,id DESC)')
@@ -77,6 +87,30 @@ def initialize(db, version):
 
 def fill_created_at(db):
     db.execute("UPDATE shipping_ks_orders SET created_at=updated_at WHERE created_at=''")
+
+
+def repair_imported_times(db):
+    # Feishu record metadata used epoch seconds. The old importer treated them as milliseconds.
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+    def correct(value):
+        if value[:4] != '1970':
+            return value
+        try:
+            original = epoch + (datetime.fromisoformat(value) - epoch) * 1000
+        except (ValueError, TypeError, OverflowError):
+            return value
+        return original.isoformat() if 2000 <= original.year < 2100 else value
+
+    for table in ('shipping_records', 'shipping_ks_orders'):
+        imported = 'AND source_id IS NOT NULL' if table == 'shipping_records' else ''
+        rows = db.execute(f"""SELECT project_id,id,created_at,updated_at FROM {table}
+            WHERE (created_at LIKE '1970-%' OR updated_at LIKE '1970-%') {imported}""").fetchall()
+        for project, record, created, updated in rows:
+            corrected = correct(created), correct(updated)
+            if corrected != (created, updated):
+                db.execute(f'UPDATE {table} SET created_at=?,updated_at=? WHERE project_id=? AND id=?',
+                           (*corrected, project, record))
 
 
 def carrier_names(value):
@@ -89,6 +123,16 @@ def list_carriers(db, project):
     for row in db.execute('''SELECT DISTINCT json_extract(details,'$.carrier') FROM shipping_records
                              WHERE project_id=?''', (project,)):
         for name in carrier_names(row[0] or ''):
+            names.setdefault(name.casefold(), name)
+    return sorted(names.values(), key=str.casefold)
+
+
+def list_sources(db, project):
+    names = {row[0].casefold(): row[0] for row in db.execute(
+        'SELECT name FROM shipping_sources WHERE project_id=?', (project,))}
+    for name, in db.execute("""SELECT DISTINCT json_extract(details,'$.source') FROM shipping_records
+                              WHERE project_id=? AND channel='other'""", (project,)):
+        if name:
             names.setdefault(name.casefold(), name)
     return sorted(names.values(), key=str.casefold)
 
@@ -284,7 +328,9 @@ def set_shipment_deleted(db, project, shipment_id, version, stamp, deleted):
 
 
 def shipped_condition(alias):
-    return f"({alias}.shipped_on<>'' OR {alias}.tracking<>'')"
+    return f"""(CASE json_extract({alias}.details,'$.shipment_status')
+        WHEN 'shipped' THEN 1 WHEN 'pending' THEN 0
+        ELSE {alias}.shipped_on<>'' OR {alias}.tracking<>'' END)"""
 
 
 def page_number(query):
@@ -370,17 +416,28 @@ def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=Non
         'SELECT 1 FROM shipping_ks_orders WHERE project_id=? AND id=?', (project, order),
     ).fetchone()):
         raise ShippingError('KS 订单不存在', 404)
+    if old and old['ks_order_id'] and order != old['ks_order_id']:
+        raise ShippingError('已关联的 KS 订单不能在发货台账中更改', 409)
     if channel == 'ks' and not order and not (imported or (old and not old['ks_order_id'])
                                               or (parent and not parent['ks_order_id'])):
         raise ShippingError('请选择 KS 订单')
-    reference = string(data.get('reference'), 150)
+    reference = string(data.get('reference'), 150) if channel == 'other' or imported else ''
     if not reference:
         if channel == 'other':
             if not imported and not (old and old['source_id']):
                 raise ShippingError('请填写订单号')
         else:
             reference = old['reference'] if old else 'KS-' + stamp[:10].replace('-', '') + '-' + shipment_id[:8].upper()
-    details = clean_details(data.get('details', {}), DETAIL_KEYS)
+    ks_ledger = channel == 'ks' and not imported
+    details = clean_details(data.get('details', {}), SHIPPING_FIELDS if ks_ledger else DETAIL_KEYS)
+    if details.get('shipment_status', '') not in ('', 'shipped', 'pending'):
+        raise ShippingError('发货状态无效')
+    if ks_ledger and old:
+        details.update({key: value for key, value in json.loads(old['details']).items()
+                        if key not in SHIPPING_FIELDS})
+    if channel == 'other' and details.get('source'):
+        db.execute('INSERT OR IGNORE INTO shipping_sources(project_id,name) VALUES(?,?)',
+                   (project, details['source']))
     carriers = carrier_names(details.get('carrier', ''))
     db.executemany('INSERT OR IGNORE INTO shipping_carriers(project_id,name) VALUES(?,?)',
                    ((project, name) for name in carriers))
