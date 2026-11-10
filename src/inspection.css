@@ -66,18 +66,33 @@
 .inspection-import-actions input { width: auto; max-width: 100%; }
 .inspection-import-report > * { margin: 9px 0; }
 .inspection-import-report ul { max-height: 150px; overflow: auto; }
-.inspection-filters { grid-template-columns: repeat(5, minmax(0, 1fr)) auto; align-items: end; margin-bottom: 10px; }
+.inspection-filters { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); align-items: end; margin-bottom: 10px; }
 .inspection-paging { justify-content: flex-end; margin-top: 8px; }
 .inspection-no-records { margin: 0; padding: 24px; color: var(--muted); text-align: center; }
 .inspection-camera video { width: 100%; min-height: 145px; max-height: 45dvh; background: #182230; border-radius: 6px; }
 .inspection-camera .dialog-actions { flex-wrap: wrap; }
 
-@media (max-width: 850px) {
-  .inspection-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-}
 @media (max-width: 600px) {
   .inspection-config-grid, .inspection-filters { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .inspection-editor-main { grid-template-columns: 1fr; }
   .inspection-submit { padding: 8px; }
   .inspection-sn-row label { flex-basis: 100%; }
+}
+
+.inspection-sn h2 { margin: 0 0 12px; font-size: 16px; }
+.inspection-registered { color: #276044; font-weight: 650; }
+.inspection-notice { display: flex; gap: 8px; align-items: center; margin: 0 0 12px; color: #405773; }
+.inspection-site-options { margin-top: 12px; }
+.inspection-site-options h3 { margin-bottom: 8px; }
+.inspection-filter-actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.inspection-record-table th { white-space: nowrap; }
+.inspection-record-table td { min-width: 85px; max-width: 240px; overflow-wrap: anywhere; }
+.inspection-record-table td:first-child { white-space: nowrap; }
+.inspection-device-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.inspection-device-tools input { width: min(100%, 260px); }
+.inspection-paging { flex-wrap: wrap; }
+.inspection-paging select { width: auto; min-height: 30px; padding: 4px 7px; }
+@media (max-width: 600px) {
+  .inspection-prefix { flex-wrap: wrap; }
+  .inspection-prefix input { max-width: 100%; }
 }

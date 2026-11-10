@@ -71,7 +71,7 @@ class IntegrationTests(unittest.TestCase):
         self.request('inspection/records', 'POST', entry(serial1, {'pressure': 5}), 409)
         failed = self.request('inspection/records', 'POST', entry(serial1, {'pressure': 5}, partial['updated_at']))
         self.assertEqual(failed['result'], '不良')
-        self.assertEqual(self.request('inspection/lookup?template='+template_id+'&serial='+serial2), {'record': None})
+        self.assertEqual(self.request('inspection/lookup?template='+template_id+'&serial='+serial2), {'record': None, 'device': None})
         passed = self.request('inspection/records', 'POST', entry(serial2, {'pressure': 4, 'surface': '正常'}))
         self.assertEqual(passed['result'], '合格')
         history = self.request('inspection/records?template='+template_id+'&prefix=000001')
@@ -145,6 +145,44 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual((again['ready'], again['duplicates']), (0, 1))
         row = self.request('inspection/lookup?template='+target+'&serial='+code)['record']
         self.assertEqual((row['result'], row['values']), ('不良', {'appearance':['有划痕'],'notes':'=2+2'}))
+
+    def test_inspection_device_registration_and_record_lifecycle(self):
+        from urllib.parse import urlencode
+        code = 'ABC123-0001'
+        self.assertEqual(self.request('inspection/templates'), [])
+        first = self.request('inspection/devices', 'POST', {'serial': code})
+        self.assertTrue(first['created'])
+        self.assertFalse(self.request('inspection/devices', 'POST', {'serial': code})['created'])
+        self.assertEqual(self.request('inspection/devices?prefix=ABC123')['devices'][0]['records'], 0)
+        second_project = self.request('projects', 'POST', {'name': '隔离项目'})['id']
+        self.assertEqual(self.request('inspection/devices', project=second_project)['total'], 0)
+        template = self.request('inspection/templates', 'POST', {
+            'name': '通用检查', 'serial_mode': 'text',
+            'fields': [{'key': 'issues', 'label': '发现问题', 'type': 'multi', 'custom': True}],
+        })['id']
+        entry = {'template_id': template, 'serial': code, 'revision': 1, 'version': None,
+                 'values': {'issues': ['边角毛刺']}}
+        record = self.request('inspection/records', 'POST', entry)
+        latest = self.request('inspection/latest?template='+template+'&prefix=ABC123')['record']
+        self.assertEqual(latest['id'], record['id'])
+        self.assertEqual(self.request('inspection/devices')['devices'][0]['records'], 1)
+        option_path = 'inspection/options?template='+template
+        self.assertEqual(self.request(option_path)[0]['value'], '边角毛刺')
+        self.request('inspection/options', 'PUT', {
+            'template_id': template, 'field_key': 'issues', 'value': '边角毛刺', 'hidden': True,
+        })
+        self.assertTrue(self.request(option_path)[0]['hidden_at'])
+        route = 'inspection/records/' + record['id']
+        self.request(route, 'DELETE', status=404, project=second_project)
+        self.request(route, 'DELETE')
+        self.assertEqual(self.request('inspection/devices')['devices'][0]['records'], 0)
+        self.assertEqual(self.request('inspection/records?template='+template)['total'], 0)
+        self.assertEqual(self.request('inspection/records?template='+template+'&deleted=1')['total'], 1)
+        self.request('inspection/records', 'POST', entry, 409)
+        self.request(route+'/recover', 'POST')
+        self.assertEqual(self.request('inspection/devices')['devices'][0]['records'], 1)
+        query = urlencode({'template': template, 'keyword': '毛刺'})
+        self.assertEqual(self.request('inspection/records?'+query)['total'], 1)
     def test_insufficient_stock_and_invalid_qty(self):
         for qty in (-1,0,'NaN','Infinity',1e12): self.request('movements','POST',{'type':'入库','part_id':self.part,'qty':qty},400)
         self.request('movements','POST',{'type':'出库','part_id':self.part,'qty':1},400)

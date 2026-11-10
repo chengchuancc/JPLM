@@ -116,6 +116,10 @@ def init_db(directory=None, bootstrap=None):
                        'CHECK(deleted_at IS NULL OR archived_at IS NOT NULL)')
         for statement in inspection.SCHEMA:
             db.execute(statement)
+        if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(inspection_records)')}:
+            db.execute('ALTER TABLE inspection_records ADD COLUMN deleted_at TEXT')
+        if version == 12:
+            inspection.backfill_from_records(db)
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -648,7 +652,7 @@ def stage_restore(archive_path, directory):
             project_tables = ('projects', 'project_members') if version >= PROJECT_VERSION else ()
             if version >= 10:
                 project_tables += ('project_covers',)
-            inspection_tables = inspection.TABLES if version >= 12 else ()
+            inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
             required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
@@ -668,11 +672,15 @@ def stage_restore(archive_path, directory):
                         optional.add('deleted_at')
                     if table == 'projects' and version < 11:
                         optional.add('deleted_at')
+                    if table == 'inspection_records' and version < 13:
+                        optional.add('deleted_at')
                     if not set(target_columns) - optional <= source_columns:
                         raise Problem('备份数据结构不完整')
                     columns = ','.join(name for name in target_columns if name in source_columns)
                     records = source.execute(f'SELECT {columns} FROM {table} ORDER BY rowid')
                     db.executemany(f'INSERT INTO {table}({columns}) VALUES({",".join("?" for _ in columns.split(","))})', records)
+                if version == 12:
+                    inspection.backfill_from_records(db)
                 db.execute("DELETE FROM settings WHERE key='password'")
                 if version >= 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                     raise Problem('备份中没有管理员账户')
@@ -1007,12 +1015,26 @@ class Handler(BaseHTTPRequestHandler):
                 enter_project(db, project_id, self.user)
                 if resource == 'templates':
                     return self.send(inspection.templates(db, project_id))
-                if resource not in ('records', 'lookup', 'export', 'import-template'):
+                if resource == 'devices':
+                    return self.send(inspection.list_devices(db, project_id, query))
+                if resource == 'device':
+                    serial, _, _ = inspection.parse_serial(query.get('serial'), 'text')
+                    return self.send({'device': inspection.get_device(db, project_id, serial)})
+                if resource not in ('records', 'lookup', 'latest', 'options', 'export', 'import-template'):
                     raise Problem('接口不存在', 404)
                 config = inspection.template(db, project_id, query.get('template'))
+                if query.get('deleted') == '1':
+                    self.require_admin()
+                if resource == 'options':
+                    return self.send(inspection.list_options(db, project_id, config))
                 if resource == 'lookup':
                     serial, _, _ = inspection.parse_serial(query.get('serial'), config['serial_mode'])
-                    return self.send({'record': inspection.exact_record(db, project_id, config['id'], serial)})
+                    return self.send({'record': inspection.exact_record(db, project_id, config['id'], serial),
+                                      'device': inspection.get_device(db, project_id, serial)})
+                if resource == 'latest':
+                    return self.send({'record': inspection.latest_record(
+                        db, project_id, config['id'], query.get('prefix'),
+                    )})
                 if resource == 'records':
                     return self.send(inspection.list_records(db, project_id, config['id'], query))
                 records = (inspection.list_records(db, project_id, config['id'], query, exporting=True)['records']
@@ -1050,10 +1072,53 @@ class Handler(BaseHTTPRequestHandler):
                 for serial, prefix, produced, result, values, operator, source, created, updated in ready:
                     inspection.insert_record(db, project_id, config, uid(), serial, prefix, produced,
                                              result, values, None, operator, source, created, updated)
+                    inspection.register_device(db, project_id, serial, prefix, produced, now(),
+                                               self.user['id'], self.user['name'])
+                    inspection.remember_options(db, project_id, config, values, now())
                 if ready:
                     touch_project(db)
                     log_activity(db, self.user, '导入生产检测记录', config['id'], config['name'], f'{len(ready)} 条')
             return self.send(report)
+
+        if resource == 'devices' and method == 'POST':
+            data = self.body()
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                mode = (inspection.template(db, project_id, data['template_id'])['serial_mode']
+                        if data.get('template_id') else 'text')
+                serial, prefix, produced = inspection.parse_serial(data.get('serial'), mode)
+                device, created = inspection.register_device(
+                    db, project_id, serial, prefix, produced, now(), self.user['id'], self.user['name'],
+                )
+                if created:
+                    touch_project(db)
+                    log_activity(db, self.user, '登记检测设备', serial, serial)
+            return self.send({'device': device, 'created': created})
+
+        if resource == 'options' and method == 'PUT':
+            data = self.body()
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                self.require_admin()
+                config = inspection.template(db, project_id, data.get('template_id'))
+                inspection.hide_option(db, project_id, config, data, now())
+                touch_project(db)
+                options = inspection.list_options(db, project_id, config)
+            return self.send(options)
+
+        record_action = re.fullmatch(r'records/([0-9a-f]{24})(/recover)?', resource)
+        if record_action and ((method == 'DELETE' and not record_action[2]) or
+                              (method == 'POST' and record_action[2])):
+            deleted = method == 'DELETE'
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                self.require_admin()
+                row = inspection.set_record_deleted(db, project_id, record_action[1], deleted, now())
+                if bool(row['deleted_at']) != deleted:
+                    touch_project(db)
+                    log_activity(db, self.user, '删除检测记录' if deleted else '恢复检测记录',
+                                 row['id'], row['serial'])
+            return self.send({'ok': True})
 
         editing = resource.startswith('templates/') and '/' not in resource[len('templates/'):]
         if (resource == 'records' and method == 'POST') or (

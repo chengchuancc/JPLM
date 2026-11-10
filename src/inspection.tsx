@@ -35,11 +35,24 @@ type RecordRow = {
   production_date: string;
   result: string;
   operator_name: string;
+  created_at: string;
   updated_at: string;
+  deleted_at: string | null;
   values: Values;
   form: Template;
 };
-type RecordPage = { records: RecordRow[]; total: number; page: number };
+type RecordPage = { records: RecordRow[]; total: number; page: number; per_page: number };
+type Device = {
+  serial: string;
+  prefix: string;
+  production_date: string;
+  registered_at: string;
+  operator_name: string;
+  records: number;
+  result: string | null;
+};
+type DevicePage = { devices: Device[]; total: number; page: number };
+type SavedOption = { field_key: string; value: string; hidden_at: string | null };
 type ImportReport = {
   ready: number;
   duplicates: number;
@@ -50,8 +63,13 @@ type ImportReport = {
   revision: number;
 };
 type Request = (path: string, method?: string, data?: unknown) => Promise<any>;
-type Filters = { serial: string; prefix: string; result: string; from: string; to: string };
-const defaultFilters: Filters = { serial: "", prefix: "", result: "", from: "", to: "" };
+type Filters = {
+  keyword: string; serial: string; prefix: string; prefix_from: string; prefix_to: string;
+  result: string; from: string; to: string;
+};
+const defaultFilters: Filters = {
+  keyword: "", serial: "", prefix: "", prefix_from: "", prefix_to: "", result: "", from: "", to: "",
+};
 const results = ["合格", "不良", "未完成", "待检测"];
 const action = "btn";
 const primary = "btn primary";
@@ -94,7 +112,9 @@ function CameraReader({ live, onRead, close }: {
   const video = useRef<HTMLVideoElement>(null);
   const read = useRef(onRead);
   read.current = onRead;
-  const [facing, setFacing] = useState<"environment" | "user">("environment");
+  const [deviceId, setDeviceId] = useState("");
+  const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
+  const [frameReady, setFrameReady] = useState(false);
   const [message, setMessage] = useState("");
   const [readingPhoto, setReadingPhoto] = useState(false);
   const photoGeneration = useRef(0);
@@ -112,6 +132,7 @@ function CameraReader({ live, onRead, close }: {
     let active = true;
     let controls: IScannerControls | undefined;
     setMessage("");
+    setFrameReady(false);
     if (!navigator.mediaDevices?.getUserMedia) {
       setMessage("当前浏览器无法打开摄像头，可以选择条码照片。");
       return;
@@ -120,7 +141,8 @@ function CameraReader({ live, onRead, close }: {
       if (!active) return;
       const reader = new BrowserMultiFormatReader();
       controls = await reader.decodeFromConstraints(
-        { audio: false, video: { facingMode: { ideal: facing }, width: { ideal: 1280 } } },
+        { audio: false, video: { ...(deviceId ? { deviceId: { exact: deviceId } } : { facingMode: { ideal: "environment" } }),
+          width: { ideal: 1280 } } },
         element,
         (result, _error, session) => {
           if (!active || !result) return;
@@ -129,7 +151,14 @@ function CameraReader({ live, onRead, close }: {
           read.current(result.getText());
         },
       );
-      if (!active) controls.stop();
+      if (!active) {
+        controls.stop();
+        return;
+      }
+      setFrameReady(true);
+      navigator.mediaDevices.enumerateDevices().then((items) => {
+        if (active) setDevices(items.filter((item) => item.kind === "videoinput"));
+      }).catch(() => {});
     }).catch(() => {
       if (active) setMessage("无法打开摄像头。请检查浏览器权限，或选择条码照片。");
     });
@@ -139,9 +168,9 @@ function CameraReader({ live, onRead, close }: {
       if (element.srcObject instanceof MediaStream)
         element.srcObject.getTracks().forEach((track) => track.stop());
     };
-  }, [facing, live]);
+  }, [deviceId, live]);
 
-  async function scanPhoto(file?: File) {
+  async function scanPhoto(file?: Blob) {
     if (!file || readingPhoto) return;
     setReadingPhoto(true);
     setMessage("");
@@ -158,6 +187,21 @@ function CameraReader({ live, onRead, close }: {
       if (ticket === photoGeneration.current) setReadingPhoto(false);
     }
   }
+  function captureFrame() {
+    const source = video.current;
+    if (!source?.videoWidth || !source.videoHeight) {
+      setMessage("摄像头画面还没准备好。");
+      return;
+    }
+    const canvas = document.createElement("canvas");
+    canvas.width = source.videoWidth;
+    canvas.height = source.videoHeight;
+    canvas.getContext("2d")?.drawImage(source, 0, 0);
+    canvas.toBlob((blob) => {
+      if (blob) void scanPhoto(blob);
+      else setMessage("无法截取摄像头画面。");
+    }, "image/jpeg", .94);
+  }
   return (
     <div className="overlay" onClick={(event) => { if (event.target === event.currentTarget) close(); }}>
       <section className="dialog inspection-camera" role="dialog" aria-modal="true" aria-label="扫码识别 S/N">
@@ -168,8 +212,14 @@ function CameraReader({ live, onRead, close }: {
         {live && <video ref={video} muted playsInline autoPlay aria-label="摄像头预览" />}
         {message && <p className="form-error" role="alert">{message}</p>}
         <div className="dialog-actions">
-          {live && <button type="button" className={action} onClick={() =>
-            setFacing((value) => value === "environment" ? "user" : "environment")}>切换摄像头</button>}
+          {live && devices.length > 1 && <button type="button" className={action} onClick={() => {
+            const stream = video.current?.srcObject;
+            const current = stream instanceof MediaStream ? stream.getVideoTracks()[0]?.getSettings().deviceId : deviceId;
+            const next = (devices.findIndex((device) => device.deviceId === current) + 1) % devices.length;
+            setDeviceId(devices[next].deviceId);
+          }}>切换摄像头</button>}
+          {live && <button type="button" className={action} disabled={!frameReady || readingPhoto}
+            onClick={captureFrame}>拍照识别</button>}
           <label className={primary}>
             {readingPhoto ? "正在识别…" : "选择条码照片"}
             <input type="file" accept="image/*" hidden disabled={readingPhoto}
@@ -181,14 +231,18 @@ function CameraReader({ live, onRead, close }: {
   );
 }
 
-function FieldInput({ field, value, onChange }: {
+function FieldInput({ field, value, suggestions, onChange }: {
   field: InspectionField;
   value?: Value;
+  suggestions: string[];
   onChange: (value: Value | undefined) => void;
 }) {
   const [custom, setCustom] = useState("");
   const selected = Array.isArray(value) ? value : value === undefined ? [] : [String(value)];
-  const options = Array.from(new Set([...field.options, ...selected]));
+  const options = Array.from(new Set([...field.options, ...suggestions, ...selected]));
+  const term = custom.trim().toLowerCase();
+  const filtered = field.custom && term
+    ? options.filter((option) => option.toLowerCase().includes(term) || selected.includes(option)) : options;
   const numeric = typeof value === "number" || (typeof value === "string" && value.trim() !== "") ? Number(value) : null;
   const hasLimit = field.minimum !== null || field.maximum !== null;
   const failed = numeric !== null &&
@@ -205,7 +259,7 @@ function FieldInput({ field, value, onChange }: {
       {(field.type === "choice" || field.type === "multi") ? (
         <>
           <div className="inspection-choices">
-            {options.map((option) => (
+            {filtered.map((option) => (
               <button key={option} type="button"
                 className={"inspection-choice" + (field.fail.includes(option) ? " is-fail" : "")}
                 aria-pressed={selected.includes(option)} onClick={() => {
@@ -217,7 +271,7 @@ function FieldInput({ field, value, onChange }: {
             ))}
           </div>
           {field.custom && <div className="inspection-custom">
-            <input aria-label={field.label + " 自定义选项"} placeholder="其他选项…" maxLength={250} value={custom}
+            <input aria-label={field.label + " 自定义选项"} placeholder="搜索或新增选项…" maxLength={250} value={custom}
               onChange={(event) => setCustom(event.target.value)}
               onKeyDown={(event) => { if (event.key === "Enter") { event.preventDefault(); addChoice(); } }} />
             <button type="button" className="btn small" disabled={!custom.trim()} onClick={addChoice}>添加</button>
@@ -420,7 +474,7 @@ function InspectionImport({ template, request, baseUrl, onImported }: {
   );
 }
 
-function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix, onChoose, revision }: {
+function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix, onChoose, onImported, revision }: {
   template: Template;
   request: Request;
   baseUrl: string;
@@ -428,73 +482,207 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
   admin: boolean;
   prefix: string;
   onChoose: (row: RecordRow) => void;
+  onImported: () => void;
   revision: number;
 }) {
   const [draft, setDraft] = useState<Filters>({ ...defaultFilters, prefix });
   const [filters, setFilters] = useState<Filters>({ ...defaultFilters, prefix });
   const [page, setPage] = useState(1);
+  const [perPage, setPerPage] = useState(50);
+  const [sort, setSort] = useState({ key: "updated_at", direction: "desc" });
+  const [deleted, setDeleted] = useState(false);
   const [reload, setReload] = useState(0);
   const [data, setData] = useState<RecordPage | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(true);
-  const query = parameters(template.id, filters);
+  const [pending, setPending] = useState("");
+  const query = parameters(template.id, {
+    ...filters, per_page: String(perPage), sort: sort.key, direction: sort.direction,
+    deleted: deleted ? "1" : "", page: String(page),
+  });
   useEffect(() => {
     let active = true;
     setBusy(true);
     setError("");
-    request(inspectionPath + "records?" + query + "&page=" + page).then(
+    request(inspectionPath + "records?" + query).then(
       (response) => { if (active) setData(response); },
       (error) => { if (active) setError(error.message); },
     ).finally(() => { if (active) setBusy(false); });
     return () => { active = false; };
-  }, [query, page, reload, revision]);
-  const totalPages = Math.max(1, Math.ceil((data?.total || 0) / 50));
+  }, [query, reload, revision]);
+  const totalPages = Math.max(1, Math.ceil((data?.total || 0) / perPage));
   const change = (key: keyof Filters, value: string) => setDraft((previous) => ({ ...previous, [key]: value }));
+  const columns = new Map(template.fields.map((field) => [field.key, field.label]));
+  for (const row of data?.records || [])
+    for (const field of row.form.fields)
+      if (!columns.has(field.key)) columns.set(field.key, field.label);
+  function sortHeader(key: string, label: string) {
+    return <th aria-sort={sort.key === key ? sort.direction === "asc" ? "ascending" : "descending" : "none"}>
+      <button type="button" className="text-link" onClick={() => {
+        setSort({ key, direction: sort.key === key && sort.direction === "desc" ? "asc" : "desc" });
+        setPage(1);
+      }}>{label}{sort.key === key ? sort.direction === "asc" ? " ↑" : " ↓" : ""}</button>
+    </th>;
+  }
+  async function updateDeleted(record: RecordRow) {
+    if (pending || !window.confirm(deleted ? "恢复此检测记录？" : "删除检测记录 " + record.serial + "？")) return;
+    setPending(record.id);
+    setError("");
+    try {
+      await request(inspectionPath + "records/" + record.id + (deleted ? "/recover" : ""),
+        deleted ? "POST" : "DELETE");
+      setPage(1);
+      setReload((value) => value + 1);
+    } catch (e) { setError((e as Error).message); }
+    finally { setPending(""); }
+  }
+  const exportUrl = baseUrl + inspectionPath + "export?" + query;
   return (
     <section className="inspection-history">
       <div className="inspection-history-tools">
-        {admin && !readOnly && <InspectionImport template={template} request={request} baseUrl={baseUrl}
-          onImported={() => { setPage(1); setReload((value) => value + 1); }} />}
-        <a className={action} href={baseUrl + inspectionPath + "export?" + query + "&format=xlsx"}>
-          <Download size={16} />导出 Excel
-        </a>
-        <a className={action} href={baseUrl + inspectionPath + "export?" + query + "&format=csv"}>导出 CSV</a>
+        <button className={action} type="button" onClick={() => setReload((value) => value + 1)}>刷新</button>
+        {admin && <button className={action} type="button" aria-pressed={deleted} onClick={() => {
+          setData(null);
+          setDeleted((value) => !value);
+          setPage(1);
+        }}>{deleted ? "返回有效记录" : "已删除记录"}</button>}
+        {!deleted && <>
+          {admin && !readOnly && <InspectionImport template={template} request={request} baseUrl={baseUrl}
+            onImported={() => { setPage(1); onImported(); }} />}
+          <a className={action} href={exportUrl + "&scope=page"}>
+            <Download size={16} />导出当前页
+          </a>
+          <a className={action} href={exportUrl + "&format=xlsx"}>导出筛选结果（Excel）</a>
+          <a className={action} href={exportUrl + "&format=csv"}>导出 CSV</a>
+        </>}
       </div>
       <form className="panel inspection-filters" onSubmit={(event) => {
         event.preventDefault();
         setPage(1);
         setFilters({ ...draft });
       }}>
+        <label>关键词<input value={draft.keyword} onChange={(e) => change("keyword", e.target.value)} /></label>
         <label>S/N<input value={draft.serial} onChange={(e) => change("serial", e.target.value)} /></label>
         <label>前 6 位<input maxLength={6} value={draft.prefix} onChange={(e) => change("prefix", e.target.value)} /></label>
+        <label>起始前缀<input maxLength={6} value={draft.prefix_from} onChange={(e) => change("prefix_from", e.target.value)} /></label>
+        <label>结束前缀<input maxLength={6} value={draft.prefix_to} onChange={(e) => change("prefix_to", e.target.value)} /></label>
         <label>检测结果<select value={draft.result} onChange={(e) => change("result", e.target.value)}>
           <option value="">全部</option>{results.map((item) => <option key={item}>{item}</option>)}
         </select></label>
         <label>起始日期<input type="date" value={draft.from} onChange={(e) => change("from", e.target.value)} /></label>
         <label>结束日期<input type="date" value={draft.to} onChange={(e) => change("to", e.target.value)} /></label>
-        <button className={primary} type="submit"><Search size={15} />筛选</button>
+        <div className="inspection-filter-actions">
+          <button className={primary} type="submit"><Search size={15} />筛选</button>
+          <button className={action} type="button" onClick={() => {
+            setDraft(defaultFilters);
+            setFilters(defaultFilters);
+            setPage(1);
+          }}>重置</button>
+        </div>
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="table-wrap" aria-busy={busy}>
+      <div className="table-wrap inspection-record-table" aria-busy={busy}>
         <table>
-          <thead><tr><th>S/N</th><th>前 6 位</th><th>生产日期</th><th>检测结果</th><th>检测员</th><th>更新时间</th></tr></thead>
+          <thead><tr>
+            {sortHeader("serial", "S/N")}{sortHeader("prefix", "前 6 位")}{sortHeader("production_date", "生产日期")}
+            {sortHeader("result", "检测结果")}<th>检测员</th>
+            {Array.from(columns, ([key, label]) => <th key={key}>{label}</th>)}
+            {sortHeader("updated_at", "更新时间")}
+            {admin && !readOnly && <th>操作</th>}
+          </tr></thead>
           <tbody>{data?.records.map((record) => (
             <tr key={record.id}>
-              <td><button type="button" className="text-link mono" onClick={() => onChoose(record)}>{record.serial}</button></td>
+              <td>{deleted ? <span className="mono">{record.serial}</span> :
+                <button type="button" className="text-link mono" onClick={() => onChoose(record)}>{record.serial}</button>}</td>
               <td className="mono">{record.prefix}</td><td>{record.production_date || "—"}</td>
               <td><ResultLabel value={record.result} /></td>
-              <td>{record.operator_name || "—"}</td><td>{formatTime(record.updated_at)}</td>
+              <td>{record.operator_name || "—"}</td>
+              {Array.from(columns, ([key]) => {
+                const value = record.values[key];
+                return <td key={key}>{Array.isArray(value) ? value.join("、") : value ?? "—"}</td>;
+              })}
+              <td>{formatTime(record.updated_at)}</td>
+              {admin && !readOnly && <td><button type="button" className="btn small"
+                disabled={!!pending} onClick={() => void updateDeleted(record)}>{deleted ? "恢复" : "删除"}</button></td>}
             </tr>
           ))}</tbody>
         </table>
-        {!busy && !error && !data?.records.length && <p className="inspection-no-records">暂无检测记录</p>}
+        {!busy && !error && !data?.records.length && <p className="inspection-no-records">
+          {deleted ? "暂无已删除记录" : "暂无检测记录"}</p>}
       </div>
       <div className="inspection-paging">
+        <label>每页 <select aria-label="每页记录数" value={perPage} onChange={(event) => {
+          setPerPage(Number(event.target.value));
+          setPage(1);
+        }}>{[20, 50, 100, 200].map((size) => <option key={size}>{size}</option>)}</select></label>
         <span>{busy ? "正在加载…" : "共 " + (data?.total || 0) + " 条"}</span>
         <button type="button" className="btn small" disabled={page <= 1 || busy} onClick={() => setPage(page - 1)}>上一页</button>
         <span>{page} / {totalPages}</span>
         <button type="button" className="btn small" disabled={page >= totalPages || busy} onClick={() => setPage(page + 1)}>下一页</button>
       </div>
+    </section>
+  );
+}
+
+function DeviceRegistry({ request, prefix, refresh, readOnly, open, register }: {
+  request: Request; prefix: string; refresh: number; readOnly: boolean;
+  open: (device: Device) => void; register: () => void;
+}) {
+  const [draft, setDraft] = useState("");
+  const [search, setSearch] = useState("");
+  const [activePrefix, setActivePrefix] = useState(prefix);
+  const [page, setPage] = useState(1);
+  const [data, setData] = useState<DevicePage | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    setError("");
+    const query = new URLSearchParams({ serial: search, page: String(page), prefix: activePrefix });
+    request(inspectionPath + "devices?" + query).then(
+      (value) => { if (active) setData(value); },
+      (e) => { if (active) setError(e.message); },
+    ).finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [search, page, refresh, activePrefix]);
+  const pages = Math.max(1, Math.ceil((data?.total || 0) / 50));
+  return (
+    <section className="inspection-devices">
+      <form className="inspection-device-tools" onSubmit={(event) => {
+        event.preventDefault();
+        setSearch(draft.trim());
+        setActivePrefix("");
+        setPage(1);
+      }}>
+        <input aria-label="搜索设备 S/N" placeholder="搜索设备 S/N…" value={draft}
+          onChange={(event) => setDraft(event.target.value)} />
+        <button type="submit" className={action}><Search size={15} />查询</button>
+        {!readOnly && <button type="button" className={primary} onClick={register}><Plus size={16} />登记设备</button>}
+      </form>
+      {activePrefix && <p className="muted">前 6 位：{activePrefix}</p>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+      <div className="table-wrap" aria-busy={loading}>
+        <table>
+          <thead><tr><th>S/N</th><th>前 6 位</th><th>生产日期</th><th>检测状态</th><th>检测记录</th>
+            <th>登记人</th><th>登记时间</th><th>操作</th></tr></thead>
+          <tbody>{data?.devices.map((device) => (
+            <tr key={device.serial}>
+              <td className="mono">{device.serial}</td><td>{device.prefix}</td>
+              <td>{device.production_date || "—"}</td><td><ResultLabel value={device.result || "待检测"} /></td>
+              <td>{device.records}</td><td>{device.operator_name || "—"}</td>
+              <td>{formatTime(device.registered_at)}</td>
+              <td><button type="button" className="text-link" onClick={() => open(device)}>打开设备</button></td>
+            </tr>
+          ))}</tbody>
+        </table>
+        {!loading && !error && !data?.devices.length && <p className="inspection-no-records">暂无设备</p>}
+      </div>
+      {pages > 1 && <div className="inspection-paging">
+        <button type="button" className="btn small" disabled={page <= 1 || loading} onClick={() => setPage(page - 1)}>上一页</button>
+        <span>{page} / {pages}</span>
+        <button type="button" className="btn small" disabled={page >= pages || loading} onClick={() => setPage(page + 1)}>下一页</button>
+      </div>}
     </section>
   );
 }
@@ -508,19 +696,22 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
 }) {
   const [templates, setTemplates] = useState<Template[]>([]);
   const [templateId, setTemplateId] = useState("");
-  const [tab, setTab] = useState<"entry" | "history" | "settings">("entry");
+  const [tab, setTab] = useState<"entry" | "devices" | "history" | "settings">("entry");
   const [editor, setEditor] = useState<Template | null | undefined>(undefined);
   const [serial, setSerial] = useState("");
   const [prefix, setPrefix] = useState("");
   const [historyPrefix, setHistoryPrefix] = useState("");
   const [values, setValues] = useState<Values>({});
   const [record, setRecord] = useState<RecordRow | null>(null);
+  const [device, setDevice] = useState<Device | null>(null);
+  const [savedOptions, setSavedOptions] = useState<SavedOption[]>([]);
   const [dirty, setDirty] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
   const [camera, setCamera] = useState<"live" | "photo" | null>(null);
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [notice, setNotice] = useState("");
+  const [lastResult, setLastResult] = useState("");
   const [error, setError] = useState("");
   const [revision, setRevision] = useState(0);
   const serialInput = useRef<HTMLInputElement>(null);
@@ -544,6 +735,21 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
     return () => { active = false; };
   }, []);
   useEffect(() => {
+    let active = true;
+    if (!templateId) {
+      setSavedOptions([]);
+      return;
+    }
+    request(inspectionPath + "options?" + parameters(templateId)).then(
+      (rows) => { if (active) setSavedOptions(rows); },
+      () => { if (active) setSavedOptions([]); },
+    );
+    return () => { active = false; };
+  }, [templateId, revision]);
+  useEffect(() => {
+    if (!loading && tab === "entry" && !record) serialInput.current?.focus();
+  }, [loading, tab]);
+  useEffect(() => {
     onDraftChange(dirty || configDirty);
     const warn = (event: BeforeUnloadEvent) => {
       event.preventDefault();
@@ -560,11 +766,13 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
   }
   function clearEntry(focus = false) {
     setRecord(null);
+    setDevice(null);
     setSerial("");
     setValues({});
     setDirty(false);
     setError("");
     setNotice("");
+    setLastResult("");
     if (focus) requestAnimationFrame(() => serialInput.current?.focus());
   }
   function chooseRecord(row: RecordRow) {
@@ -572,30 +780,77 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
     setSerial(row.serial);
     setValues(row.values);
     setDirty(false);
+    setLastResult("");
     setNotice("");
     setError("");
     setTab("entry");
   }
   async function lookup(raw = serial, scanned = false) {
-    if (!template || busy) return;
-    const value = template.serial_mode === "dated" && scanned
+    if (busy || (scanned && !discard())) return;
+    const value = template?.serial_mode === "dated" && scanned
       ? (raw.match(/(?<![0-9])[0-9]{16}(?![0-9])/)?.[0] || raw.trim()) : raw.trim();
     if (!value) return;
-    setSerial(value);
+    setBusy(true);
+    setError("");
+    setNotice("");
+    try {
+      const result: { record?: RecordRow | null; device: Device | null } = await request(template
+        ? inspectionPath + "lookup?" + parameters(template.id, { serial: value })
+        : inspectionPath + "device?" + new URLSearchParams({ serial: value }));
+      if (result.record && dirty && !scanned && !discard()) return;
+      if (scanned) {
+        setRecord(null);
+        setValues({});
+        setDirty(false);
+      }
+      setSerial(value);
+      setDevice(result.device);
+      setLastResult("");
+      if (result.record) {
+        chooseRecord(result.record);
+        setNotice("已载入此 S/N 的检测记录");
+      } else {
+        setNotice(result.device ? "设备已登记" : "新 S/N，可登记设备");
+      }
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(false); }
+  }
+  async function registerDevice() {
+    if (busy || readOnly || !serial.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const response: { device: Device; created: boolean } = await request(
+        inspectionPath + "devices", "POST", { serial, template_id: template?.id },
+      );
+      setDevice(response.device);
+      setSerial(response.device.serial);
+      setNotice(response.created ? "已登记设备 " + response.device.serial : "该设备已登记");
+      setRevision((value) => value + 1);
+    } catch (e) { setError((e as Error).message); }
+    finally { setBusy(false); }
+  }
+  async function queryLatest() {
+    const value = prefix.trim();
+    if (value.length !== 6 || busy) return;
+    if (!template) {
+      setHistoryPrefix(value);
+      changeTab("devices");
+      return;
+    }
+    if (!discard()) return;
     setBusy(true);
     setError("");
     setNotice("");
     try {
       const result: { record: RecordRow | null } = await request(
-        inspectionPath + "lookup?" + parameters(template.id, { serial: value }),
+        inspectionPath + "latest?" + parameters(template.id, { prefix: value }),
       );
       if (result.record) {
-        if (dirty && !discard()) return;
+        setDevice(null);
         chooseRecord(result.record);
-        setNotice("已载入此 S/N 的检测记录");
-      } else {
-        setNotice("新 S/N，可以开始检测");
-      }
+        setNotice("已载入前缀 " + value + " 的最近检测记录");
+      } else setNotice("未找到该前缀的检测记录");
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   }
@@ -608,8 +863,9 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
       const saved: RecordRow = await request(inspectionPath + "records", "POST", {
         template_id: template.id, serial, values, version: record?.updated_at || null, revision: form.revision,
       });
-      chooseRecord(saved);
-      setNotice("已保存 " + saved.serial + " · " + saved.result);
+      clearEntry(true);
+      setLastResult(saved.result);
+      setNotice("已保存 " + saved.serial + " · " + saved.result + "，可继续扫码");
       setRevision((value) => value + 1);
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
@@ -634,7 +890,12 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
             setEditor(undefined);
             setConfigDirty(false);
             setHistoryPrefix("");
-            clearEntry();
+            setRecord(null);
+            setValues({});
+            setDirty(false);
+            setLastResult("");
+            setNotice("");
+            setError("");
           }}>
             {templates.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
           </select>
@@ -642,12 +903,16 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
       </div>
       <div className="tabs page-tabs" aria-label="生产检测功能">
         <button type="button" className={tab === "entry" ? "selected" : ""} onClick={() => changeTab("entry")}>检测录入</button>
+        <button type="button" className={tab === "devices" ? "selected" : ""} onClick={() => {
+          setHistoryPrefix("");
+          changeTab("devices");
+        }}>设备台账</button>
         <button type="button" className={tab === "history" ? "selected" : ""} onClick={() => changeTab("history")}>检测记录</button>
         {admin && !readOnly && <button type="button" className={tab === "settings" ? "selected" : ""}
           onClick={() => changeTab("settings")}>检测表设置</button>}
       </div>
       {error && <p className="form-error" role="alert">{error}</p>}
-      {!template && tab !== "settings" && (
+      {!template && tab === "history" && (
         <div className="panel inspection-empty">
           <h3>暂无检测表</h3>
           {admin && !readOnly ? <button type="button" className={primary} onClick={() => {
@@ -668,69 +933,126 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
             setTemplateId(saved.id);
             setEditor(undefined);
             setConfigDirty(false);
-            clearEntry();
+            setRecord(null);
+            setValues({});
+            setDirty(false);
+            setTab("entry");
           }} /> : <section className="panel inspection-template-list">
             <div className="inspection-config-head">
               <h3>检测表</h3>
               <button type="button" className={primary} onClick={() => {
-                if (discard()) { clearEntry(); setEditor(null); }
+                if (discard()) { setDirty(false); setEditor(null); }
               }}><Plus size={16} />新建检测表</button>
             </div>
             {templates.map((item) => <div className="inspection-template-row" key={item.id}>
               <strong>{item.name}</strong><span className="muted">{item.fields.length} 项 · 版本 {item.revision}</span>
               <button type="button" className="btn small" onClick={() => {
-                if (discard()) { clearEntry(); setEditor(item); }
+                if (discard()) { setDirty(false); setEditor(item); }
               }}>编辑</button>
             </div>)}
           </section>
       )}
+      {tab === "settings" && editor === undefined && template && savedOptions.length > 0 && (
+        <section className="panel inspection-site-options">
+          <h3>现场新增选项</h3>
+          {savedOptions.map((item) => (
+            <div className="inspection-template-row" key={item.field_key + ":" + item.value}>
+              <span className="muted">{template.fields.find((field) => field.key === item.field_key)?.label}</span>
+              <strong>{item.value}</strong>
+              <button type="button" className="btn small" disabled={busy} onClick={async () => {
+                setBusy(true);
+                setError("");
+                try {
+                  setSavedOptions(await request(inspectionPath + "options", "PUT", {
+                    template_id: template.id, field_key: item.field_key, value: item.value, hidden: !item.hidden_at,
+                  }));
+                } catch (e) { setError((e as Error).message); }
+                finally { setBusy(false); }
+              }}>{item.hidden_at ? "恢复选项" : "隐藏选项"}</button>
+            </div>
+          ))}
+        </section>
+      )}
+      {tab === "devices" && <DeviceRegistry key={historyPrefix} request={request} prefix={historyPrefix}
+        refresh={revision} readOnly={readOnly} open={(item) => {
+          if (!discard()) return;
+          clearEntry(true);
+          setDevice(item);
+          setSerial(item.serial);
+          setTab("entry");
+        }} register={() => {
+          if (!discard()) return;
+          clearEntry(true);
+          setTab("entry");
+        }} />}
       {template && tab === "history" && <InspectionHistory key={template.id + ":" + historyPrefix}
         template={template} request={request} baseUrl={baseUrl} readOnly={readOnly} admin={admin}
+        onImported={() => setRevision((value) => value + 1)}
         prefix={historyPrefix} revision={revision} onChoose={(row) => { if (discard()) chooseRecord(row); }} />}
-      {template && form && tab === "entry" && (
+      {tab === "entry" && (
         <>
           <form className="panel inspection-sn" onSubmit={(event) => { event.preventDefault(); void lookup(); }}>
+            <h2>设备登记</h2>
             <div className="inspection-sn-row">
               <label>S/N
-                <input ref={serialInput} autoComplete="off" inputMode={form.serial_mode === "dated" ? "numeric" : "text"}
-                  maxLength={form.serial_mode === "dated" ? 16 : 100} placeholder="扫码枪输入或手动输入"
+                <input ref={serialInput} autoComplete="off" inputMode={form?.serial_mode === "dated" ? "numeric" : "text"}
+                  maxLength={form?.serial_mode === "dated" ? 16 : 100} placeholder="扫码枪输入或手动输入"
                   readOnly={!!record} disabled={busy} value={serial}
-                  onChange={(event) => { setSerial(event.target.value); setNotice(""); }} />
+                  onChange={(event) => { setSerial(event.target.value); setDevice(null); setNotice(""); setLastResult(""); }} />
               </label>
-              <button type="submit" className={action} disabled={busy || !!record || !serial.trim()}>读取记录</button>
-              <button type="button" className={action} disabled={busy || !!record} onClick={() => setCamera("live")}>
-                <Camera size={16} />扫码
+              <button type="submit" className={action} disabled={busy || !serial.trim()}>读取记录</button>
+              <button type="button" className={action} disabled={busy} onClick={() => setCamera("live")}>
+                <Camera size={16} />摄像头扫码
               </button>
-              <button type="button" className={action} disabled={busy || !!record}
+              <button type="button" className={action} disabled={busy}
                 onClick={() => setCamera("photo")}>从照片识别</button>
+              {!readOnly && <button type="button" className={primary}
+                disabled={busy || !serial.trim() || !!device || !!record}
+                onClick={() => void registerDevice()}>登记设备</button>}
             </div>
             <div className="inspection-serial-info">
               <span>前 6 位 <b>{serial.slice(0, 6) || "—"}</b></span>
-              {form.serial_mode === "dated" && <>
-                <span>生产日期 <b>{serial.length === 16 ? "20" + serial.slice(6, 8) + "-" + serial.slice(8, 10) + "-" + serial.slice(10, 12) : "—"}</b></span>
+              {(form?.serial_mode === "dated" || device?.production_date) && <>
+                <span>生产日期 <b>{record?.production_date || device?.production_date || (serial.length === 16
+                  ? (Number(serial.slice(6, 8)) >= 69 ? "19" : "20") + serial.slice(6, 8) + "-" + serial.slice(8, 10) + "-" + serial.slice(10, 12)
+                  : "—")}</b></span>
                 <span>尾号 <b>{serial.length === 16 ? serial.slice(12) : "—"}</b></span>
               </>}
               {record && <span>最近检测 <b>{formatTime(record.updated_at)}</b></span>}
+              {(device || record) && <span className="inspection-registered">已登记</span>}
             </div>
           </form>
           <form className="inspection-prefix" onSubmit={(event) => {
             event.preventDefault();
-            setHistoryPrefix(prefix.trim());
-            changeTab("history");
+            void queryLatest();
           }}>
             <input aria-label="按前 6 位查询" placeholder="按前 6 位查询历史记录" maxLength={6} value={prefix}
               onChange={(event) => setPrefix(event.target.value)} />
-            <button className={action} type="submit" disabled={prefix.trim().length !== 6}>
-              <Search size={15} />查询历史
+            <button className={action} type="submit" disabled={busy || prefix.trim().length !== 6}>
+              <Search size={15} />{template ? "查最近一条" : "查设备"}
             </button>
+            {template && <button type="button" className={action} disabled={prefix.trim().length !== 6}
+              onClick={() => { setHistoryPrefix(prefix.trim()); changeTab("history"); }}>查看全部</button>}
           </form>
-          <fieldset className="inspection-entry-fields" disabled={readOnly || busy}>
+          {notice && <p className="inspection-notice" role="status">
+            {lastResult && <ResultLabel value={lastResult} />}{notice}
+          </p>}
+          {!form && <section className="panel inspection-empty">
+            <h3>暂无检测表</h3>
+            {admin && !readOnly ? <button type="button" className={action} onClick={() => {
+              setTab("settings");
+              setEditor(null);
+            }}><Plus size={16} />新建检测表</button> : <p className="muted">请联系管理员配置检测表。</p>}
+          </section>}
+          {form && <fieldset className="inspection-entry-fields" disabled={readOnly || busy}>
             {Array.from(groups, ([group, fields]) => (
               <section className="panel inspection-field-group" key={group}>
                 <h3>{group}</h3>
                 <div className="inspection-field-grid">
                   {fields.map((field) => <FieldInput key={form.id + ":" + form.revision + ":" + field.key}
-                    field={field} value={values[field.key]} onChange={(value) => {
+                    field={field} value={values[field.key]} suggestions={savedOptions
+                      .filter((item) => item.field_key === field.key && !item.hidden_at).map((item) => item.value)}
+                    onChange={(value) => {
                       setValues((previous) => {
                         const next = { ...previous };
                         if (value === undefined || (Array.isArray(value) && !value.length)) delete next[field.key];
@@ -742,15 +1064,15 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
                 </div>
               </section>
             ))}
-          </fieldset>
+          </fieldset>}
           <div className="inspection-submit">
-            <div><ResultLabel value={record && !dirty ? record.result : decision(form.fields, values)} />
-              {notice && <span role="status" className="muted">{notice}</span>}</div>
+            <div>{form && (!lastResult || serial) &&
+              <ResultLabel value={record && !dirty ? record.result : decision(form.fields, values)} />}</div>
             <div>
               <button type="button" className={action} disabled={busy} onClick={() => {
                 if (discard()) clearEntry(true);
-              }}>{record ? "下一台" : "清空表单"}</button>
-              {!readOnly && <button type="button" className={primary} disabled={busy || !serial.trim()}
+              }}>{record || device ? "下一台" : "清空表单"}</button>
+              {form && !readOnly && <button type="button" className={primary} disabled={busy || !serial.trim()}
                 onClick={() => void saveRecord()}>{busy ? "处理中…" : "保存检测"}</button>}
             </div>
           </div>

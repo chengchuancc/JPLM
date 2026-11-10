@@ -10,7 +10,8 @@ from xml.sax.saxutils import escape
 
 from electronic_import import ElectronicBomError, normalized, read_csv, read_xlsx
 
-TABLES = ('inspection_templates', 'inspection_records')
+INITIAL_TABLES = ('inspection_templates', 'inspection_records')
+TABLES = ('inspection_templates', 'inspection_devices', 'inspection_records', 'inspection_options')
 RESULTS = ('合格', '不良', '未完成', '待检测')
 LIMIT = 5000
 SCHEMA = (
@@ -27,6 +28,7 @@ SCHEMA = (
         values_json TEXT NOT NULL, template_snapshot TEXT NOT NULL,
         operator_id TEXT REFERENCES users(id), operator_name TEXT NOT NULL,
         source_id TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        deleted_at TEXT,
         UNIQUE(project_id,template_id,serial),
         FOREIGN KEY(project_id,template_id) REFERENCES inspection_templates(project_id,id)
     )""",
@@ -34,6 +36,22 @@ SCHEMA = (
        ON inspection_records(project_id,template_id,updated_at DESC,id DESC)""",
     """CREATE INDEX IF NOT EXISTS idx_inspection_prefix
        ON inspection_records(project_id,template_id,prefix,updated_at DESC)""",
+    """CREATE TABLE IF NOT EXISTS inspection_devices (
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        serial TEXT NOT NULL, prefix TEXT NOT NULL, production_date TEXT NOT NULL,
+        registered_at TEXT NOT NULL, operator_id TEXT REFERENCES users(id), operator_name TEXT NOT NULL,
+        PRIMARY KEY(project_id,serial)
+    )""",
+    """CREATE INDEX IF NOT EXISTS idx_inspection_devices_recent
+       ON inspection_devices(project_id,registered_at DESC,serial)""",
+    """CREATE INDEX IF NOT EXISTS idx_inspection_device_records
+       ON inspection_records(project_id,serial,updated_at DESC)""",
+    """CREATE TABLE IF NOT EXISTS inspection_options (
+        project_id TEXT NOT NULL, template_id TEXT NOT NULL, field_key TEXT NOT NULL,
+        value TEXT NOT NULL, created_at TEXT NOT NULL, hidden_at TEXT,
+        PRIMARY KEY(project_id,template_id,field_key,value),
+        FOREIGN KEY(project_id,template_id) REFERENCES inspection_templates(project_id,id)
+    )""",
 )
 
 
@@ -257,20 +275,25 @@ def decode_record(row):
     return record
 
 
-def exact_record(db, project_id, template_id, serial):
-    row = db.execute('SELECT * FROM inspection_records WHERE project_id=? AND template_id=? AND serial=?',
-                     (project_id, template_id, serial)).fetchone()
+def exact_record(db, project_id, template_id, serial, *, include_deleted=False):
+    row = db.execute('''SELECT * FROM inspection_records WHERE project_id=? AND template_id=? AND serial=?
+                       AND (? OR deleted_at IS NULL)''',
+                     (project_id, template_id, serial, include_deleted)).fetchone()
     return decode_record(row) if row else None
 
 
 def save_record(db, project_id, config, data, user, stamp, record_id):
     serial, prefix, produced = parse_serial(data.get('serial'), config['serial_mode'])
-    old = exact_record(db, project_id, config['id'], serial)
+    old = exact_record(db, project_id, config['id'], serial, include_deleted=True)
+    if old and old['deleted_at']:
+        raise InspectionError('该 S/N 的检测记录已删除，请联系管理员恢复', 409)
     current_form = old['form'] if old else config
     if data.get('version') != (old['updated_at'] if old else None) or data.get('revision') != current_form['revision']:
         raise InspectionError('检测记录或检测表已更新，请重新读取后再保存', 409)
     values = clean_values(current_form, data.get('values'), old['values'] if old else None)
     result = grade(current_form, values)
+    register_device(db, project_id, serial, prefix, produced, stamp, user['id'], user['name'])
+    remember_options(db, project_id, current_form, values, stamp)
     if old:
         db.execute('UPDATE inspection_records SET result=?,values_json=?,operator_id=?,operator_name=?,updated_at=? WHERE id=? AND project_id=?',
                    (result, dumps(values), user['id'], user['name'], stamp, old['id'], project_id))
@@ -282,18 +305,26 @@ def save_record(db, project_id, config, data, user, stamp, record_id):
 
 def insert_record(db, project_id, config, record_id, serial, prefix, produced, result, values,
                   operator_id, operator_name, source_id, created_at, updated_at):
-    db.execute('INSERT INTO inspection_records VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)', (
+    db.execute('''INSERT INTO inspection_records(
+        id,project_id,template_id,serial,prefix,production_date,result,values_json,template_snapshot,
+        operator_id,operator_name,source_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', (
         record_id, project_id, config['id'], serial, prefix, produced, result, dumps(values),
         dumps(config), operator_id, operator_name, source_id, created_at, updated_at,
     ))
 
 
 def list_records(db, project_id, template_id, query, *, exporting=False):
-    where = ['project_id=?', 'template_id=?']
+    for start, end, label in (('from', 'to', '日期'), ('prefix_from', 'prefix_to', '编号前缀')):
+        lower, upper = text(query.get(start), 100), text(query.get(end), 100)
+        if lower and upper and lower > upper:
+            raise InspectionError(f'起始{label}不能大于结束{label}')
+    where = ['project_id=?', 'template_id=?',
+             'deleted_at IS NOT NULL' if query.get('deleted') == '1' else 'deleted_at IS NULL']
     parameters = [project_id, template_id]
     for key, clause in (
         ('serial', 'instr(lower(serial), lower(?)) > 0'),
         ('prefix', 'prefix=?'), ('result', 'result=?'),
+        ('prefix_from', 'prefix>=?'), ('prefix_to', 'prefix<=?'),
         ('from', "COALESCE(NULLIF(production_date,''),substr(created_at,1,10))>=?"),
         ('to', "COALESCE(NULLIF(production_date,''),substr(created_at,1,10))<=?"),
     ):
@@ -301,16 +332,29 @@ def list_records(db, project_id, template_id, query, *, exporting=False):
         if value:
             where.append(clause)
             parameters.append(value)
+    keyword = text(query.get('keyword'), 100)
+    if keyword:
+        where.append("""instr(lower(serial||' '||production_date||' '||result||
+                        ' '||operator_name||' '||values_json), lower(?))>0""")
+        parameters.append(keyword)
     predicate = ' AND '.join(where)
     total = db.execute(f'SELECT COUNT(*) FROM inspection_records WHERE {predicate}', parameters).fetchone()[0]
-    if exporting and total > LIMIT:
+    export_all = exporting and query.get('scope') != 'page'
+    if export_all and total > LIMIT:
         raise InspectionError(f'一次最多导出 {LIMIT} 条，请缩小筛选范围')
     page = max(1, min(int(query.get('page') or 1), 100000))
-    cap = LIMIT if exporting else 50
+    per_page = int(query.get('per_page') or 50)
+    if per_page not in (20, 50, 100, 200):
+        per_page = 50
+    cap = LIMIT if export_all else per_page
+    sort = query.get('sort')
+    if sort not in ('serial', 'prefix', 'production_date', 'result', 'created_at', 'updated_at'):
+        sort = 'updated_at'
+    direction = 'ASC' if query.get('direction') == 'asc' else 'DESC'
     rows = db.execute(f'''SELECT * FROM inspection_records WHERE {predicate}
-                          ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?''',
-                      (*parameters, cap, 0 if exporting else (page - 1) * cap))
-    return dict(records=[decode_record(row) for row in rows], total=total, page=page)
+                          ORDER BY {sort} {direction},id DESC LIMIT ? OFFSET ?''',
+                      (*parameters, cap, 0 if export_all else (page - 1) * cap))
+    return dict(records=[decode_record(row) for row in rows], total=total, page=page, per_page=per_page)
 
 def timestamp(value, fallback):
     value = text(value, 40)
@@ -521,3 +565,97 @@ def xlsx_file(rows):
                 sheet.write(f'<row r="{row_no}">{"".join(cells)}</row>'.encode())
             sheet.write(f'</sheetData><autoFilter ref="A1:{column_letter(len(rows[0]))}{len(rows)}"/></worksheet>'.encode())
     return output.getvalue()
+
+
+def get_device(db, project_id, serial):
+    row = db.execute('SELECT * FROM inspection_devices WHERE project_id=? AND serial=?',
+                     (project_id, serial)).fetchone()
+    return dict(row) if row else None
+
+
+def register_device(db, project_id, serial, prefix, produced, stamp, operator_id, operator_name):
+    created = db.execute('INSERT OR IGNORE INTO inspection_devices VALUES(?,?,?,?,?,?,?)',
+                         (project_id, serial, prefix, produced, stamp, operator_id, operator_name)).rowcount
+    if not created and produced:
+        db.execute("""UPDATE inspection_devices SET production_date=?
+                      WHERE project_id=? AND serial=? AND production_date=''""",
+                   (produced, project_id, serial))
+    return get_device(db, project_id, serial), bool(created)
+
+
+def list_devices(db, project_id, query):
+    page = max(1, min(int(query.get('page') or 1), 100000))
+    search = text(query.get('serial'), 100)
+    prefix = text(query.get('prefix'), 6)
+    predicate = "project_id=? AND instr(lower(serial),lower(?))>0 AND (?='' OR prefix=?)"
+    parameters = (project_id, search, prefix, prefix)
+    count = db.execute(f'SELECT COUNT(*) FROM inspection_devices WHERE {predicate}', parameters).fetchone()[0]
+    devices = db.execute(f'''SELECT d.*,
+        (SELECT COUNT(*) FROM inspection_records r
+         WHERE r.project_id=d.project_id AND r.serial=d.serial AND r.deleted_at IS NULL) AS records,
+        (SELECT result FROM inspection_records r
+         WHERE r.project_id=d.project_id AND r.serial=d.serial AND r.deleted_at IS NULL
+         ORDER BY r.updated_at DESC,r.id DESC LIMIT 1) AS result
+        FROM (SELECT * FROM inspection_devices WHERE {predicate}
+              ORDER BY registered_at DESC,serial LIMIT 50 OFFSET ?) AS d
+        ORDER BY d.registered_at DESC,d.serial''', (*parameters, (page - 1) * 50))
+    return dict(devices=[dict(row) for row in devices], total=count, page=page)
+
+
+def latest_record(db, project_id, template_id, prefix):
+    if len(text(prefix, 6)) != 6:
+        raise InspectionError('请输入编号前 6 位')
+    row = db.execute('''SELECT * FROM inspection_records WHERE project_id=? AND template_id=?
+                       AND prefix=? AND deleted_at IS NULL ORDER BY updated_at DESC,id DESC LIMIT 1''',
+                     (project_id, template_id, prefix)).fetchone()
+    return decode_record(row) if row else None
+
+
+def set_record_deleted(db, project_id, record_id, deleted, stamp):
+    row = db.execute('SELECT * FROM inspection_records WHERE project_id=? AND id=?',
+                     (project_id, record_id)).fetchone()
+    if not row:
+        raise InspectionError('检测记录不存在', 404)
+    if bool(row['deleted_at']) != deleted:
+        # Change the version as well so a pre-deletion draft cannot overwrite a restored record.
+        db.execute('UPDATE inspection_records SET deleted_at=?,updated_at=? WHERE project_id=? AND id=?',
+                   (stamp if deleted else None, stamp, project_id, record_id))
+    return row
+
+
+def remember_options(db, project_id, config, values, stamp):
+    rows = (
+        (project_id, config['id'], field['key'], value, stamp)
+        for field in config['fields'] if field['type'] == 'multi' and field['custom']
+        for value in values.get(field['key'], []) if value not in field['options']
+    )
+    db.executemany('INSERT OR IGNORE INTO inspection_options VALUES(?,?,?,?,?,NULL)', rows)
+
+
+def list_options(db, project_id, config):
+    keys = {field['key'] for field in config['fields'] if field['type'] == 'multi' and field['custom']}
+    return [dict(row) for row in db.execute(
+        '''SELECT field_key,value,hidden_at FROM inspection_options WHERE project_id=? AND template_id=?
+           ORDER BY created_at DESC,value''', (project_id, config['id']),
+    ) if row['field_key'] in keys]
+
+
+def hide_option(db, project_id, config, data, stamp):
+    key = text(data.get('field_key'), 40)
+    value = text(data.get('value'), 250)
+    if not isinstance(data.get('hidden'), bool):
+        raise InspectionError('选项状态无效')
+    result = db.execute('''UPDATE inspection_options SET hidden_at=?
+                           WHERE project_id=? AND template_id=? AND field_key=? AND value=?''',
+                        (stamp if data['hidden'] else None, project_id, config['id'], key, value))
+    if not result.rowcount:
+        raise InspectionError('现场选项不存在', 404)
+
+
+def backfill_from_records(db):
+    db.execute('''INSERT OR IGNORE INTO inspection_devices
+                  SELECT project_id,serial,prefix,production_date,created_at,operator_id,operator_name
+                  FROM inspection_records ORDER BY created_at,id''')
+    for row in db.execute('SELECT project_id,template_snapshot,values_json,updated_at FROM inspection_records'):
+        remember_options(db, row['project_id'], json.loads(row['template_snapshot']),
+                         json.loads(row['values_json']), row['updated_at'])
