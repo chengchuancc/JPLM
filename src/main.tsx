@@ -2119,6 +2119,7 @@ function Workspace({
     "photo",
     "name",
     "category",
+    "custodian",
     ...levelColumns,
     "spec",
     "external_code",
@@ -2136,6 +2137,7 @@ function Workspace({
     "photo",
     "name",
     "category",
+    "custodian",
     ...levelColumns,
     "spec",
     "external_code",
@@ -2143,7 +2145,6 @@ function Workspace({
     "unit",
     "price",
     "stock",
-    "custodian",
     "min_stock",
     "location",
     "notes",
@@ -2154,6 +2155,7 @@ function Workspace({
     "photo",
     "name",
     "category",
+    "custodian",
     "spec",
     "external_code",
     "brand",
@@ -2250,7 +2252,12 @@ function Workspace({
     {
       name: "custodian_id",
       label: "物料管理员",
-      options: userOptions,
+      options: [
+        ...userOptions,
+        ...state.former_users
+          .filter(({ id }) => modal?.kind === "part" && modal.item?.custodian_id === id)
+          .map(({ id, name }) => ({ value: id, label: name })),
+      ],
       wide: true,
     },
     { name: "external_code", label: "外部料号" },

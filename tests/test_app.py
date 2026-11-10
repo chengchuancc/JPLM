@@ -57,7 +57,7 @@ class IntegrationTests(unittest.TestCase):
         category = '包装耗材'
         created = self.request('parts', 'POST', {'name': '缓冲垫', 'category': ' ' + category + ' '})['id']
         original = next(p for p in self.state()['parts'] if p['id'] == created)
-        self.assertEqual((original['category'], original['code'][:4]), (category, 'CM31'))
+        self.assertEqual((original['category'], original['code'][:4]), (category, 'JC31'))
         self.request('material-cells/' + created, 'PUT', {'category': '塑料辅料'})
         changed = next(p for p in self.state()['parts'] if p['id'] == created)
         self.assertEqual(changed['code'], original['code'])
@@ -65,7 +65,7 @@ class IntegrationTests(unittest.TestCase):
         self.request('material-cells/' + created, 'PUT', {'category': '电子物料'})
         state = self.state()
         changed = next(p for p in state['parts'] if p['id'] == created)
-        self.assertEqual(changed['code'], 'CM21' + original['code'][-4:])
+        self.assertEqual(changed['code'], 'JC21' + original['code'][-4:])
         self.assertIn(original['code'], [row['code'] for row in state['material_code_aliases']])
         other = self.request('projects', 'POST', {'name': '另一个项目'})['id']
         self.assertNotIn(category, self.request('state', project=other)['material_categories'])
@@ -770,7 +770,7 @@ class IntegrationTests(unittest.TestCase):
                          {'count':2,'created':2,'reused':0})
         state = self.state()
         foam = next(p for p in state['parts'] if p['name']=='密封泡棉')
-        self.assertRegex(foam['code'], r'^TA31[0-9]{4}$')
+        self.assertRegex(foam['code'], r'^JC31[0-9]{4}$')
         self.assertEqual((foam['external_code'],foam['price'],foam['spec'],foam['unit']),
                          ('L7-65177',0.41,'0.5 mm','张'))
         other = self.product()
@@ -801,7 +801,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(m['unit'],'PCS');self.assertEqual(m['spec'],'');self.assertEqual(m['material_level'],1)
         self.assertEqual(next(x for x in state['parts'] if x['id']==b)['material_level'],2)
         self.assertEqual(len({x['code'] for x in state['parts']}),3)
-        self.assertRegex(m['code'],r'^CM11[0-9]{4}$')
+        self.assertRegex(m['code'],r'^JC11[0-9]{4}$')
         self.assertEqual(len([v for v in state['bom_versions'] if v['product_id']==product]),1)
     def test_inline_updates_preserve_other_fields_and_codes(self):
         self.move('入库',7)
@@ -811,7 +811,7 @@ class IntegrationTests(unittest.TestCase):
         p=self.state()['parts'][0]
         self.assertEqual(p['name'],'测试物料');self.assertEqual(p['stock'],7)
         self.assertEqual(p['price'],1.5);self.assertEqual(p['min_stock'],2)
-        self.assertEqual(p['spec'],'0603');self.assertEqual(p['unit'],'PCS');self.assertEqual(p['material_level'],2);self.assertRegex(p['code'],r'^CM22[0-9]{4}$');self.assertNotEqual(p['code'],self.code)
+        self.assertEqual(p['spec'],'0603');self.assertEqual(p['unit'],'PCS');self.assertEqual(p['material_level'],2);self.assertRegex(p['code'],r'^JC22[0-9]{4}$');self.assertNotEqual(p['code'],self.code)
         self.request('parts/'+self.part,'PUT',{'material_level':3},400)
         self.assertEqual(self.state()['parts'][0]['material_level'],2)
     def test_create_material_inside_bom_is_atomic(self):
@@ -1122,7 +1122,8 @@ class IntegrationTests(unittest.TestCase):
                 state = app.get_state(db)
                 self.assertEqual((state['parts'][0]['id'], state['parts'][0]['stock']), ('m', 8))
                 self.assertEqual(state['bom_lines'][0]['id'], 'l')
-                self.assertEqual(state['material_code_aliases'][0]['code'], '旧料号')
+                self.assertEqual({row['code'] for row in state['material_code_aliases']}, {'旧料号', 'CM110001'})
+                self.assertEqual(state['parts'][0]['code'], 'JC110001')
                 self.assertEqual(db.execute('SELECT user_id FROM project_members').fetchone()[0], user)
                 self.assertEqual([r[0] for r in db.execute('SELECT project_id FROM activity ORDER BY id')],
                                  [app.LEGACY_PROJECT_ID, None])
@@ -1164,10 +1165,10 @@ class IntegrationTests(unittest.TestCase):
             for level in (1,2):
                 id=self.request('parts','POST',{'name':category+str(level),'category':category,'material_level':level})['id']
                 material=next(p for p in self.state()['parts'] if p['id']==id)
-                self.assertRegex(material['code'],'^CM'+prefix+str(level)+r'[0-9]{4}$')
+                self.assertRegex(material['code'],'^JC'+prefix+str(level)+r'[0-9]{4}$')
         old=self.code
         self.request('material-cells/'+self.part,'PUT',{'category':'结构物料'})
-        p=self.state()['parts'][0];self.assertRegex(p['code'],r'^CM11[0-9]{4}$')
+        p=self.state()['parts'][0];self.assertRegex(p['code'],r'^JC11[0-9]{4}$')
         self.assertTrue(any(a['code']==old and a['part_id']==self.part for a in self.state()['material_code_aliases']))
         product=self.product();version=self.state()['bom_versions'][0]['id']
         self.request('bom-import','POST',{'version_id':version,'rows':[{'code':old,'qty':2}]})
@@ -1235,7 +1236,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.state()['material_links'][0]['child_id'],child)
         self.assertEqual(self.state()['bom_lines'][0]['part_id'],child)
 
-    def test_project_name_prefix_for_bom_and_child_materials(self):
+    def test_fixed_prefix_for_bom_and_child_materials(self):
         self.request('projects/' + self.project_id, 'PUT', {'name': '研发 Ｔａｎｏｓ'})
         product=self.request('products','POST',{'name':'混配设备','english_code':'aquamix'})['id']
         state=self.state();p=next(p for p in state['products'] if p['id']==product)
@@ -1244,8 +1245,8 @@ class IntegrationTests(unittest.TestCase):
         a=self.request('bom-materials','POST',{'name':'主控板','version_id':version,'category':'电子物料'})['id']
         b=self.request('parts','POST',{'name':'电容','material_level':2,'parent_ids':[a]})['id']
         parts={p['id']:p for p in self.state()['parts']}
-        self.assertRegex(parts[a]['code'],r'^TA21[0-9]{4}$');self.assertRegex(parts[b]['code'],r'^TA22[0-9]{4}$')
-    def test_shared_material_keeps_project_prefix(self):
+        self.assertRegex(parts[a]['code'],r'^JC21[0-9]{4}$');self.assertRegex(parts[b]['code'],r'^JC22[0-9]{4}$')
+    def test_shared_material_keeps_code(self):
         self.request('projects/' + self.project_id, 'PUT', {'name': 'AquaMix'})
         first=self.request('products','POST',{'name':'产品A','english_code':'AQUAMIX'})['id']
         second=self.request('products','POST',{'name':'产品B','english_code':'FUME'})['id']
@@ -1254,7 +1255,7 @@ class IntegrationTests(unittest.TestCase):
         original=next(p['code'] for p in self.state()['parts'] if p['id']==material)
         self.request('bom-lines','POST',{'version_id':v2,'part_id':material,'qty':2})
         saved=next(p for p in self.state()['parts'] if p['id']==material)
-        self.assertEqual(saved['code'],original);self.assertTrue(saved['code'].startswith('AQ11'))
+        self.assertEqual(saved['code'],original);self.assertTrue(saved['code'].startswith('JC11'))
     def test_part_bom_edits_share_version_lines_and_preserve_material_number(self):
         first = self.request('products', 'POST', {'name': '产品A', 'english_code': 'ALPHA'})['id']
         second = self.request('products', 'POST', {'name': '产品B', 'english_code': 'BETA'})['id']
@@ -1286,7 +1287,7 @@ class IntegrationTests(unittest.TestCase):
         state = self.state()
         self.assertEqual(state['bom_lines'], [lines[new_product_version]])
         part = next(p for p in state['parts'] if p['id'] == material['id'])
-        self.assertTrue(part['code'].startswith('CM'))
+        self.assertTrue(part['code'].startswith('JC'))
 
     def test_project_rename_and_product_code_change_keep_existing_numbers(self):
         self.request('projects/' + self.project_id, 'PUT', {'name': 'AquaMix'})
@@ -1294,14 +1295,14 @@ class IntegrationTests(unittest.TestCase):
         version = self.state()['bom_versions'][0]['id']
         material = self.request('bom-materials', 'POST', {'name': '主控板', 'version_id': version, 'category': '电子物料'})['id']
         original = next(p['code'] for p in self.state()['parts'] if p['id'] == material)
-        self.assertTrue(original.startswith('AQ21'))
+        self.assertTrue(original.startswith('JC21'))
         self.request('projects/' + self.project_id, 'PUT', {'name': 'Fume'})
         self.request('products/' + product, 'PUT', {'english_code': 'TANOS'})
         self.request('parts/' + material, 'PUT', {'numbering_product_id': product, 'spec': '控制板'})
         new = self.request('parts', 'POST', {'name': '新物料', 'numbering_product_id': product})['id']
         codes = {p['id']: p['code'] for p in self.state()['parts']}
         self.assertEqual(codes[material], original)
-        self.assertTrue(codes[new].startswith('FU11'))
+        self.assertTrue(codes[new].startswith('JC11'))
 
     def test_product_code_validation_allows_shared_prefix(self):
         for code in ('A','123','中文','AB XX'):
@@ -1329,45 +1330,84 @@ class IntegrationTests(unittest.TestCase):
                 app.init_db()
                 with app.connect() as db:
                     parts={r['id']:dict(r) for r in db.execute('SELECT * FROM parts')}
-                    self.assertEqual(parts['parent']['code'],'CM210001');self.assertEqual(parts['child']['code'],'CM220002')
+                    self.assertEqual(parts['parent']['code'],'JC210001');self.assertEqual(parts['child']['code'],'JC220002')
                     self.assertEqual(parts['child']['numbering_product_id'],'p')
                     self.assertEqual(db.execute("SELECT qty FROM material_links WHERE id='link'").fetchone()[0],12)
                     self.assertEqual(parts['child']['stock'],5)
                     self.assertEqual(db.execute("SELECT part_id FROM material_code_aliases WHERE code='2200000001'").fetchone()[0],'child')
             finally: app.DATA=previous
+    def test_v20_upgrade_and_restore_keep_codes_as_aliases_across_projects(self):
+        product = self.product()
+        version = self.state()['bom_versions'][0]['id']
+        self.request('bom-lines', 'POST', {'version_id': version, 'part_id': self.part, 'qty': 4})
+        self.move('入库', 7)
+        other = self.request('projects', 'POST', {'name': 'Tanos'})['id']
+        retired = self.request('parts', 'POST', {'name': '旧物料', 'category': '包材'}, project=other)['id']
+        self.request('parts/' + retired, 'DELETE', project=other)
+        self.request('projects/' + other, 'PUT', {'archived': True})
+        legacy = {self.part: 'CM21' + self.code[-4:], retired: 'TA310002'}
+        with app.transaction() as db:
+            db.executemany('UPDATE parts SET code=? WHERE id=?', ((code, id) for id, code in legacy.items()))
+            db.execute(f'PRAGMA user_version={app.MATERIAL_CATEGORIES_VERSION}')
+            before = {row['id']: dict(row) for row in db.execute('SELECT * FROM parts')}
+        expected = {id: {**row, 'code': 'JC' + row['code'][2:]} for id, row in before.items()}
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            archive = folder / 'v20.zip'
+            archive.write_bytes(self.request('backup', raw=True))
+            restored, version_before_restore = app.stage_restore(archive, folder)
+            self.assertEqual(version_before_restore, app.MATERIAL_CATEGORIES_VERSION)
+            app.init_db()
+            app.init_db()
+            for directory in (app.DATA, restored):
+                with app.connect(directory) as db:
+                    self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], app.VERSION)
+                    self.assertEqual({row['id']: dict(row) for row in db.execute('SELECT * FROM parts')}, expected)
+                    for id, code in legacy.items():
+                        db.project_id = expected[id]['project_id']
+                        self.assertEqual(app.find_part_code(db, code)[0], id)
+                    self.assertIsNone(db.execute('PRAGMA foreign_key_check').fetchone())
+        self.assertEqual(self.stock(), 7)
+        self.assertEqual(self.state()['bom_lines'][0]['qty'], 4)
+        result = self.request('bom-import', 'POST', {'version_id': version, 'rows': [
+            {'code': legacy[self.part], 'qty': 5},
+        ]})
+        self.assertEqual(result['reused'], 1)
+        self.assertEqual(self.state()['bom_lines'][0]['part_id'], self.part)
+
     def test_four_digit_sequence_never_overflows_into_five_digits(self):
         with app.transaction() as db:
             db.execute("INSERT INTO settings VALUES('sequence_material_global','9998') ON CONFLICT(key) DO UPDATE SET value='9998'")
         self.request('parts','POST',{'name':'最后一个编号'})
-        self.assertEqual(self.state()['parts'][-1]['code'],'CM119999')
+        self.assertEqual(self.state()['parts'][-1]['code'],'JC119999')
         before=len(self.state()['parts'])
         self.request('parts','POST',{'name':'不应生成五位流水'},409)
         self.assertEqual(len(self.state()['parts']),before)
 
-    def test_serial_is_unique_globally_across_all_prefixes(self):
+    def test_serial_is_unique_globally_across_projects(self):
         aqua = self.request('projects', 'POST', {'name': 'AquaMix'})['id']
         fume = self.request('projects', 'POST', {'name': 'Fume'})['id']
         records = self.state()['parts']
-        for project, prefix in ((aqua, 'AQ'), (fume, 'FU')):
+        for project in (aqua, fume):
             for category in ('结构物料', '电子物料'):
                 for level in (1, 2):
                     self.request('parts', 'POST', {'name': '物料', 'category': category, 'material_level': level}, project=project)
             parts = self.request('state', project=project)['parts']
-            self.assertTrue(all(part['code'].startswith(prefix) for part in parts))
+            self.assertTrue(all(part['code'].startswith('JC') for part in parts))
             records.extend(parts)
         serials = [part['material_serial'] for part in records]
         self.assertEqual(len(serials),len(set(serials)))
         self.assertEqual([p['code'][-4:] for p in records],[f'{n:04d}' for n in serials])
         self.assertEqual(serials,list(range(1,len(records)+1)))
         self.assertEqual(len({p['code'][-4:] for p in records}),len(records))
-    def test_changing_prefix_does_not_change_serial_and_deletion_does_not_reuse_it(self):
+    def test_changing_classification_and_deleting_material_does_not_reuse_serial(self):
         self.request('projects/' + self.project_id, 'PUT', {'name': 'AquaMix'})
         id=self.request('parts','POST',{'name':'螺钉'})['id']
         before=next(p for p in self.state()['parts'] if p['id']==id)
         self.request('projects/' + self.project_id, 'PUT', {'name': 'Fume'})
         self.request('material-cells/'+id,'PUT',{'category':'电子物料','material_level':2})
         changed=next(p for p in self.state()['parts'] if p['id']==id)
-        self.assertTrue(changed['code'].startswith('FU22'))
+        self.assertTrue(changed['code'].startswith('JC22'))
         self.assertEqual(changed['code'][-4:],before['code'][-4:])
         self.assertEqual(changed['material_serial'],before['material_serial'])
         self.assertIn(before['code'], [alias['code'] for alias in self.state()['material_code_aliases']])
@@ -1397,7 +1437,7 @@ class IntegrationTests(unittest.TestCase):
         result=self.request('electronic-import/commit','POST',{'request_id':'electronic-test-0001','parent_id':parent,'version_id':version,'rows':[{'name':'1uF','external_code':'C15849','qty':5,'spec':'C0603','brand':'SAMSUNG','price':0.085,'notes':'备注原样','reference':'C1,C2'}]})
         self.assertEqual(result['created'],1);self.assertEqual(result['materials'],1);self.assertEqual(result['reference_total'],0.425)
         state=self.state();child=next(p for p in state['parts'] if p['external_code']=='C15849')
-        self.assertTrue(child['code'].startswith('AQ22'));self.assertNotEqual(child['code'],child['external_code'])
+        self.assertTrue(child['code'].startswith('JC22'));self.assertNotEqual(child['code'],child['external_code'])
         self.assertEqual(child['stock'],0);self.assertEqual(child['unit'],'PCS');self.assertEqual(child['brand'],'SAMSUNG')
         self.assertEqual(state['material_links'][0]['qty'],5);self.assertEqual(state['material_links'][0]['notes'],'备注原样')
         self.assertEqual(state['material_links'][0]['reference'],'C1,C2')

@@ -15,7 +15,8 @@ import inspection
 import shipping
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
-    SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, migrate_material_categories, migrate_projects,
+    SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
+    migrate_material_categories, migrate_projects,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -125,6 +126,8 @@ def init_db(directory=None, bootstrap=None):
             db.execute('ALTER TABLE inspection_records ADD COLUMN deleted_at TEXT')
         if version == 12:
             inspection.backfill_from_records(db)
+        if version < MATERIAL_CODE_PREFIX_VERSION:
+            migrate_material_codes(db)
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -191,7 +194,7 @@ def init_legacy_db(directory=None, bootstrap=None):
                 db.execute('UPDATE parts SET material_serial=?,code=? WHERE id=?',(serial,'__migration_'+part['id'],part['id']))
             for part in db.execute('SELECT * FROM parts ORDER BY rowid').fetchall():
                 prefix=legacy_product_prefix(db,part['numbering_product_id'])
-                db.execute('UPDATE parts SET code=? WHERE id=?',(material_code(part['category'],part['material_level'],prefix,part['material_serial']),part['id']))
+                db.execute('UPDATE parts SET code=? WHERE id=?',(material_code(part['category'],part['material_level'],part['material_serial'],prefix=prefix),part['id']))
         for field in ('external_code','brand'):
             if field not in columns: db.execute(f"ALTER TABLE parts ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
         link_columns={r[1] for r in db.execute('PRAGMA table_info(material_links)')}
@@ -525,11 +528,6 @@ def legacy_product_prefix(db,product_id):
     letters=''.join(c for c in product['english_code'] if c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
     return letters[:2] if len(letters)>=2 else 'CM'
 
-def project_prefix(db):
-    name = exists(db, 'projects', db.project_id)['name']
-    letters = re.findall(r'[A-Za-z]', unicodedata.normalize('NFKC', name))
-    return ''.join(letters[:2]).upper() if len(letters) >= 2 else 'CM'
-
 BUILTIN_MATERIAL_CATEGORIES = ('结构物料', '电子物料')
 MATERIAL_CATEGORY_DIGITS = dict(zip(BUILTIN_MATERIAL_CATEGORIES, ('1', '2')))
 
@@ -549,9 +547,6 @@ def material_category(db, value, level):
                       (db.project_id, key)).fetchone()[0]
 
 
-def material_prefix(category, level, prefix='CM'):
-    return prefix + MATERIAL_CATEGORY_DIGITS.get(category, '3') + str(level)
-
 def next_material_serial(db):
     key='sequence_material_global'
     row=db.execute('SELECT value FROM settings WHERE key=?',(key,)).fetchone()
@@ -561,9 +556,24 @@ def next_material_serial(db):
     db.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,str(sequence)))
     return sequence
 
-def material_code(category,level,prefix,serial):
+def material_code(category, level, serial, *, prefix='JC'):
     if not isinstance(serial,int) or not 1<=serial<=9999: raise Problem('物料流水号无效')
-    return f'{material_prefix(category,level,prefix)}{serial:04d}'
+    digit = MATERIAL_CATEGORY_DIGITS.get(category, '3')
+    return f'{prefix}{digit}{level}{serial:04d}'
+
+def migrate_material_codes(db):
+    parts = db.execute('SELECT id, project_id, code, category, material_level, material_serial FROM parts').fetchall()
+    for part in parts:
+        code = material_code(part['category'], part['material_level'], part['material_serial'])
+        previous = part['code']
+        if previous == code:
+            continue
+        if db.execute('SELECT 1 FROM material_code_aliases WHERE code IN (?,?) AND part_id<>?',
+                      (previous, code, part['id'])).fetchone():
+            raise Problem(f'物料料号与历史编号冲突：{previous} → {code}', 409)
+        db.execute('INSERT INTO material_code_aliases(project_id,code,part_id) VALUES(?,?,?) ON CONFLICT(code) DO NOTHING',
+                   (part['project_id'], previous, part['id']))
+        db.execute('UPDATE parts SET code=? WHERE id=?', (code, part['id']))
 
 def link_material(db,parent_id,child_id,qty=1):
     parent=active_part(db,parent_id);child=active_part(db,child_id)
@@ -774,6 +784,8 @@ def stage_restore(archive_path, directory):
                     shipping.backfill_products(db)
                 if shipping_tables and not shipping.valid_parent_links(db):
                     raise Problem('备份中的发货父子关系无效')
+                if PROJECT_VERSION <= version < MATERIAL_CODE_PREFIX_VERSION:
+                    migrate_material_codes(db)
                 if version >= shipping.PRODUCTS_VERSION and db.execute("""SELECT 1 FROM shipping_items i
                     JOIN shipping_records s ON s.project_id=i.project_id AND s.id=i.shipment_id
                     WHERE s.channel<>'other' OR s.items_configured<>1 LIMIT 1""").fetchone():
@@ -1885,7 +1897,7 @@ class Handler(BaseHTTPRequestHandler):
                 if old and old['material_level']!=level and db.execute('SELECT 1 FROM material_links WHERE parent_id=? OR child_id=?',(id,id)).fetchone(): raise Problem('请先解除一级、二级物料关联，再更改级别')
                 serial=old['material_serial'] if old else next_material_serial(db)
                 same_classification=old and (old['category'],old['material_level'])==(category,level)
-                code=old['code'] if same_classification else material_code(category,level,project_prefix(db),serial)
+                code=old['code'] if same_classification else material_code(category,level,serial)
                 if old and code!=old['code']:
                     insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
                 values.update(code=code,material_serial=serial,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location','')),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
@@ -2192,12 +2204,11 @@ def seed_demo(db):
                                           status=status, created_at=now(), updated_at=now()))
         insert_scoped(db, 'bom_versions', dict(id=version_ids[key], product_id=product_ids[key],
                                               name='V1.0', notes='示例初始版本', created_at=now()))
-    prefix = project_prefix(db)
     for key, _, name, category, spec, unit, price, minimum, location, _ in parts:
         part_ids[key] = uid()
         level = 2 if key in ('m7', 'm8') else 1
         serial = next_material_serial(db)
-        insert_scoped(db, 'parts', dict(id=part_ids[key], code=material_code(category, level, prefix, serial),
+        insert_scoped(db, 'parts', dict(id=part_ids[key], code=material_code(category, level, serial),
                                        name=name, category=category, spec=spec, unit=unit, price=price,
                                        min_stock=minimum, location=location, material_level=level,
                                        material_serial=serial,
