@@ -169,7 +169,7 @@ function shipmentColumns(channel: Channel): Column[] {
     { key: "reference", label: channel === "ks" ? "发货编号" : "订单号", width: 170, fixed: true },
     createdColumn,
     { key: channel === "ks" ? "backer" : "source", label: channel === "ks" ? "Backer 编号" : "来源", width: 120 },
-    { key: "devices", label: "发货设备 S/N", width: 244 },
+    { key: "devices", label: "发货设备 S/N", width: 146 },
     { key: "shipped_on", label: "发货日期", width: 135, type: "date" },
     { key: "tracking", label: "运单号", width: 175 },
     { key: "status", label: "发货状态", width: 94 },
@@ -203,7 +203,8 @@ function ShipmentCell({ row, column, edit, saving, open, pick, request }: {
     return <div className="shipping-relation-cell">
       {row.devices.slice(0, 1).map((device) => <button key={device.serial} type="button"
         className={"shipping-chip mono" + (device.registered === false ? " unresolved" : "")}
-        onClick={() => open({ kind: "device", serial: device.serial })}>{device.serial}</button>)}
+        title={device.serial} aria-label={"查看设备 " + device.serial}
+        onClick={() => open({ kind: "device", serial: device.serial })}>{device.serial.slice(0, 6)}</button>)}
       {row.devices.length > 1 && <button type="button" className="shipping-chip"
         onClick={() => row.id ? open({ kind: "shipment", id: row.id, reference: row.reference }) : pick("devices")}
         aria-label={"查看全部 " + row.devices.length + " 台设备"}>+{row.devices.length - 1}</button>}
