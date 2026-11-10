@@ -169,7 +169,6 @@ type Field = {
 type CreateChoice = {
   resource: "parts" | "products" | "suppliers";
   level?: number;
-  productId?: string | null;
 };
 type ChoiceRequest = CreateChoice & {
   select: (id: string, updated: State) => void;
@@ -2249,16 +2248,6 @@ function Workspace({
       categoryOptions: state.material_categories,
     },
     {
-      name: "numbering_product_id",
-      label: "料号前缀来源",
-      create: { resource: "products" },
-      options: state.products.map((p) => ({
-        value: p.id,
-        label: p.name + (p.english_code ? " · " + p.english_code : ""),
-      })),
-      wide: true,
-    },
-    {
       name: "custodian_id",
       label: "物料管理员",
       options: userOptions,
@@ -2918,7 +2907,6 @@ function Workspace({
                                   kind: "electronic-import",
                                   extra: {
                                     version_id: selectedVersion?.id,
-                                    numbering_product_id: product?.id,
                                   },
                                 }
                               : { kind: "import" },
@@ -3416,7 +3404,6 @@ function Workspace({
                             kind: "electronic-import",
                             extra: {
                               parent_id: part.id,
-                              numbering_product_id: part.numbering_product_id,
                             },
                           })
                         }
@@ -3617,11 +3604,6 @@ function Workspace({
                             <ChevronRight size={14} />
                           </button>
                         ) : "未关联 BOM"}
-                      </dd>
-                      <dt>料号前缀来源</dt>
-                      <dd>
-                        {findProduct(part.numbering_product_id || "")?.name ||
-                          "通用物料"}
                       </dd>
                       <dt>物料管理员</dt>
                       <dd>{userName(part.custodian_id)}</dd>
@@ -4546,13 +4528,6 @@ function Workspace({
                 }
                 initial={{
                   unit: "PCS",
-                  numbering_product_id:
-                    modal.kind === "bom-create"
-                      ? product?.id
-                      : modal.kind === "child-create"
-                        ? findPart(modal.extra?.parent_id)
-                            ?.numbering_product_id || null
-                        : null,
                   category:
                     modal.kind === "child-create" || materialLevel === 2
                       ? "电子物料"
@@ -4618,7 +4593,6 @@ function Workspace({
                 create={{
                   resource: "parts",
                   level: modal.kind === "material-parents" ? 1 : 2,
-                  productId: modal.item.numbering_product_id,
                 }}
                 records={state.parts.filter(
                   (p) =>
@@ -4747,7 +4721,6 @@ function Workspace({
                 create={{
                   resource: "parts",
                   level: materialLevel,
-                  productId: product?.id,
                 }}
                 submit={(d) =>
                   mutate(
@@ -5152,7 +5125,6 @@ function Workspace({
               unit: "PCS",
               material_level: choice.level || 1,
               category: choice.level === 2 ? "电子物料" : "结构物料",
-              numbering_product_id: choice.productId || "",
             }}
             create={async (data) =>
               (await businessApi(choice.resource, "POST", data)).id
@@ -5579,12 +5551,24 @@ function PurchaseMaterialPicker({
   const [product, setProduct] = useState("");
   const [page, setPage] = useState(0);
   const productById = new Map(state.products.map((item) => [item.id, item]));
+  const bomProductsByPart = React.useMemo(() => {
+    const productByVersion = new Map(state.bom_versions.map((item) => [item.id, item.product_id]));
+    const byPart = new Map<string, Set<string>>();
+    for (const line of state.bom_lines) {
+      const productId = productByVersion.get(line.version_id);
+      if (!productId) continue;
+      const products = byPart.get(line.part_id) || new Set<string>();
+      products.add(productId);
+      byPart.set(line.part_id, products);
+    }
+    return byPart;
+  }, [state.bom_versions, state.bom_lines]);
   const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean);
   const matches = state.parts.filter((part) => {
     if (category && part.category !== category) return false;
     if (level && part.material_level !== Number(level)) return false;
-    if (product && (part.numbering_product_id || "common") !== product)
-      return false;
+    const products = bomProductsByPart.get(part.id);
+    if (product === "unlinked" ? !!products : product && !products?.has(product)) return false;
     const searchText = [part.code, part.name, part.spec, part.external_code, part.brand]
       .join(" ")
       .toLowerCase();
@@ -5622,7 +5606,6 @@ function PurchaseMaterialPicker({
               openChoice({
                 resource: "parts",
                 level: level ? Number(level) : undefined,
-                productId: product && product !== "common" ? product : undefined,
                 select: onAdd,
               })
             }
@@ -5651,12 +5634,12 @@ function PurchaseMaterialPicker({
           <option value="2">二级物料</option>
         </select>
         <select
-          aria-label="归属产品"
+          aria-label="关联产品"
           value={product}
           onChange={(event) => updateFilter(setProduct, event.target.value)}
         >
           <option value="">全部产品</option>
-          <option value="common">通用物料</option>
+          <option value="unlinked">未关联 BOM</option>
           {state.products.map((item) => (
             <option key={item.id} value={item.id}>
               {item.name} · {item.english_code || item.code}
@@ -5667,9 +5650,8 @@ function PurchaseMaterialPicker({
       <div className="purchase-picker-results" key={JSON.stringify([query, category, level, product, currentPage])}>
         {matches.slice(start, start + PURCHASE_MATERIAL_PAGE_SIZE).map((part) => {
           const checked = selected.has(part.id);
-          const owner = part.numbering_product_id
-            ? productById.get(part.numbering_product_id)
-            : undefined;
+          const products = Array.from(bomProductsByPart.get(part.id) || [],
+            (id) => productById.get(id)?.name).filter(Boolean);
           return (
             <button
               type="button"
@@ -5686,7 +5668,7 @@ function PurchaseMaterialPicker({
               <span className="purchase-material-meta">
                 <span>{part.category} · {part.material_level === 1 ? "一级" : "二级"}</span>
                 <small>
-                  {owner?.name || "通用物料"}
+                  {products.join("、") || "未关联 BOM"}
                   {!quotesByPart.get(part.id)?.size && " · 未关联供应商"}
                 </small>
               </span>
@@ -6902,7 +6884,6 @@ function QuickCreateForm({
               create={{
                 resource: "parts",
                 level: 1,
-                productId: values.numbering_product_id,
               }}
               selected={parentIds}
               onChange={setParentIds}
@@ -7114,7 +7095,6 @@ function ElectronicImportForm({
   const [preview, setPreview] = useState<any>(null);
   const [rows, setRows] = useState<any[]>([]);
   const [parent, setParent] = useState(context.parent_id || "");
-  const [product, setProduct] = useState(context.numbering_product_id || "");
   const [includeExcluded, setIncludeExcluded] = useState(false);
   const [updatePrices, setUpdatePrices] = useState(false);
   const [search, setSearch] = useState("");
@@ -7196,7 +7176,6 @@ function ElectronicImportForm({
             create={{
               resource: "parts",
               level: 1,
-              productId: context.numbering_product_id,
             }}
             aria-label="导入关联一级物料"
             disabled={!!context.parent_id || busy}
@@ -7214,29 +7193,6 @@ function ElectronicImportForm({
             ))}
           </ChoiceSelect>
         </label>
-        {!context.version_id && !parent && (
-          <label>
-            料号前缀来源
-            <ChoiceSelect
-              create={{ resource: "products" }}
-              aria-label="导入料号前缀来源"
-              disabled={busy}
-              value={product}
-              onValueChange={(id) => {
-                setProduct(id);
-                reset();
-              }}
-            >
-              <option value="">通用物料 CM</option>
-              {state.products.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                  {p.english_code ? " · " + p.english_code : ""}
-                </option>
-              ))}
-            </ChoiceSelect>
-          </label>
-        )}
         {preview && (
           <label>
             工作表
@@ -7464,7 +7420,6 @@ function ElectronicImportForm({
                 request_id: requestId.current,
                 parent_id: parent || null,
                 version_id: context.version_id || null,
-                numbering_product_id: product || null,
                 update_existing_prices: updatePrices,
                 rows: selected.map((r) => ({
                   name: r.name,

@@ -15,7 +15,6 @@ export type Part = {
   external_code: string;
   brand: string;
   material_serial: number;
-  numbering_product_id: string | null;
   id: string;
   code: string;
   name: string;

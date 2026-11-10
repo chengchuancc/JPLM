@@ -190,7 +190,8 @@ def init_legacy_db(directory=None, bootstrap=None):
                 serial=part['material_serial'] if part['material_serial'] is not None else next_material_serial(db)
                 db.execute('UPDATE parts SET material_serial=?,code=? WHERE id=?',(serial,'__migration_'+part['id'],part['id']))
             for part in db.execute('SELECT * FROM parts ORDER BY rowid').fetchall():
-                db.execute('UPDATE parts SET code=? WHERE id=?',(material_code(db,part['category'],part['material_level'],part['numbering_product_id'],part['material_serial']),part['id']))
+                prefix=legacy_product_prefix(db,part['numbering_product_id'])
+                db.execute('UPDATE parts SET code=? WHERE id=?',(material_code(part['category'],part['material_level'],prefix,part['material_serial']),part['id']))
         for field in ('external_code','brand'):
             if field not in columns: db.execute(f"ALTER TABLE parts ADD COLUMN {field} TEXT NOT NULL DEFAULT ''")
         link_columns={r[1] for r in db.execute('PRAGMA table_info(material_links)')}
@@ -292,16 +293,26 @@ def find_bom_import_part(db, product_id, code, external_code, name, spec, level,
         if found:
             return found[0]
     if external_code:
-        matches = db.execute("""SELECT id FROM parts WHERE project_id=? AND external_code=? COLLATE NOCASE
-            AND numbering_product_id=? AND deleted_at IS NULL LIMIT 2""",
-            (db.project_id, external_code, product_id)).fetchall()
+        criteria = 'p.external_code=? COLLATE NOCASE'
+        values = (external_code,)
     else:
-        matches = db.execute("""SELECT id FROM parts WHERE project_id=? AND numbering_product_id=?
-            AND name=? AND spec=? AND material_level=? AND category=? AND deleted_at IS NULL LIMIT 2""",
-            (db.project_id, product_id, name, spec, level, category)).fetchall()
-    if len(matches) > 1:
+        criteria = 'p.name=? AND p.spec=? AND p.material_level=? AND p.category=?'
+        values = (name, spec, level, category)
+    matches = db.execute(f"""SELECT p.id, p.name, p.spec, EXISTS (
+            SELECT 1 FROM bom_lines l JOIN bom_versions v ON v.id=l.version_id
+            WHERE l.part_id=p.id AND v.product_id=?
+        ) AS in_product_bom FROM parts p
+        WHERE p.project_id=? AND p.deleted_at IS NULL AND {criteria}
+        ORDER BY in_product_bom DESC LIMIT 2""", (product_id, db.project_id, *values)).fetchall()
+    if len(matches) > 1 and matches[0]['in_product_bom'] == matches[1]['in_product_bom']:
         raise Problem('有多个匹配物料，请填写唯一的系统料号')
-    return matches[0][0] if matches else None
+    if not matches:
+        return None
+    match = matches[0]
+    if external_code and not match['in_product_bom'] and name and (
+            match['name'] != name or spec and match['spec'] != spec):
+        return None
+    return match['id']
 
 
 def bom_import_price(value):
@@ -508,11 +519,16 @@ def normalize_english_code(value):
         raise Problem('英文代号需含至少 2 个英文字母，可使用数字、连字符或下划线，最多 32 位')
     return code
 
-def product_prefix(db,product_id):
+def legacy_product_prefix(db,product_id):
     if not product_id: return 'CM'
     product=exists(db,'products',product_id)
     letters=''.join(c for c in product['english_code'] if c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
     return letters[:2] if len(letters)>=2 else 'CM'
+
+def project_prefix(db):
+    name = exists(db, 'projects', db.project_id)['name']
+    letters = re.findall(r'[A-Za-z]', unicodedata.normalize('NFKC', name))
+    return ''.join(letters[:2]).upper() if len(letters) >= 2 else 'CM'
 
 BUILTIN_MATERIAL_CATEGORIES = ('结构物料', '电子物料')
 MATERIAL_CATEGORY_DIGITS = dict(zip(BUILTIN_MATERIAL_CATEGORIES, ('1', '2')))
@@ -545,9 +561,9 @@ def next_material_serial(db):
     db.execute('INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',(key,str(sequence)))
     return sequence
 
-def material_code(db,category,level,product_id,serial):
+def material_code(category,level,prefix,serial):
     if not isinstance(serial,int) or not 1<=serial<=9999: raise Problem('物料流水号无效')
-    return f'{material_prefix(category,level,product_prefix(db,product_id))}{serial:04d}'
+    return f'{material_prefix(category,level,prefix)}{serial:04d}'
 
 def link_material(db,parent_id,child_id,qty=1):
     parent=active_part(db,parent_id);child=active_part(db,child_id)
@@ -1703,7 +1719,7 @@ class Handler(BaseHTTPRequestHandler):
             return {'id':bid}
         if resource=='bom-materials' and method=='POST':
             version=exists(db,'bom_versions',d.get('version_id'))
-            part=self.mutate(db,'/api/parts','POST',{**d,'numbering_product_id':version['product_id']})
+            part=self.mutate(db,'/api/parts','POST',d)
             line=self.mutate(db,'/api/bom-lines','POST',{'version_id':version['id'],'part_id':part['id'],'qty':d.get('qty',1)})
             return {'id':part['id'],'line_id':line['id']}
         if resource=='bom-lines':
@@ -1753,7 +1769,7 @@ class Handler(BaseHTTPRequestHandler):
                         part_id = self.mutate(db, '/api/parts', 'POST', {
                             'name': name, 'external_code': external, 'spec': spec,
                             'material_level': level, 'category': category, 'unit': row.get('unit') or 'PCS',
-                            'price': bom_import_price(row.get('price')), 'numbering_product_id': version['product_id'],
+                            'price': bom_import_price(row.get('price')),
                         })['id']
                         created += 1
                     insert_bom_line(db, version['id'], part_id, qty, str(row.get('reference') or ''),
@@ -1847,7 +1863,7 @@ class Handler(BaseHTTPRequestHandler):
                     if has_bom and d.get('delete_bom') is not True:
                         raise Problem('请确认一并删除该产品的所有 BOM 版本和明细', 409)
                     db.execute('DELETE FROM bom_versions WHERE product_id=?', (id,))
-                    # The numbering link determines future prefixes, not material ownership.
+                    # Clear the legacy numbering reference before removing the product.
                     db.execute('UPDATE parts SET numbering_product_id=NULL WHERE numbering_product_id=?', (id,))
                     log_activity(db, self.user, '删除产品', id, f"{record['code']} {record['name']}")
                 db.execute(f'DELETE FROM {resource} WHERE id=?',(id,))
@@ -1867,19 +1883,12 @@ class Handler(BaseHTTPRequestHandler):
                 level=material_level(d.get('material_level',1))
                 category=material_category(db, d.get('category'), level)
                 if old and old['material_level']!=level and db.execute('SELECT 1 FROM material_links WHERE parent_id=? OR child_id=?',(id,id)).fetchone(): raise Problem('请先解除一级、二级物料关联，再更改级别')
-                numbering_product_id=d.get('numbering_product_id') or None
-                if not old and 'numbering_product_id' not in d and level==2 and parent_ids:
-                    if not isinstance(parent_ids,list) or any(not isinstance(x,str) for x in parent_ids): raise Problem('关联记录格式错误')
-                    sources={exists(db,'parts',parent)['numbering_product_id'] for parent in parent_ids}
-                    if len(sources)==1 and None not in sources: numbering_product_id=next(iter(sources))
-                if numbering_product_id: exists(db,'products',numbering_product_id)
                 serial=old['material_serial'] if old else next_material_serial(db)
-                code=old['code'] if old else material_code(db,category,level,numbering_product_id,serial)
-                if old and (old['category']!=category or old['material_level']!=level or old['numbering_product_id']!=numbering_product_id):
-                    code=material_code(db,category,level,numbering_product_id,serial)
-                    if code != old['code']:
-                        insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
-                values.update(code=code,material_serial=serial,numbering_product_id=numbering_product_id,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location','')),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
+                same_classification=old and (old['category'],old['material_level'])==(category,level)
+                code=old['code'] if same_classification else material_code(category,level,project_prefix(db),serial)
+                if old and code!=old['code']:
+                    insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
+                values.update(code=code,material_serial=serial,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location','')),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
             else: values.update({k:str(d.get(k,'')) for k in ('contact','phone','email','address','notes')})
             if resource in RESPONSIBILITIES:
                 column = RESPONSIBILITIES[resource]
@@ -1891,12 +1900,6 @@ class Handler(BaseHTTPRequestHandler):
                     insert_scoped(db, 'bom_versions', dict(id=uid(), product_id=id, name='V1.0', notes='初始版本', created_at=now()))
             else:
                 exists(db,resource,id); db.execute(f'UPDATE {resource} SET '+','.join(k+'=?' for k in values)+' WHERE id=?',(*values.values(),id))
-            if resource=='products' and old and old['english_code']!=values['english_code']:
-                for material in db.execute('SELECT * FROM parts WHERE numbering_product_id=?',(id,)).fetchall():
-                    expected=material_prefix(material['category'],material['material_level'],product_prefix(db,id))
-                    if not material['code'].startswith(expected):
-                        insert_scoped(db, 'material_code_aliases', dict(code=material['code'], part_id=material['id']), 'ON CONFLICT(code) DO NOTHING')
-                        db.execute('UPDATE parts SET code=?,updated_at=? WHERE id=?',(material_code(db,material['category'],material['material_level'],id,material['material_serial']),now(),material['id']))
             if resource=='parts' and parent_ids is not None:
                 if values['material_level']!=2 and parent_ids: raise Problem('只有二级物料可以选择关联一级物料')
                 if values['material_level']==2: set_material_parents(db,id,parent_ids)
@@ -1961,8 +1964,6 @@ class Handler(BaseHTTPRequestHandler):
         parent=active_part(db,parent_id) if parent_id else None
         if parent and parent['material_level']!=1: raise Problem('关联目标必须是一级物料')
         version=exists(db,'bom_versions',version_id) if version_id else None
-        source=parent['numbering_product_id'] if parent else version['product_id'] if version else d.get('numbering_product_id') or None
-        if source: exists(db,'products',source)
         candidates=electronic_candidates(db)
         groups={};created=0;created_ids=set();reused=set()
         for index,raw in enumerate(rows,1):
@@ -1974,7 +1975,7 @@ class Handler(BaseHTTPRequestHandler):
             row['price']=num(raw.get('price') if raw.get('price') is not None else 0)
             material=self.match_electronic_material(db,row,candidates)
             if material is None:
-                saved=self.mutate(db,'/api/parts','POST',{**row,'material_level':2,'category':'电子物料','numbering_product_id':source,'unit':row['unit'] or 'PCS'})
+                saved=self.mutate(db,'/api/parts','POST',{**row,'material_level':2,'category':'电子物料','unit':row['unit'] or 'PCS'})
                 material=exists(db,'parts',saved['id']);candidates.append(material);created+=1;created_ids.add(material['id'])
             else:
                 if material['id'] not in created_ids: reused.add(material['id'])
@@ -2191,15 +2192,15 @@ def seed_demo(db):
                                           status=status, created_at=now(), updated_at=now()))
         insert_scoped(db, 'bom_versions', dict(id=version_ids[key], product_id=product_ids[key],
                                               name='V1.0', notes='示例初始版本', created_at=now()))
+    prefix = project_prefix(db)
     for key, _, name, category, spec, unit, price, minimum, location, _ in parts:
         part_ids[key] = uid()
         level = 2 if key in ('m7', 'm8') else 1
         serial = next_material_serial(db)
-        owner = product_ids['p1']
-        insert_scoped(db, 'parts', dict(id=part_ids[key], code=material_code(db, category, level, owner, serial),
+        insert_scoped(db, 'parts', dict(id=part_ids[key], code=material_code(category, level, prefix, serial),
                                        name=name, category=category, spec=spec, unit=unit, price=price,
                                        min_stock=minimum, location=location, material_level=level,
-                                       numbering_product_id=owner, material_serial=serial,
+                                       material_serial=serial,
                                        created_at=now(), updated_at=now()))
         electronic = category == '电子物料'
         insert_scoped(db, 'quotes', dict(id=uid(), part_id=part_ids[key], price=price,
