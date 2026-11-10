@@ -168,6 +168,85 @@ type CreateChoice = {
 type ChoiceRequest = CreateChoice & {
   select: (id: string, updated: State) => void;
 };
+type SupplierOption = { value: string; label: string };
+type SupplierDraft = { ids: string[]; names: string[]; pending: string };
+
+function supplierChanges(draft: SupplierDraft, original: string[] = []) {
+  const add = draft.ids.filter((id) => !original.includes(id));
+  const remove = original.filter((id) => !draft.ids.includes(id));
+  const create = Array.from(new Set([...draft.names, draft.pending.trim()].filter(Boolean)));
+  return add.length || remove.length || create.length ? { add, remove, create } : undefined;
+}
+
+function SupplierLinksInput({ options, draft, onChange, disabled }: {
+  options: SupplierOption[];
+  draft: SupplierDraft;
+  onChange: React.Dispatch<React.SetStateAction<SupplierDraft>>;
+  disabled: boolean;
+}) {
+  const [adding, setAdding] = useState(false);
+  const addName = () => {
+    onChange((previous) => {
+      const name = previous.pending.trim();
+      return name ? { ...previous, names: Array.from(new Set([...previous.names, name])), pending: "" } : previous;
+    });
+    setAdding(false);
+  };
+  return (
+    <div className="supplier-links-input wide-field">
+      <label className="form-label">
+        供应商
+        <select aria-label="选择供应商" value="" disabled={disabled} onChange={(event) => {
+          const id = event.target.value;
+          if (id) onChange((previous) => ({ ...previous, ids: [...previous.ids, id] }));
+        }}>
+          <option value="">选择已有供应商</option>
+          {options.filter((item) => !draft.ids.includes(item.value)).map((item) => (
+            <option key={item.value} value={item.value}>{item.label}</option>
+          ))}
+        </select>
+      </label>
+      <Button small type="button" disabled={disabled || adding} onClick={() => setAdding(true)}>
+        <Plus size={14} />新建供应商
+      </Button>
+      {adding && <div className="supplier-name-input">
+        <input aria-label="新供应商名称" placeholder="输入供应商名称" autoFocus maxLength={1000} value={draft.pending}
+          disabled={disabled} onChange={(event) => {
+            const pending = event.target.value;
+            onChange((previous) => ({ ...previous, pending }));
+          }} onKeyDown={(event) => {
+            if (event.key === "Enter" && !event.nativeEvent.isComposing) {
+              event.preventDefault();
+              if (draft.pending.trim()) addName();
+            }
+          }} />
+        <Button small type="button" disabled={disabled || !draft.pending.trim()} onClick={addName}>加入</Button>
+        <Button small type="button" disabled={disabled} onClick={() => {
+          onChange((previous) => ({ ...previous, pending: "" }));
+          setAdding(false);
+        }}>取消新建</Button>
+      </div>}
+      <div className="selected-records">
+        {draft.ids.map((id) => {
+          const label = options.find((item) => item.value === id)?.label || "供应商";
+          return <span className="record-tag" key={id}><span title={label}>{label}</span>
+            <button type="button" disabled={disabled} aria-label={"移除关联 " + label}
+              onClick={() => onChange((previous) => ({ ...previous, ids: previous.ids.filter((item) => item !== id) }))}>
+              <X size={12} />
+            </button>
+          </span>;
+        })}
+        {draft.names.map((name) => <span className="record-tag" key={"new:" + name}><span title={name}>{name}</span><small>待新建</small>
+          <button type="button" disabled={disabled} aria-label={"取消新建 " + name}
+            onClick={() => onChange((previous) => ({ ...previous, names: previous.names.filter((item) => item !== name) }))}>
+            <X size={12} />
+          </button>
+        </span>)}
+      </div>
+    </div>
+  );
+}
+
 const ChoiceContext = React.createContext<
   ((request: ChoiceRequest) => void) | null
 >(null);
@@ -339,6 +418,7 @@ function EntityForm({
   onCancel,
   label = "保存",
   images,
+  suppliers,
 }: {
   fields: Field[];
   initial?: any;
@@ -349,11 +429,16 @@ function EntityForm({
     upload: (files: File[]) => Promise<void>;
     finish: () => Promise<void>;
   };
+  suppliers?: { options: SupplierOption[]; linked: string[] };
 }) {
   const [values, setValues] = useState<any>(initial);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState<File[]>([]);
+  const originalSuppliers = useRef(suppliers?.linked || []);
+  const [supplierDraft, setSupplierDraft] = useState<SupplierDraft>({
+    ids: originalSuppliers.current, names: [], pending: "",
+  });
   function addImages(files: File[]) {
     if (!files.length) return;
     try {
@@ -377,7 +462,9 @@ function EntityForm({
         setError("");
         setBusy(true);
         try {
-          await submit(values);
+          await submit(suppliers ? {
+            ...values, supplier_changes: supplierChanges(supplierDraft, originalSuppliers.current),
+          } : values);
           if (images) {
             if (selected.length) {
               await images.upload(selected);
@@ -405,58 +492,62 @@ function EntityForm({
       )}
       <div className="form-grid">
         {fields.map((f) => (
-          <label key={f.name} className={f.wide ? "wide-field" : ""}>
-            {f.label}
-            {f.required && <span className="required"> *</span>}
-            {f.type === "textarea" ? (
-              <textarea
-                rows={3}
-                value={values[f.name] ?? ""}
-                onChange={(e) =>
-                  setValues({ ...values, [f.name]: e.target.value })
-                }
-              />
-            ) : f.options ? (
-              <ChoiceSelect
-                create={f.create}
-                required={f.required}
-                value={values[f.name] ?? ""}
-                onValueChange={(value) =>
-                  setValues((previous: any) => ({
-                    ...previous,
-                    [f.name]: value,
-                  }))
-                }
-              >
-                <option value="">请选择</option>
-                {f.options
-                  .filter(
-                    (o) =>
-                      o.value === values[f.name] ||
-                      !f.optionFilter ||
-                      f.optionFilter(o.value),
-                  )
-                  .map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-              </ChoiceSelect>
-            ) : (
-              <input
-                required={f.required}
-                type={f.type || "text"}
-                autoComplete={f.autoComplete}
-                min={f.min ?? (f.type === "number" ? 0 : undefined)}
-                step={f.step || (f.type === "number" ? "any" : undefined)}
-                placeholder={f.placeholder}
-                value={values[f.name] ?? ""}
-                onChange={(e) =>
-                  setValues({ ...values, [f.name]: e.target.value })
-                }
-              />
-            )}
-          </label>
+          <React.Fragment key={f.name}>
+            <label className={f.wide ? "wide-field" : ""}>
+              {f.label}
+              {f.required && <span className="required"> *</span>}
+              {f.type === "textarea" ? (
+                <textarea
+                  rows={3}
+                  value={values[f.name] ?? ""}
+                  onChange={(e) =>
+                    setValues({ ...values, [f.name]: e.target.value })
+                  }
+                />
+              ) : f.options ? (
+                <ChoiceSelect
+                  create={f.create}
+                  required={f.required}
+                  value={values[f.name] ?? ""}
+                  onValueChange={(value) =>
+                    setValues((previous: any) => ({
+                      ...previous,
+                      [f.name]: value,
+                    }))
+                  }
+                >
+                  <option value="">请选择</option>
+                  {f.options
+                    .filter(
+                      (o) =>
+                        o.value === values[f.name] ||
+                        !f.optionFilter ||
+                        f.optionFilter(o.value),
+                    )
+                    .map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                </ChoiceSelect>
+              ) : (
+                <input
+                  required={f.required}
+                  type={f.type || "text"}
+                  autoComplete={f.autoComplete}
+                  min={f.min ?? (f.type === "number" ? 0 : undefined)}
+                  step={f.step || (f.type === "number" ? "any" : undefined)}
+                  placeholder={f.placeholder}
+                  value={values[f.name] ?? ""}
+                  onChange={(e) =>
+                    setValues({ ...values, [f.name]: e.target.value })
+                  }
+                />
+              )}
+            </label>
+            {f.name === "name" && suppliers && <SupplierLinksInput options={suppliers.options}
+              draft={supplierDraft} onChange={setSupplierDraft} disabled={busy} />}
+          </React.Fragment>
         ))}
       </div>
       {error && (
@@ -4388,6 +4479,7 @@ function Workspace({
             >
               <QuickCreateForm
                 images={modal.kind !== "supplier"}
+                suppliers={["part", "bom-create", "child-create"].includes(modal.kind) ? supplierOptions : undefined}
                 fields={
                   modal.kind === "product"
                     ? productFields.filter((f) => f.name !== "name")
@@ -4548,6 +4640,11 @@ function Workspace({
                         : supplierFields
                   }
                   initial={modal.item}
+                  suppliers={modal.kind === "part" ? {
+                    options: supplierOptions,
+                    linked: state.quotes.filter((quote) => quote.part_id === modal.item.id)
+                      .map((quote) => quote.supplier_id),
+                  } : undefined}
                   onCancel={() => setModal(null)}
                   images={
                     modal.kind === "product"
@@ -4983,6 +5080,7 @@ function Workspace({
         >
           <QuickCreateForm
             images={choice.resource !== "suppliers"}
+            suppliers={choice.resource === "parts" ? supplierOptions : undefined}
             fields={(choice.resource === "parts"
               ? partFields
               : choice.resource === "products"
@@ -6549,6 +6647,7 @@ function QuickCreateForm({
   fields,
   initial,
   parents,
+  suppliers,
   create,
   upload,
   done,
@@ -6558,6 +6657,7 @@ function QuickCreateForm({
   fields: Field[];
   initial: any;
   parents?: Part[];
+  suppliers?: SupplierOption[];
   create: (data: any) => Promise<string>;
   upload: (id: string, files: File[]) => Promise<void>;
   done: (id: string) => Promise<void>;
@@ -6569,6 +6669,7 @@ function QuickCreateForm({
     initial.parent_ids || [],
   );
   const [selected, setSelected] = useState<File[]>([]);
+  const [supplierDraft, setSupplierDraft] = useState<SupplierDraft>({ ids: [], names: [], pending: "" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const created = useRef("");
@@ -6605,6 +6706,7 @@ function QuickCreateForm({
               ...values,
               name,
               parent_ids: parents ? parentIds : undefined,
+              supplier_changes: suppliers ? supplierChanges(supplierDraft) : undefined,
             });
           if (selected.length && !uploaded.current) {
             await upload(created.current, selected);
@@ -6642,6 +6744,8 @@ function QuickCreateForm({
           autoComplete="off"
         />
       </label>
+      {suppliers && <SupplierLinksInput options={suppliers} draft={supplierDraft}
+        onChange={setSupplierDraft} disabled={busy || !!created.current} />}
       {fields
         .filter((f) => f.name === "english_code")
         .map((f) => (

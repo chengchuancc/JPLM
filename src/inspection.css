@@ -34,9 +34,12 @@
   min-height: 35px; padding: 6px 11px; border: 1px solid var(--border);
   background: #fff; border-radius: 6px; font-size: 13px; font-weight: 600;
 }
-.inspection-choice[aria-pressed="true"] { background: #e9f0ff; border-color: #87a6ed; color: #2145a5; }
-.inspection-choice.is-fail[aria-pressed="true"] { background: #fff0ef; border-color: #dca4a4; color: #982d34; }
-.inspection-choice:disabled { opacity: .7; }
+.inspection-choice.is-pass { background: #eefaf2; border-color: #86bfa0; color: #155536; }
+.inspection-choice.is-fail { background: #fff3f1; border-color: #dd9b94; color: #98261d; }
+.inspection-choice[aria-pressed="true"] { background: #2148c0; border-color: #2148c0; color: #fff; }
+.inspection-choice.is-pass[aria-pressed="true"] { background: #146640; border-color: #146640; color: #fff; }
+.inspection-choice.is-fail[aria-pressed="true"] { background: #b3261e; border-color: #b3261e; color: #fff; }
+.inspection-choice:disabled:not([aria-pressed="true"]) { opacity: .7; }
 .inspection-custom { margin-top: 7px; }
 .inspection-custom input { min-height: 32px; max-width: 260px; }
 .inspection-dropdown summary {
@@ -44,6 +47,8 @@
   padding: 6px 10px; list-style: none; cursor: pointer; border: 1px solid var(--border); border-radius: 6px; background: #fff;
 }
 .inspection-dropdown summary::-webkit-details-marker { display: none; }
+.inspection-dropdown summary.has-selection { background: #edf3ff; border-color: #6284d5; color: #15388e; }
+.inspection-dropdown summary.is-fail { background: #fff0ee; border-color: #c35b53; color: #95251e; }
 .inspection-dropdown summary span { min-width: 0; overflow-wrap: anywhere; }
 .inspection-dropdown summary svg { flex-shrink: 0; }
 .inspection-dropdown[open] summary svg { transform: rotate(180deg); }
@@ -58,9 +63,10 @@
   display: inline-flex; align-items: center; justify-content: center;
   font-weight: 650; padding: 4px 8px; border-radius: 5px; white-space: nowrap;
 }
-.inspection-result.pass { background: #e7f5ed; color: #276044; }
-.inspection-result.fail { background: #fff0ef; color: #982d34; }
-.inspection-result.pending { background: #edf0f5; color: #465369; }
+.inspection-result.pass { background: #146640; color: #fff; }
+.inspection-result.fail { background: #b3261e; color: #fff; }
+.inspection-result.incomplete { background: #fbd36f; color: #562f06; }
+.inspection-result.pending { background: #e0e7f1; color: #33445b; }
 .inspection-submit {
   position: sticky; bottom: 0; z-index: 2; flex-wrap: wrap; justify-content: space-between;
   padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: #fff;

@@ -249,6 +249,38 @@ class IntegrationTests(unittest.TestCase):
         self.request('quotes/' + unpriced, 'DELETE', {})
         self.assertEqual(len(self.state()['quotes']), 2)
 
+    def test_material_form_supplier_changes_are_atomic_and_keep_existing_quotes(self):
+        supplier = self.supplier()
+        material = self.request('parts', 'POST', {
+            'name': '物料表单供应商测试',
+            'supplier_changes': {'add': [supplier], 'create': ['表单新供应商']},
+        })['id']
+        state = self.state()
+        new_supplier = next(s['id'] for s in state['suppliers'] if s['name'] == '表单新供应商')
+        self.assertEqual({q['supplier_id'] for q in state['quotes'] if q['part_id'] == material}, {supplier, new_supplier})
+        quote = self.request('quotes', 'POST', {'part_id': material, 'supplier_id': supplier,
+                                               'price': 3, 'url': 'https://example.test/item'})['id']
+        self.request('parts/' + material, 'PUT', {'supplier_changes': {
+            'add': [supplier, supplier], 'create': ['表单新供应商'],
+        }})
+        self.request('parts/' + material, 'PUT', {'notes': '保留关联'})
+        state = self.state()
+        self.assertEqual([s['id'] for s in state['suppliers'] if s['name'] == '表单新供应商'], [new_supplier])
+        row = next(q for q in state['quotes'] if q['id'] == quote)
+        self.assertEqual((row['price'], row['url']), (3, 'https://example.test/item'))
+        other_project = self.request('projects', 'POST', {'name': '隔离供应商'})['id']
+        foreign = self.request('suppliers', 'POST', {'name': '异项目供应商'}, project=other_project)['id']
+        self.request('parts/' + material, 'PUT', {'notes': '应当回滚', 'supplier_changes': {
+            'add': [foreign], 'remove': [supplier], 'create': ['应当回滚的供应商'],
+        }}, 404)
+        state = self.state()
+        self.assertEqual(next(p['notes'] for p in state['parts'] if p['id'] == material), '保留关联')
+        self.assertNotIn('应当回滚的供应商', [s['name'] for s in state['suppliers']])
+        self.request('parts/' + material, 'PUT', {'supplier_changes': {'remove': [new_supplier]}})
+        state = self.state()
+        self.assertEqual([q['id'] for q in state['quotes'] if q['part_id'] == material], [quote])
+        self.assertIn(new_supplier, [s['id'] for s in state['suppliers']])
+
     def test_accounts_record_responsibility_and_reject_privilege_escalation(self):
         admin_cookie = self.cookie
         account = {'name': '经办测试', 'email': 'operator@example.test', 'password': 'temporary-1234'}

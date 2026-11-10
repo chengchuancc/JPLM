@@ -1343,6 +1343,31 @@ class Handler(BaseHTTPRequestHandler):
                 return {'ok': True}
         raise Problem('不支持的账户操作', 405)
 
+    def change_part_suppliers(self, db, part_id, changes):
+        if not isinstance(changes, dict) or changes.keys() - {'add', 'remove', 'create'}:
+            raise Problem('供应商关联格式错误')
+        add, remove, names = (changes.get(key, []) for key in ('add', 'remove', 'create'))
+        if any(not isinstance(items, list) or any(not isinstance(value, str) or not value.strip()
+                                                   for value in items) for items in (add, remove, names)):
+            raise Problem('供应商关联格式错误')
+        linked = dict.fromkeys(add)
+        for name in dict.fromkeys(name.strip() for name in names):
+            matches = db.execute('SELECT id FROM suppliers WHERE project_id=? AND name=? COLLATE NOCASE LIMIT 2',
+                                 (db.project_id, name)).fetchall()
+            if len(matches) > 1:
+                raise Problem(f'有多个名为「{name}」的供应商，请从列表选择', 409)
+            supplier_id = matches[0]['id'] if matches else self.mutate(
+                db, '/api/suppliers', 'POST', {'name': name})['id']
+            linked[supplier_id] = None
+        if set(linked).intersection(remove):
+            raise Problem('同一供应商不能同时添加和移除')
+        for supplier_id in linked:
+            if not db.execute('SELECT 1 FROM quotes WHERE project_id=? AND part_id=? AND supplier_id=?',
+                              (db.project_id, part_id, supplier_id)).fetchone():
+                self.mutate(db, '/api/quotes', 'POST', {'part_id': part_id, 'supplier_id': supplier_id})
+        db.executemany('DELETE FROM quotes WHERE project_id=? AND part_id=? AND supplier_id=?',
+                       ((db.project_id, part_id, supplier_id) for supplier_id in remove))
+
     def mutate(self,db,path,method,d):
         seg=path.strip('/').split('/'); resource=seg[1]; id=seg[2] if len(seg)>2 else None
         if resource in ('users', 'account', 'reset-password'):
@@ -1558,6 +1583,8 @@ class Handler(BaseHTTPRequestHandler):
             if resource=='parts' and parent_ids is not None:
                 if values['material_level']!=2 and parent_ids: raise Problem('只有二级物料可以选择关联一级物料')
                 if values['material_level']==2: set_material_parents(db,id,parent_ids)
+            if resource=='parts' and 'supplier_changes' in d:
+                self.change_part_suppliers(db, id, d['supplier_changes'])
             if resource in ('parts', 'products'):
                 noun = '物料' if resource == 'parts' else '产品'
                 log_activity(db, self.user, ('新增' if method == 'POST' else '修改') + noun,

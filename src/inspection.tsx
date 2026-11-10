@@ -122,7 +122,8 @@ function automaticValues(fields: InspectionField[], values: Values, original?: V
 }
 
 function ResultLabel({ value }: { value: string }) {
-  const tone = value === "不良" ? "fail" : value === "合格" ? "pass" : "pending";
+  const tone = value === "不良" ? "fail" : value === "合格" ? "pass" :
+    value === "未完成" ? "incomplete" : "pending";
   return <span className={"inspection-result " + tone}>{value}</span>;
 }
 
@@ -273,6 +274,8 @@ function FieldInput({ field, value, suggestions, hidden, automatic, onChange }: 
     return () => document.removeEventListener("pointerdown", outside);
   }, [dropdown]);
   const selected = Array.isArray(value) ? value : value === undefined ? [] : [String(value)];
+  const selectionTone = selected.some((option) => field.fail.includes(option)) ? " is-fail" :
+    selected.length ? " has-selection" : "";
   const options = Array.from(new Set([...field.options.filter((item) => !hidden.includes(item)), ...suggestions, ...selected]));
   const entered = search.trim();
   const term = entered.toLowerCase();
@@ -295,7 +298,8 @@ function FieldInput({ field, value, suggestions, hidden, automatic, onChange }: 
   }
   const choices = <div className="inspection-choices">
     {filtered.map((option) => <button key={option} type="button"
-      className={"inspection-choice" + (field.fail.includes(option) ? " is-fail" : "")}
+      className={"inspection-choice" + (field.fail.includes(option) ? " is-fail" :
+        option === "OK" && field.fail.includes("NG") ? " is-pass" : "")}
       aria-pressed={selected.includes(option)} onClick={() => choose(option)}>{option}</button>)}
     {!filtered.length && term && <small className="muted">无匹配选项</small>}
   </div>;
@@ -325,7 +329,7 @@ function FieldInput({ field, value, suggestions, hidden, automatic, onChange }: 
             details.current.querySelector("summary")?.focus();
           }
         }}>
-          <summary aria-label={field.label + " 选项"}>
+          <summary aria-label={field.label + " 选项"} className={selectionTone.trim()}>
             <span className={selected.length ? "" : "muted"}>
               {selected.join(" / ") || (field.type === "multi" ? "请选择一项或多项" : "请选择")}
             </span><ChevronDown size={16} />

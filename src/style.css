@@ -3393,6 +3393,25 @@ td .text-link:hover {
 .selected-records:not(:empty) {
   margin-bottom: 13px;
 }
+.supplier-links-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 7px 8px;
+  align-items: end;
+  margin: 0 0 11px;
+}
+.form-grid > .supplier-links-input { margin: 0; }
+.supplier-links-input > .form-label { min-width: 0; }
+.supplier-links-input select { width: 100%; }
+.supplier-name-input, .supplier-links-input > .selected-records { grid-column: 1 / -1; }
+.supplier-name-input { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.supplier-name-input input { flex: 1 1 150px; width: auto; min-width: 0; margin-top: 0; }
+.supplier-links-input > .selected-records { margin: 0; }
+.supplier-links-input > .selected-records:empty { display: none; }
+.supplier-links-input .record-tag { max-width: 100%; }
+.supplier-links-input .record-tag > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.supplier-links-input .record-tag > button { flex-shrink: 0; }
+.supplier-links-input .record-tag > small { color: var(--muted); }
 .record-options {
   max-height: 290px;
   overflow-y: auto;
