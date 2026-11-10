@@ -4829,14 +4829,16 @@ function Workspace({
             <Dialog title="导入 BOM" onClose={() => setModal(null)}>
               <ImportForm
                 onCancel={() => setModal(null)}
-                submit={(rows) =>
-                  mutate(
+                submit={async (rows) => {
+                  const result = await businessApi(
                     "bom-import",
                     "POST",
-                    { version_id: selectedVersion?.id, rows },
-                    "BOM 已导入",
-                  )
-                }
+                    { version_id: selectedVersion?.id, material_level: materialLevel, rows },
+                  );
+                  await refresh();
+                  setModal(null);
+                  notify(`已导入 ${result.count} 行，新建 ${result.created} 项，复用 ${result.reused} 行`);
+                }}
               />
             </Dialog>
           )}
@@ -5845,10 +5847,10 @@ function ImportForm({
     <>
       <div className="import-guide">
         <p>
-          必需列：<code>物料编码</code>、<code>数量</code>
+          填写<code>数量</code>，并提供<code>物料编码</code>或<code>物料名称</code>。
         </p>
         <p>
-          可选列：<code>位号</code>、<code>备注</code>。物料须已存在于物料库。
+          已有料号直接复用。找不到料号时，按名称新建物料并自动生成料号。
         </p>
         <Button
           small
@@ -5856,8 +5858,13 @@ function ImportForm({
             exportCSV(
               [
                 {
-                  物料编码: "请替换为已有物料编码",
+                  物料编码: "",
+                  物料名称: "示例物料",
+                  类别: "",
+                  规格型号: "",
                   数量: 1,
+                  单位: "PCS",
+                  参考单价: "",
                   位号: "",
                   备注: "",
                 },
@@ -5898,11 +5905,11 @@ function ImportForm({
                 }
                 if (
                   !r.meta.fields?.some((k) =>
-                    ["物料编码", "code"].includes(k),
+                    ["物料编码", "code", "物料名称", "名称", "name"].includes(k),
                   ) ||
                   !r.meta.fields?.some((k) => ["数量", "qty"].includes(k))
                 ) {
-                  setError("文件必须包含物料编码、数量两列");
+                  setError("文件须包含数量列，以及物料编码或物料名称列");
                   return;
                 }
                 if (r.data.length > 5000) {
@@ -5912,7 +5919,14 @@ function ImportForm({
                 setRows(
                   r.data.map((x) => ({
                     code: x["物料编码"] ?? x.code,
+                    name: x["物料名称"] ?? x["名称"] ?? x.name,
+                    external_code: x["外部料号"] ?? x.external_code,
+                    material_level: x["级别"] ?? x.material_level,
+                    category: x["类别"] ?? x.category,
+                    spec: x["规格型号"] ?? x.spec,
                     qty: x["数量"] ?? x.qty,
+                    unit: x["单位"] ?? x.unit,
+                    price: x["参考单价"] ?? x["单价"] ?? x.price,
                     reference: x["位号"] ?? x.reference ?? "",
                     notes: x["备注"] ?? x.notes ?? "",
                   })),

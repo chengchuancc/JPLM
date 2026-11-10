@@ -285,6 +285,34 @@ def find_part_code(db, code):
         (code, db.project_id, code, db.project_id),
     ).fetchone()
 
+
+def find_bom_import_part(db, product_id, code, external_code, name, spec, level, category):
+    if code:
+        found = find_part_code(db, code)
+        if found:
+            return found[0]
+    if external_code:
+        matches = db.execute("""SELECT id FROM parts WHERE project_id=? AND external_code=? COLLATE NOCASE
+            AND numbering_product_id=? AND deleted_at IS NULL LIMIT 2""",
+            (db.project_id, external_code, product_id)).fetchall()
+    else:
+        matches = db.execute("""SELECT id FROM parts WHERE project_id=? AND numbering_product_id=?
+            AND name=? AND spec=? AND material_level=? AND category=? AND deleted_at IS NULL LIMIT 2""",
+            (db.project_id, product_id, name, spec, level, category)).fetchall()
+    if len(matches) > 1:
+        raise Problem('有多个匹配物料，请填写唯一的系统料号')
+    return matches[0][0] if matches else None
+
+
+def bom_import_price(value):
+    if value is None or value == '':
+        return 0
+    text = re.sub(r'^[¥￥]\s*', '', str(value).strip())
+    if re.fullmatch(r'\d{1,3}(?:,\d{3})+(?:\.\d+)?', text):
+        text = text.replace(',', '')
+    return num(text) if text else 0
+
+
 def electronic_candidates(db):
     return [dict(row) for row in db.execute(
         'SELECT * FROM parts WHERE project_id=? AND material_level=2 AND deleted_at IS NULL',
@@ -1683,17 +1711,42 @@ class Handler(BaseHTTPRequestHandler):
                              part['id'], f"{part['code']} {part['name']}", f"{version['name']} · 用量 {values[2]:g}")
                 return {'id':id}
         if resource=='bom-import' and method=='POST':
-            version=exists(db,'bom_versions',d['version_id']); count=0
+            version=exists(db,'bom_versions',d['version_id'])
+            count=created=0
             db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
-            if not isinstance(d.get('rows'),list) or len(d['rows'])>5000: raise Problem('每次最多导入 5000 行')
-            for i,row in enumerate(d['rows']):
-                code=str(row.get('code','')).strip()
-                part=find_part_code(db, code)
-                if not part: raise Problem(f'第 {i+1} 行物料编码不存在，请先建立物料：{row.get("code","")}')
-                active_part(db, part[0])
-                insert_bom_line(db, version['id'], part[0], num(row.get('qty'), True), str(row.get('reference','')), str(row.get('notes','')), upsert=True); count+=1
-            log_activity(db, self.user, '导入 BOM', version['product_id'], version['name'], f'{count} 条明细')
-            return {'count':count}
+            if not isinstance(d.get('rows'),list) or not 1 <= len(d['rows']) <= 5000:
+                raise Problem('每次导入 1 至 5000 行')
+            for index, row in enumerate(d['rows'], 2):
+                try:
+                    if not isinstance(row, dict):
+                        raise Problem('物料行格式无效')
+                    code = str(row.get('code') or '').strip()
+                    name = str(row.get('name') or '').strip()
+                    spec = str(row.get('spec') or '').strip()
+                    external = str(row.get('external_code') or '').strip() or code
+                    qty = num(row.get('qty'), True)
+                    level = material_level(row.get('material_level') or d.get('material_level') or 1)
+                    category = str(row.get('category') or '').strip() or BUILTIN_MATERIAL_CATEGORIES[level - 1]
+                    part_id = find_bom_import_part(db, version['product_id'], code, external, name, spec, level, category)
+                    if part_id:
+                        active_part(db, part_id)
+                    else:
+                        if not name:
+                            raise Problem('找不到对应物料，请填写物料名称以便自动新建')
+                        part_id = self.mutate(db, '/api/parts', 'POST', {
+                            'name': name, 'external_code': external, 'spec': spec,
+                            'material_level': level, 'category': category, 'unit': row.get('unit') or 'PCS',
+                            'price': bom_import_price(row.get('price')), 'numbering_product_id': version['product_id'],
+                        })['id']
+                        created += 1
+                    insert_bom_line(db, version['id'], part_id, qty, str(row.get('reference') or ''),
+                                    str(row.get('notes') or ''), upsert=True)
+                    count += 1
+                except Problem as exc:
+                    raise Problem(f'第 {index} 行：{exc.message}', exc.status) from exc
+            log_activity(db, self.user, '导入 BOM', version['product_id'], version['name'],
+                         f'{count} 条明细 · 新建物料 {created} 项')
+            return {'count':count, 'created':created, 'reused':count-created}
         if resource == 'purchases' and method == 'PUT':
             purchase = exists(db, 'purchases', id)
             if set(d) != {'responsible_id'} or not d['responsible_id']:

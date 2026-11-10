@@ -751,10 +751,36 @@ class IntegrationTests(unittest.TestCase):
         p=self.product();v=self.state()['bom_versions'][0]['id']
         self.request('bom-lines','POST',{'version_id':v,'part_id':self.part,'qty':2})
         v2=self.request('bom-versions','POST',{'product_id':p,'name':'V1.1','copy_from':v})['id']
-        self.request('bom-import','POST',{'version_id':v2,'rows':[{'code':self.code,'qty':5},{'code':'NO-PART','qty':1}]},400)
+        self.request('bom-import','POST',{'version_id':v2,'rows':[
+            {'code':self.code,'qty':5},{'name':'应回滚的物料','qty':1},{'code':'NO-PART','qty':1},
+        ]},400)
         self.assertEqual([l['qty'] for l in self.state()['bom_lines']],[2,2])
+        self.assertEqual(len(self.state()['parts']),1)
         self.request('bom-import','POST',{'version_id':v2,'rows':[{'code':self.code,'qty':5}]})
         self.assertEqual([l['qty'] for l in self.state()['bom_lines']],[2,5])
+
+    def test_bom_csv_creates_and_reuses_materials_with_external_or_blank_codes(self):
+        product = self.request('products','POST',{'name':'测试产品','english_code':'TANOS'})['id']
+        version = self.state()['bom_versions'][0]['id']
+        rows = [{'code':'L7-65177','name':'密封泡棉','qty':'1','price':'¥0.41 ','spec':'0.5 mm',
+                 'category':'包装耗材','unit':'张','material_level':'1','reference':'P1','notes':'补齐'},
+                {'name':'螺钉','qty':'2'}]
+        self.assertEqual(self.request('bom-import','POST',{'version_id':version,'rows':rows}),
+                         {'count':2,'created':2,'reused':0})
+        state = self.state()
+        foam = next(p for p in state['parts'] if p['name']=='密封泡棉')
+        self.assertRegex(foam['code'], r'^TA31[0-9]{4}$')
+        self.assertEqual((foam['external_code'],foam['price'],foam['spec'],foam['unit'],foam['numbering_product_id']),
+                         ('L7-65177',0.41,'0.5 mm','张',product))
+        rows[0].update(qty='3',price='¥100.00')
+        self.assertEqual(self.request('bom-import','POST',{'version_id':version,'rows':rows}),
+                         {'count':2,'created':0,'reused':2})
+        state = self.state()
+        self.assertEqual(len(state['parts']),3)
+        self.assertEqual(next(p for p in state['parts'] if p['id']==foam['id'])['price'],0.41)
+        line = next(line for line in state['bom_lines'] if line['part_id']==foam['id'])
+        self.assertEqual((line['qty'],line['reference'],line['notes']),(3,'P1','补齐'))
+
     def test_sub_bom_relationship_is_not_supported(self):
         p=self.product()
         self.request('parts','POST',{'name':'组件','sub_product_id':p},400)
