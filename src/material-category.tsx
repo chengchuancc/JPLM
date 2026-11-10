@@ -1,11 +1,21 @@
 import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, Plus } from "lucide-react";
+import { OptionTag, type OptionTone } from "./option-tag";
 
-export function MaterialCategory({ label, value, options, disabled, autoOpen, onChange, onDismiss }: {
+type PickerProps = {
   label: string; value: string; options: string[]; disabled?: boolean; autoOpen?: boolean;
   onChange: (value: string) => void; onDismiss?: () => void;
-}) {
+};
+type Choice = { value: string; label: string; tone?: OptionTone };
+
+export function MaterialCategory({ options, ...props }: PickerProps) {
+  const choices = [...new Set([...options, props.value].filter(Boolean))].map((value) => ({ value, label: value }));
+  return <TableOptionPicker {...props} choices={choices} allowNew />;
+}
+
+export function TableOptionPicker({ label, value, choices, disabled, autoOpen, onChange, onDismiss, allowNew }:
+  Omit<PickerProps, "options"> & { choices: Choice[]; allowNew?: boolean }) {
   const [position, setPosition] = useState<CSSProperties>();
   const [query, setQuery] = useState("");
   const trigger = useRef<HTMLButtonElement>(null);
@@ -15,9 +25,9 @@ export function MaterialCategory({ label, value, options, disabled, autoOpen, on
   const open = !!position;
   const term = query.trim();
   const normalize = (name: string) => name.normalize("NFKC").toLowerCase();
-  const names = [...new Set([...options, value].filter(Boolean))];
-  const matches = names.filter((name) => normalize(name).includes(normalize(term)));
-  const exact = names.find((name) => normalize(name) === normalize(term));
+  const selected = choices.find((choice) => choice.value === value);
+  const matches = choices.filter((choice) => normalize(choice.label).includes(normalize(term)));
+  const exact = choices.find((choice) => normalize(choice.label) === normalize(term));
   function locate() {
     const anchor = trigger.current?.getBoundingClientRect();
     if (!anchor) return;
@@ -38,7 +48,8 @@ export function MaterialCategory({ label, value, options, disabled, autoOpen, on
   useEffect(() => { if (autoOpen) locate(); }, [autoOpen]);
   useEffect(() => {
     if (!open) return;
-    input.current?.focus({ preventScroll: true });
+    (input.current || popup.current?.querySelector<HTMLElement>('[aria-pressed="true"]') ||
+      popup.current?.querySelector<HTMLElement>("button"))?.focus({ preventScroll: true });
     const outside = (event: PointerEvent) => {
       if (event.target instanceof Node && !trigger.current?.contains(event.target) && !popup.current?.contains(event.target)) dismiss();
     };
@@ -58,22 +69,31 @@ export function MaterialCategory({ label, value, options, disabled, autoOpen, on
     <button ref={trigger} className="material-category-trigger" type="button" aria-label={label}
       aria-expanded={open} aria-controls={open ? id : undefined} disabled={disabled}
       onClick={() => { if (open) dismiss(); else { setQuery(""); locate(); } }}>
-      <span>{value || "选择类别"}</span><ChevronDown size={14} />
+      {selected ? <OptionTag label={selected.label} tone={selected.tone} /> : <span>{allowNew ? "选择类别" : label}</span>}
+      <ChevronDown size={14} />
     </button>
     {open && createPortal(<div className="material-category-popup" ref={popup} id={id} style={position} onKeyDown={(event) => {
       if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); dismiss(); trigger.current?.focus(); }
+      if (event.key === "Tab") { dismiss(); trigger.current?.focus(); }
+      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+        const buttons = [...event.currentTarget.querySelectorAll<HTMLButtonElement>(".material-category-options button:not(:disabled)")];
+        if (!buttons.length) return;
+        const index = buttons.indexOf(document.activeElement as HTMLButtonElement);
+        const next = event.key === "ArrowDown" ? (index + 1) % buttons.length : (index <= 0 ? buttons.length - 1 : index - 1);
+        if (buttons[next]) { event.preventDefault(); buttons[next].focus(); }
+      }
     }}>
-      <input ref={input} aria-label="搜索或新增物料类别" placeholder="搜索或新增类别" maxLength={64}
+      {allowNew && <input ref={input} aria-label="搜索或新增物料类别" placeholder="搜索或新增类别" maxLength={64}
         value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
           if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-            event.preventDefault(); if (term) select(exact || term);
+            event.preventDefault(); if (term) select(exact?.value || term);
           }
-        }} />
-      <div className="material-category-options">{matches.map((name) => <button key={name} type="button"
-        aria-pressed={name === value} onClick={() => select(name)}>
-        <span>{name}</span>{name === value && <Check size={14} />}
+        }} />}
+      <div className="material-category-options">{matches.map((choice) => <button key={choice.value} type="button"
+        disabled={disabled} aria-pressed={choice.value === value} onClick={() => select(choice.value)}>
+        <OptionTag label={choice.label} tone={choice.tone} />{choice.value === value && <Check size={14} />}
       </button>)}</div>
-      {term && !exact && <button className="btn small" type="button" onClick={() => select(term)}>
+      {allowNew && term && !exact && <button className="btn small" type="button" onClick={() => select(term)}>
         <Plus size={14} />新增「{term}」
       </button>}
     </div>, document.body)}

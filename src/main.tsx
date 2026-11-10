@@ -75,7 +75,8 @@ import {
   ColumnVisibility,
   type Column,
 } from "./material-table";
-import { MaterialCategory } from "./material-category";
+import { MaterialCategory, TableOptionPicker } from "./material-category";
+import { OptionTag } from "./option-tag";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
 import { Dialog } from "./dialog";
@@ -2574,6 +2575,7 @@ function Workspace({
               products={state.products.map((product) => ({
                 id: product.id, name: product.name, code: product.code, english_code: product.english_code,
                 project_id: project.id, project_name: project.name,
+                image_id: files("products", product.id).find((file) => file.kind === "image")?.id,
               })).sort((a, b) => a.code.localeCompare(b.code))}
               initialRecord={detail}
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
@@ -6494,7 +6496,9 @@ function InlineCell({
       setBusy(false);
     }
   }
-  if (archived) return <span>{String(value ?? "") || "—"}</span>;
+  const display = options?.find((option) => option.value === String(value))?.label ?? String(value ?? "");
+  const content = display && (options || categoryOptions) ? <OptionTag label={display} /> : display || "—";
+  if (archived) return <span>{content}</span>;
   if (!editing)
     return (
       <button
@@ -6508,10 +6512,7 @@ function InlineCell({
           setEditing(true);
         }}
       >
-        <span className="cell-value">
-          {options?.find((x) => x.value === String(value))?.label ??
-            (String(value ?? "") || "—")}
-        </span>
+        <span className="cell-value">{content}</span>
         <Pencil size={11} />
       </button>
     );
@@ -6520,29 +6521,9 @@ function InlineCell({
       {categoryOptions ? <MaterialCategory label={label} value={draft} options={categoryOptions} disabled={busy}
         autoOpen onDismiss={() => { if (!committing.current) setEditing(false); }}
         onChange={(value) => { setDraft(value); void commit(value); }} /> : options ? (
-        <select
-          autoFocus
-          aria-label={label}
-          disabled={busy}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            commit(e.target.value);
-          }}
-          onBlur={() => commit()}
-          onKeyDown={(e) => {
-            if (e.key === "Escape") {
-              cancelled.current = true;
-              setEditing(false);
-            }
-          }}
-        >
-          {options.map((o) => (
-            <option key={o.value} value={o.value}>
-              {o.label}
-            </option>
-          ))}
-        </select>
+        <TableOptionPicker label={label} value={draft} choices={options} disabled={busy} autoOpen
+          onDismiss={() => { if (!committing.current) setEditing(false); }}
+          onChange={(value) => { setDraft(value); void commit(value); }} />
       ) : (
         <input
           ref={input}

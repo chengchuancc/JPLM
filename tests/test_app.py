@@ -212,6 +212,37 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.request('shipping/orders?status=shipped')['total'], 1)
         self.assertEqual(self.request('shipping/records?channel=ks&status=shipped')['total'], 1)
 
+    def test_shipment_thumbnails_use_product_images_with_project_access(self):
+        product = self.request('products', 'POST', {'name': 'L7'})['id']
+        png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j0i8AAAAASUVORK5CYII=')
+        boundary = 'shipping-product-photo'
+        body = (
+            f'--{boundary}\r\nContent-Disposition: form-data; name="owner_type"\r\n\r\nproducts\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="owner_id"\r\n\r\n{product}\r\n'
+            f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="product.png"\r\n'
+            'Content-Type: image/png\r\n\r\n'
+        ).encode() + png + f'\r\n--{boundary}--\r\n'.encode()
+        image = self.request('files', 'POST', body, headers={
+            'Content-Type': 'multipart/form-data; boundary=' + boundary,
+        })['ids'][0]
+        catalog = self.request('global-shipping/products', project=False)
+        self.assertEqual(next(p for p in catalog if p['id'] == product)['image_id'], image)
+        other = self.request('shipping/records', 'POST', {
+            'channel': 'other', 'reference': '#PHOTO', 'shipment_items': [
+                {'project_id': self.project_id, 'product_id': product, 'quantity': 2},
+            ],
+        })['id']
+        self.assertEqual(self.request('shipping/records/' + other)['shipment_items'][0]['image_id'], image)
+        self.request('shipping/orders/paste', 'POST', {'clipboard': 'Backer Number\t主机\t底座\n21\t2\t1'})
+        order_id = self.request('shipping/orders?q=21')['rows'][0]['id']
+        ks_id = self.request('shipping/records', 'POST', {'channel': 'ks', 'ks_order_id': order_id})['id']
+        for path in ('shipping/orders/' + order_id, 'shipping/records/' + ks_id):
+            previews = self.request(path)['ks_items']
+            self.assertEqual([(p['quantity'], p['image_id']) for p in previews], [(2, image), (1, None)])
+        unrelated = self.request('projects', 'POST', {'name': '其他项目'})['id']
+        self.assertEqual(self.request('shipping/products', project=unrelated), [])
+        self.request('shipping/records/' + other, status=404, project=unrelated)
+
     def test_global_shipping_groups_order_and_limits_shared_project_data(self):
         other = self.request('projects', 'POST', {'name': '配件项目'})['id']
         first = self.request('products', 'POST', {'name': '新主机'})['id']

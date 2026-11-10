@@ -3,7 +3,7 @@ import { ChevronDown, ChevronRight, CornerDownRight, Plus, Search, Trash2 } from
 import { Dialog } from "./dialog";
 import { FieldVisibility } from "./material-table";
 import { formatTime, RelatedRecordDialog, type RelatedTarget } from "./record-details";
-import { CarrierTags, costs, otherContactFields, SourceTag, Status, Tracking,
+import { CarrierTags, CountryTag, costs, otherContactFields, shipmentStatuses, SourceTag, Status, Tracking,
   type Details, type Device, type ProductChoice, type Request, type ShipmentItem } from "./shipping-data";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import { ShippingPicker } from "./shipping-options";
@@ -11,6 +11,8 @@ import { ShippingTableHeader } from "./shipping-table-header";
 import { columnClass, groupedFields, type ShippingColumn } from "./shipping-columns";
 import { useShipmentRowLocation } from "./shipping-location";
 import { DevicePicker } from "./shipping-devices";
+import { TableOptionPicker } from "./material-category";
+import { OptionTag } from "./option-tag";
 
 type Project = { id: string; name: string; archived_at: string | null };
 type RecordRow = {
@@ -78,11 +80,15 @@ function RecordCell({ column, row, projects, open }: {
   column: ShippingColumn; row: RecordRow; projects: Project[]; open: (target: RelatedTarget) => void;
 }) {
   const key = column.key;
-  if (key === "shipment_items") return <ShipmentItems items={row.shipment_items} showProject flagEmpty />;
+  if (key === "shipment_items") return <button type="button" className="shipping-items-open" aria-label="查看发货商品"
+    onClick={() => open({ kind: "shipment", id: row.id, reference: row.reference })}>
+    <ShipmentItems items={row.shipment_items} showProject flagEmpty />
+  </button>;
   if (key === "created_at") return <span>{formatTime(row.created_at)}</span>;
   if (key === "status") return <Status sent={!!row.shipped} />;
   if (key === "source") return <SourceTag value={row.source} />;
   if (key === "carrier") return <CarrierTags value={row.carrier} />;
+  if (key === "country") return <CountryTag value={row.details?.country} />;
   if (key === "tracking") return <Tracking shipment={{ channel: "other", tracking: row.tracking, details: {} }} />;
   if (key === "devices") {
     const first = row.devices?.[0];
@@ -92,9 +98,12 @@ function RecordCell({ column, row, projects, open }: {
       {row.devices!.length > 1 && <small>+{row.devices!.length - 1}</small>}
     </div> : <>—</>;
   }
-  const related = key === "owner" ? recordProjects(row) : null;
-  const value = related ? projects.filter((p) => related.has(p.id)).map((p) => p.name).join("、")
-    : key === "shipped_on" ? row.shipped_on : row.details?.[key];
+  if (key === "owner") {
+    const related = recordProjects(row);
+    return <span className="shipping-carrier-tags">{projects.filter((p) => related.has(p.id)).map((p) =>
+      <OptionTag key={p.id} label={p.name} />)}</span>;
+  }
+  const value = key === "shipped_on" ? row.shipped_on : row.details?.[key];
   return <span title={String(value ?? "")}>{value === "" || value == null ? "—" : value}</span>;
 }
 
@@ -151,10 +160,9 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
         <label>订单号<input value={reference} onChange={(e) => setReference(e.target.value)} maxLength={150} required={!item} disabled={busy} /></label>
         <label>姓名<input value={details.name || ""} onChange={(e) => setField("name", e.target.value)} disabled={busy} /></label>
         <label>运单号<input value={tracking} onChange={(e) => setTracking(e.target.value)} maxLength={500} disabled={busy} /></label>
-        <label>发货进度<select aria-label="发货进度" value={String(details.shipment_status || "")} disabled={busy}
-          onChange={(e) => setField("shipment_status", e.target.value)}>
-          <option value="">自动</option><option value="shipped">已发货</option><option value="pending">待发货</option>
-        </select></label>
+        <div>发货进度<TableOptionPicker label="发货进度" value={String(details.shipment_status || "")} disabled={busy}
+          choices={[{ value: "", label: "自动", tone: "slate" }, ...shipmentStatuses]}
+          onChange={(value) => setField("shipment_status", value)} /></div>
         <label>发货日期<input type="date" value={shippedOn} onChange={(e) => setShippedOn(e.target.value)} disabled={busy} /></label>
         <div className="global-handling-projects">
           <span>经办项目</span>
@@ -173,7 +181,7 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
                       if ((fixedProject || next[0]) !== project) setDevices([]);
                       setSelected(next);
                     }} />
-                  <span>{p.name}{p.id === project && <small> · 主项目</small>}
+                  <span><OptionTag label={p.name} />{p.id === project && <small> · 主项目</small>}
                     {p.id !== project && hasGoods && <small> · 已选商品</small>}</span>
                 </label>;
               })}
@@ -369,13 +377,10 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
           try { localStorage.setItem("plm-global-order-columns", JSON.stringify(next)); }
           catch { /* Column changes still apply to the current view. */ }
         }} />
-        <select aria-label="发货项目" value={project} onChange={(event) => { resetFocus(); setProject(event.target.value); }}>
-          <option value="">全部项目</option>
-          {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-        </select>
-        <select aria-label="订单发货状态" value={status} onChange={(event) => { resetFocus(); setStatus(event.target.value); }}>
-          <option value="">全部状态</option><option value="shipped">已发货</option><option value="pending">待发货</option>
-        </select>
+        <TableOptionPicker label="发货项目" value={project} onChange={(value) => { resetFocus(); setProject(value); }}
+          choices={[{ value: "", label: "全部项目", tone: "slate" }, ...projects.map((p) => ({ value: p.id, label: p.name }))]} />
+        <TableOptionPicker label="订单发货状态" value={status} onChange={(value) => { resetFocus(); setStatus(value); }}
+          choices={[{ value: "", label: "全部状态", tone: "slate" }, ...shipmentStatuses]} />
         {canCreate && <button className="btn primary" type="button" onClick={() => { setNotice(""); setEditor({}); }}>
           <Plus size={15} />登记发货
         </button>}

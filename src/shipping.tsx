@@ -5,12 +5,14 @@ import { FieldVisibility } from "./material-table";
 import { DevicePicker } from "./shipping-devices";
 import { RelatedRecordDialog, formatTime, type RelatedTarget } from "./record-details";
 import { type Request, type Channel, type Order, type Shipment, type Page,
-  path, contactFields, otherContactFields, orderFields, items, costs, isOrder, isShipped, CarrierTags, SourceTag, Status, Tracking, shipmentLabel } from "./shipping-data";
+  path, contactFields, otherContactFields, orderFields, items, costs, isOrder, isShipped, CarrierTags, CountryTag, SourceTag,
+  Status, Tracking, shipmentLabel, shipmentStatuses } from "./shipping-data";
 import { ShippingPicker } from "./shipping-options";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
 import { ShippingTableHeader } from "./shipping-table-header";
 import { useShipmentRowLocation } from "./shipping-location";
+import { TableOptionPicker } from "./material-category";
 import { columnClass, createdColumn, fieldColumns, groupedFields, ksGoodsColumns, productFields, shipmentColumns,
   type ShippingColumn as Column } from "./shipping-columns";
 
@@ -204,6 +206,7 @@ function ShipmentCell({ row, column, edit, editItems, saving, orderLocked, open,
 }) {
   const key = column.key;
   const product = column.product;
+  const openGoods = () => open({ kind: "shipment", id: row.id, reference: shipmentLabel(row) });
   if (product) {
     const match = row.shipment_items.find((item) => item.product_id === product.product_id && item.project_id === product.project_id);
     return editItems ? <input type="number" aria-label={product.name + "数量"} value={match?.quantity ?? ""}
@@ -211,10 +214,15 @@ function ShipmentCell({ row, column, edit, editItems, saving, orderLocked, open,
         const quantity = event.target.valueAsNumber || 0;
         editItems([...row.shipment_items.filter((item) => item !== match),
           ...(quantity ? [{ ...product, available: match?.available, quantity }] : [])]);
-      }} /> : <span className="shipping-quantity">{match?.quantity ?? "—"}</span>;
+      }} /> : match ? <button type="button" className="text-link shipping-quantity"
+      aria-label={"查看发货商品 " + product.name} onClick={openGoods}>{match.quantity}</button>
+      : <span className="shipping-quantity">—</span>;
   }
   if (key === "legacy_items") return <div className="shipping-relation-cell">
-    <ShipmentItems items={row.shipment_items.filter((item) => !item.product_id)} />
+    {row.id && !editItems && row.shipment_items.some((item) => !item.product_id)
+      ? <button type="button" className="shipping-items-open" aria-label="查看未关联商品" onClick={openGoods}>
+        <ShipmentItems items={row.shipment_items.filter((item) => !item.product_id)} />
+      </button> : <ShipmentItems items={row.shipment_items.filter((item) => !item.product_id)} />}
     {editItems && row.shipment_items.some((item) => !item.product_id) && <button type="button" className="shipping-relation-add" disabled={saving}
       aria-label="编辑发货商品" onClick={() => pick("items")}><Plus size={14} /></button>}
   </div>;
@@ -239,13 +247,10 @@ function ShipmentCell({ row, column, edit, editItems, saving, orderLocked, open,
       onClick={() => pick("order")}><Plus size={14} /></button>}
     {!row.ks_order_id && (!edit || orderLocked) && <span className="muted">—</span>}
   </div>;
-  if (key === "status") return edit ? <select aria-label="发货状态" disabled={saving}
+  if (key === "status") return edit ? <TableOptionPicker label="发货状态" disabled={saving}
     value={String(row.details.shipment_status ?? "")}
-    onChange={(event) => edit({ details: { ...row.details, shipment_status: event.target.value } })}>
-    <option value="">自动（{row.shipped_on || row.tracking ? "已发货" : "待发货"}）</option>
-    <option value="shipped">已发货</option>
-    <option value="pending">待发货</option>
-  </select> : <Status sent={isShipped(row)} />;
+    choices={[{ value: "", label: row.shipped_on || row.tracking ? "自动（已发货）" : "自动（待发货）", tone: "slate" }, ...shipmentStatuses]}
+    onChange={(value) => edit({ details: { ...row.details, shipment_status: value } })} /> : <Status sent={isShipped(row)} />;
   if (key === "created_at") return <span>{row.created_at ? formatTime(row.created_at) : "—"}</span>;
   if (key === "carrier") return edit ? <ShippingPicker kind="carriers" request={request} value={row.details.carrier} disabled={saving}
     onChange={(value) => edit({ details: { ...row.details, carrier: value } })} /> : <CarrierTags value={row.details.carrier} />;
@@ -274,6 +279,11 @@ function ShipmentCell({ row, column, edit, editItems, saving, orderLocked, open,
     {row.reference || (row.parent_id ? "子记录" : "查看记录")}</button>;
   if (key === "tracking") return <Tracking shipment={row} />;
   if (key === "source") return <SourceTag value={row.details.source} />;
+  if (key === "country") return <CountryTag value={value} />;
+  if (row.id && row.channel === "ks" && items.some(([field]) => field === key) && Number(value) > 0) {
+    return <button type="button" className="text-link shipping-quantity" aria-label={"查看发货商品 " + column.label}
+      onClick={openGoods}>{value}</button>;
+  }
   return <span title={String(value ?? "")}>{value === "" ? "—" : value ?? "—"}</span>;
 }
 
@@ -689,6 +699,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     if (key === "backer") return <button type="button" className="text-link mono" onClick={() => setDetail(target)}>#{row.backer}</button>;
     if (key === "created_at") return <span>{formatTime(row.created_at)}</span>;
     if (key === "status") return <Status sent={row.shipped > 0} />;
+    if (key === "country") return <CountryTag value={row.details[key]} />;
     if (key === "shipments") return row.shipments > 0 ? <button type="button" className="shipping-chip"
       onClick={() => setDetail(target)}>{row.shipments} 条</button> : "—";
     return <span title={String(row.details[key] ?? "")}>{row.details[key] ?? "—"}</span>;
@@ -775,11 +786,9 @@ export default function ShippingManagement({ request, products, admin, readOnly,
       }}>
         <input aria-label="搜索发货" placeholder={orders ? "Backer 编号、收件人或邮箱" : "订单号、运单号或设备 S/N"}
           value={term} onChange={(event) => setTerm(event.target.value)} />
-        <select aria-label="发货状态" value={status} onChange={(event) => {
-          if (abandon()) { setStatus(event.target.value); resetList(); }
-        }}>
-          <option value="">全部状态</option><option value="shipped">已发货</option><option value="pending">待发货</option>
-        </select>
+        <TableOptionPicker label="发货状态" value={status}
+          choices={[{ value: "", label: "全部状态", tone: "slate" }, ...shipmentStatuses]}
+          onChange={(value) => { if (abandon()) { setStatus(value); resetList(); } }} />
         <button type="submit" className="btn"><Search size={15} />搜索</button>
       </form>
       <div className="shipping-tools">

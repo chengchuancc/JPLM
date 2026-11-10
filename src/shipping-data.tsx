@@ -1,12 +1,16 @@
+import { OptionTag, type OptionTone } from "./option-tag";
+import { countryOption } from "./shipping-countries";
+
 export type Request = (path: string, method?: string, data?: unknown) => Promise<any>;
 export type Channel = "ks" | "other";
 export type Details = Record<string, string | number>;
 export type Order = { id: string; backer: string; details: Details; shipped: number; shipments: number;
   created_at: string; updated_at: string };
 export type Device = { serial: string; registered?: boolean; result?: string; shipments?: string };
-export type ProductChoice = { id: string; name: string; code: string; english_code?: string; project_id: string; project_name: string };
+export type ProductChoice = { id: string; name: string; code: string; english_code?: string; project_id: string;
+  project_name: string; image_id?: string | null };
 export type ShipmentItem = { project_id: string; product_id: string | null; name: string; code?: string;
-  project_name?: string; quantity: number; available?: boolean; legacy_key?: string };
+  project_name?: string; quantity: number; available?: boolean; legacy_key?: string; image_id?: string | null };
 export type Shipment = {
   id: string; channel: Channel; reference: string; ks_order_id: string | null; backer: string | null;
   shipped_on: string; tracking: string; details: Details; order_details: Details; operator: string | null;
@@ -15,6 +19,7 @@ export type Shipment = {
   child_count: number; deleted_at: string | null;
   project_id?: string; shared?: boolean; can_edit_items?: boolean; items_configured: number; shipment_items: ShipmentItem[];
   handling_project_ids?: string[];
+  ks_items?: ShipmentItem[];
 };
 export const shipmentLabel = (row: Pick<Shipment, "reference" | "tracking">) =>
   row.reference || row.tracking || "发货记录";
@@ -39,23 +44,27 @@ export function SourceTag({ value }: { value: string | number | undefined }) {
   const label = String(value ?? "").trim();
   if (!label) return <>—</>;
   const source = label.toLowerCase();
-  const tone = source.includes("amazon") || source.includes("亚马逊") ? "amber" :
+  const tone: OptionTone | undefined = source.includes("amazon") || source.includes("亚马逊") ? "amber" :
     source.includes("shopify") || source.includes("独立站") ? "green" :
     source.includes("kickstarter") || source === "ks" ? "violet" :
     source.includes("aliexpress") || source.includes("速卖通") ? "rose" :
     source.includes("indiegogo") ? "blue" :
-    source.includes("经销") || source.includes("dealer") ? "teal" : "slate";
-  return <span className={"shipping-source " + tone} title={label}>{label}</span>;
+    source.includes("经销") || source.includes("dealer") ? "teal" : source === "其他" ? "slate" : undefined;
+  return <OptionTag label={label} tone={tone} />;
 }
 
 export const carrierNames = (value: string | number | undefined) =>
   [...new Set(String(value ?? "").split("、").map((name) => name.trim()).filter(Boolean))];
 
 export function CarrierTag({ name }: { name: string }) {
-  const colors = ["blue", "rose", "teal", "amber", "violet", "green"];
-  let hash = 0;
-  for (const char of name.toLowerCase()) hash = (Math.imul(hash, 31) + char.codePointAt(0)!) >>> 0;
-  return <span className={"shipping-source " + colors[hash % colors.length]} title={name}>{name}</span>;
+  return <OptionTag label={name} />;
+}
+
+export function CountryTag({ value, localized = false }: { value: string | number | undefined; localized?: boolean }) {
+  const name = String(value ?? "").trim();
+  if (!name) return <>—</>;
+  const country = countryOption(name);
+  return <OptionTag label={localized ? country?.label || name : name} colorKey={country?.code || name} />;
 }
 
 export function CarrierTags({ value }: { value: string | number | undefined }) {
@@ -73,13 +82,16 @@ export function isShipped(row: Pick<Shipment, "shipped_on" | "tracking" | "detai
 }
 
 export function Status({ sent }: { sent: boolean }) {
-  return <span className={"shipping-status" + (sent ? " sent" : "")}>{sent ? "已发货" : "待发货"}</span>;
+  return <OptionTag label={sent ? "已发货" : "待发货"} />;
 }
+
+export const shipmentStatuses = [{ value: "shipped", label: "已发货" }, { value: "pending", label: "待发货" }];
 
 export function DetailsList({ fields, details, showEmpty }: { fields: string[][]; details: Details; showEmpty?: boolean }) {
   return <dl className="shipping-details">{fields.filter(([key]) => showEmpty || (details[key] !== undefined && details[key] !== ""))
     .map(([key, label]) => <div key={key} className={key.startsWith("address") || key === "notes" ? "wide-field" : ""}>
-      <dt>{label}</dt><dd>{details[key] === "" ? "—" : details[key] ?? "—"}</dd>
+      <dt>{label}</dt><dd>{key === "country" ? <CountryTag value={details[key]} />
+        : details[key] === "" ? "—" : details[key] ?? "—"}</dd>
     </div>)}</dl>;
 }
 

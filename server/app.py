@@ -1199,14 +1199,14 @@ class Handler(BaseHTTPRequestHandler):
                 if resource == 'orders':
                     return self.send(shipping.list_orders(db, project_id, query))
                 if order_path:
-                    return self.send(shipping.get_order(db, project_id, order_path[1]))
+                    return self.send(shipping.get_order(db, project_id, order_path[1], images=True))
                 if resource == 'records':
                     allowed = shipping.accessible_projects(db, self.user)
                     return self.send(shipping.list_shipments(db, project_id, query.get('channel'), query, allowed))
                 if record_path:
                     return self.send(shipping.get_shipment(db, project_id, record_path[1],
                                                            shipping.accessible_projects(db, self.user),
-                                                           local=query.get('scope') != 'global'))
+                                                           local=query.get('scope') != 'global', images=True))
                 if children_path:
                     return self.send(shipping.list_children(db, project_id, children_path[1],
                                                            shipping.accessible_projects(db, self.user),

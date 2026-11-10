@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { ChevronDown, Plus } from "lucide-react";
-import { CarrierTag, CarrierTags, SourceTag, carrierNames, path, sources, type Request } from "./shipping-data";
+import { CarrierTag, CarrierTags, CountryTag, SourceTag, carrierNames, path, sources, type Request } from "./shipping-data";
 import { countryOption, countryOptions } from "./shipping-countries";
 
 export function ShippingPicker({ kind, request, value, disabled, onChange, autoOpen, onDismiss }: {
@@ -103,7 +103,7 @@ export function ShippingPicker({ kind, request, value, disabled, onChange, autoO
   return <>
     <button ref={anchor} className="shipping-carrier-trigger" type="button" aria-label={"选择" + label}
       aria-expanded={!!position} aria-controls={position ? panelId : undefined} disabled={disabled} onClick={toggle}>
-      {selected.length ? (multiple ? <CarrierTags value={value} /> : country ? <span>{current}</span> : <SourceTag value={current} />)
+      {selected.length ? (multiple ? <CarrierTags value={value} /> : country ? <CountryTag value={current} /> : <SourceTag value={current} />)
         : <span className="muted">选择{label}</span>}
       <ChevronDown size={14} />
     </button>
@@ -127,7 +127,7 @@ export function ShippingPicker({ kind, request, value, disabled, onChange, autoO
             onChange={() => choose(name)} />
           <CarrierTag name={name} />
         </label> : <button type="button" key={name} aria-pressed={normalize(name) === normalize(current)} onClick={() => choose(name)}>
-          {country ? <><span>{countryOption(name)?.label || name}</span>{countryOption(name) && <small>{name}</small>}</>
+          {country ? <><CountryTag value={name} localized />{countryOption(name) && <small>{name}</small>}</>
             : <SourceTag value={name} />}
         </button>)}
         {!available.length && !canAdd && <span className="muted">没有匹配的{label}</span>}

@@ -197,8 +197,12 @@ def backfill_products(db, only_project=None):
             db.execute('UPDATE shipping_records SET items_configured=1 WHERE project_id=? AND id=?', (project, shipment))
 
 
+PRODUCT_IMAGE = """(SELECT f.id FROM files f WHERE f.project_id=p.project_id
+    AND f.owner_type='products' AND f.owner_id=p.id AND f.kind='image' ORDER BY f.rowid LIMIT 1) AS image_id"""
+
+
 def product_catalog(db, user, project=None):
-    return [dict(p) for p in db.execute("""SELECT p.id,p.name,p.code,p.english_code,p.project_id,j.name AS project_name
+    return [dict(p) for p in db.execute(f"""SELECT p.id,p.name,p.code,p.english_code,p.project_id,j.name AS project_name,{PRODUCT_IMAGE}
         FROM products p JOIN projects j ON j.id=p.project_id
         WHERE j.deleted_at IS NULL AND j.archived_at IS NULL AND (? IS NULL OR j.id=?)
           AND (? OR EXISTS (SELECT 1 FROM project_members m WHERE m.project_id=j.id AND m.user_id=?))
@@ -257,20 +261,42 @@ def check_order_reference(db, reference, projects, previous=''):
         raise ShippingError('订单号已存在，请编辑该订单或登记补发子订单', 409)
 
 
-def shipment_items(db, project, shipment, allowed=None):
+def shipment_items(db, project, shipment, allowed=None, *, images=False):
     result = []
-    for p in db.execute("""SELECT i.product_project_id AS project_id,i.product_id,
+    image_column = ',' + PRODUCT_IMAGE if images else ''
+    for p in db.execute(f"""SELECT i.product_project_id AS project_id,i.product_id,
         coalesce(p.name,i.product_name) AS name,coalesce(p.code,i.product_code) AS code,
-        j.name AS project_name,i.quantity,p.id IS NOT NULL AND j.deleted_at IS NULL AS available
+        j.name AS project_name,i.quantity,p.id IS NOT NULL AND j.deleted_at IS NULL AS available {image_column}
         FROM shipping_items i JOIN projects j ON j.id=i.product_project_id
         LEFT JOIN products p ON p.project_id=i.product_project_id AND p.id=i.product_id
         WHERE i.project_id=? AND i.shipment_id=? ORDER BY j.name,name,code""", (project, shipment)):
         if allowed is not None and p['project_id'] not in allowed:
             continue
         item = dict(p)
+        if images and item['image_id'] is None:
+            del item['image_id']
         if item['product_id'].startswith('unknown:'):
             item.update(legacy_key=item['product_id'], product_id=None)
         result.append(item)
+    return result
+
+
+def ks_item_previews(db, project, details):
+    quantities = legacy_quantities(details)
+    if not quantities:
+        return []
+    products = db.execute(f'SELECT p.id,p.name,p.code,{PRODUCT_IMAGE} FROM products p WHERE p.project_id=?',
+                          (project,)).fetchall()
+    result = []
+    for key, quantity in quantities:
+        names = LEGACY_PRODUCTS[key]
+        matches = [p for p in products if p['name'] in names]
+        product = matches[0] if len(matches) == 1 else None
+        result.append({
+            'project_id': project, 'legacy_key': key, 'quantity': quantity, 'name': names[0],
+            'product_id': product['id'] if product else None,
+            'code': product['code'] if product else None, 'image_id': product['image_id'] if product else None,
+        })
     return result
 
 
@@ -567,14 +593,14 @@ def list_shipments(db, project, channel, query, allowed=None):
             'total': total, 'page': page, 'page_size': PAGE_SIZE, 'location': location}
 
 
-def decode_shipment(row, devices, db, allowed=None, view_project=None):
+def decode_shipment(row, devices, db, allowed=None, view_project=None, *, images=False):
     details = json.loads(row['details'])
     data = {**dict(row), 'details': details, 'order_details': json.loads(row['order_details'] or '{}'),
             'devices': devices, 'shipment_items': []}
     if row['channel'] == 'other':
         shared = view_project is not None and row['project_id'] != view_project
         data['shipment_items'] = shipment_items(db, row['project_id'], row['id'],
-                                                {view_project} if view_project is not None else allowed)
+                                                {view_project} if view_project is not None else allowed, images=images)
         data['handling_project_ids'] = handling_projects(db, row['project_id'], row['id'],
                                                          {view_project} if view_project is not None else allowed)
         if shared:
@@ -589,10 +615,14 @@ def decode_shipment(row, devices, db, allowed=None, view_project=None):
             data['shipment_items'] = [{'project_id': row['project_id'], 'product_id': None, 'legacy_key': key,
                                        'name': LEGACY_PRODUCTS[key][0], 'quantity': quantity, 'available': False}
                                       for key, quantity in legacy_quantities(details)]
+    elif images:
+        previews = ks_item_previews(db, row['project_id'], data['order_details'])
+        if previews:
+            data['ks_items'] = previews
     return data
 
 
-def get_shipment(db, project, shipment_id, allowed=None, *, local=False):
+def get_shipment(db, project, shipment_id, allowed=None, *, local=False, images=False):
     row = db.execute(SHIPMENT_SELECT + ' WHERE s.project_id=? AND s.id=?', (project, shipment_id)).fetchone()
     if not row and local:
         row = db.execute(SHIPMENT_SELECT + f""" WHERE s.id=? AND s.channel='other' AND s.deleted_at IS NULL
@@ -601,7 +631,7 @@ def get_shipment(db, project, shipment_id, allowed=None, *, local=False):
     if not row:
         raise ShippingError('发货记录不存在', 404)
     devices = shipment_devices(db, project, [shipment_id]).get(shipment_id, []) if row['project_id'] == project else []
-    return decode_shipment(row, devices, db, allowed, project if local else None)
+    return decode_shipment(row, devices, db, allowed, project if local else None, images=images)
 
 
 def list_children(db, project, shipment_id, allowed=None, *, local=False):
@@ -707,7 +737,7 @@ def list_orders(db, project, query):
     return {'rows': [decode_order(row) for row in rows], 'total': total, 'page': page, 'page_size': PAGE_SIZE}
 
 
-def get_order(db, project, order_id):
+def get_order(db, project, order_id, *, images=False):
     row = db.execute(f'''SELECT o.*, count(s.id) AS shipments,
         count(CASE WHEN {shipped_condition('s')} THEN 1 END) AS shipped
         FROM shipping_ks_orders o LEFT JOIN shipping_records s ON s.project_id=o.project_id AND s.ks_order_id=o.id
@@ -718,7 +748,12 @@ def get_order(db, project, order_id):
     links = db.execute('''SELECT id,reference,channel,shipped_on,tracking FROM shipping_records
         WHERE project_id=? AND ks_order_id=? AND deleted_at IS NULL ORDER BY created_at DESC,id DESC''',
         (project, order_id))
-    return {**decode_order(row), 'shipment_links': [{**dict(link), 'backer': row['backer']} for link in links]}
+    order = {**decode_order(row), 'shipment_links': [{**dict(link), 'backer': row['backer']} for link in links]}
+    if images:
+        previews = ks_item_previews(db, project, order['details'])
+        if previews:
+            order['ks_items'] = previews
+    return order
 
 
 def find_devices(db, project, query):

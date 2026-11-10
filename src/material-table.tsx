@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
-import { GripVertical, ListFilter, SlidersHorizontal } from "lucide-react";
+import { GripVertical, SlidersHorizontal } from "lucide-react";
+import { TableOptionPicker } from "./material-category";
 
 const fields = {
   code: ["料号", 110],
@@ -332,18 +333,13 @@ export function MaterialTable({
                   )}
                   {id === "category" ? (
                     <div className="column-filter">
-                      <select
-                        aria-label="类别筛选"
-                        title={category ? "类别：" + category : "筛选类别"}
+                      <TableOptionPicker
+                        label="类别筛选"
                         value={category}
-                        onChange={(e) => setCategory(e.target.value)}
-                      >
-                        <option value="">类别</option>
-                        {categoryOptions.map((item) => (
-                          <option key={item}>{item}</option>
-                        ))}
-                      </select>
-                      <ListFilter size={13} aria-hidden="true" />
+                        choices={[{ value: "", label: "类别", tone: "slate" },
+                          ...categoryOptions.map((item) => ({ value: item, label: item }))]}
+                        onChange={setCategory}
+                      />
                     </div>
                   ) : (
                     fields[id][0]

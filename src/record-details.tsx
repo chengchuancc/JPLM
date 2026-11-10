@@ -6,7 +6,8 @@ import type { RecordRow } from "./inspection";
 import { contactFields, otherContactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList, isShipped, shipmentLabel,
   type Request, type Order, type Shipment } from "./shipping-data";
 import "./shipping.css";
-import { ShipmentItems } from "./shipping-items";
+import { ShipmentItemPreviews } from "./shipping-items";
+import type { ShipmentItem } from "./shipping-data";
 
 export function formatTime(value: string) {
   const time = new Date(value);
@@ -197,10 +198,12 @@ function ShipmentDetails({ id, request, open, navigation }: {
     </section>}
     {row.channel === "other" &&
       <section className="shipping-detail-section"><h3>发货商品</h3>
-        <ShipmentItems items={row.shipment_items} showProject />
+        <ShipmentItemPreviews items={row.shipment_items} showProject />
       </section>}
     {row.ks_order_id && <section className="shipping-detail-section"><h3>KS 订单数量</h3>
-      <DetailsList fields={[["sku", "SKU"], ...items]} details={row.order_details} showEmpty />
+      {!!row.ks_items?.length && <ShipmentItemPreviews items={row.ks_items} />}
+      <DetailsList fields={[["sku", "SKU"], ...items.filter(([key]) => !row.ks_items?.some((item) => item.legacy_key === key))]}
+        details={row.order_details} showEmpty />
     </section>}
     {!row.shared && <section className="shipping-detail-section"><h3>发货设备 <span className="muted">{row.devices.length} 台</span></h3>
       <ul className="shipping-device-detail">
@@ -219,15 +222,18 @@ function ShipmentDetails({ id, request, open, navigation }: {
 }
 
 function OrderDetails({ id, request, open }: { id: string; request: Request; open: Open }) {
-  const { value: row, error } = useDetail<Order & { shipment_links: ShipmentLink[] }>(request, "shipping/orders/" + id);
+  const { value: row, error } = useDetail<Order & { shipment_links: ShipmentLink[]; ks_items?: ShipmentItem[] }>(request, "shipping/orders/" + id);
   if (!row) return <Loading error={error} />;
   return <>
     <div className="shipping-tools"><Status sent={row.shipped > 0} /><span>发货记录 {row.shipments} 条</span></div>
     <div className="shipping-record-fields">
       <section className="shipping-detail-section"><h3>订单资料</h3>
-        <DetailsList fields={[["created_at", "添加时间"], ...orderFields]} showEmpty
+        <DetailsList fields={[["created_at", "添加时间"], ...orderFields.filter(([key]) => !row.ks_items?.some((item) => item.legacy_key === key))]} showEmpty
           details={{ ...row.details, created_at: formatTime(row.created_at) }} />
       </section>
+      {!!row.ks_items?.length && <section className="shipping-detail-section"><h3>发货商品</h3>
+        <ShipmentItemPreviews items={row.ks_items} />
+      </section>}
     </div>
     {!!row.shipment_links.length && <section className="shipping-detail-section"><h3>关联发货</h3>
       <ShipmentLinks rows={row.shipment_links} open={open} />

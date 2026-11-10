@@ -1,6 +1,7 @@
 import { useState } from "react";
-import { ChevronDown, Link2, Plus, X } from "lucide-react";
+import { ChevronDown, ImageOff, Link2, Plus, X } from "lucide-react";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
+import { OptionTag } from "./option-tag";
 
 export function itemKey(item: ShipmentItem) {
   return item.project_id + "/" + (item.product_id || item.legacy_key);
@@ -17,9 +18,42 @@ export function ShipmentItems({ items, showProject = false, flagEmpty = false }:
   if (!items.length) return flagEmpty ? <span className="shipping-chip shipping-items-empty">未填商品</span> : <span className="muted">—</span>;
   return <span className="shipping-item-tags">{items.map((item) => {
     const name = (showProject && item.project_name ? item.project_name + " / " : "") + item.name + " × " + item.quantity;
-    return <span key={itemKey(item)} className={"shipping-chip" + (!item.product_id || item.available === false ? " unresolved" : "")}
-      title={item.code}>{name}{!item.product_id ? "（待关联）" : item.available === false ? "（产品已移除）" : ""}</span>;
+    return <OptionTag key={itemKey(item)} colorKey={itemKey(item)}
+      tone={!item.product_id || item.available === false ? "amber" : undefined}
+      label={name + (!item.product_id ? "（待关联）" : item.available === false ? "（产品已移除）" : "")} />;
   })}</span>;
+}
+
+function ProductLine({ name, project, code, imageId, colorKey }: {
+  name: string; project?: string; code?: string; imageId?: string | null; colorKey: string;
+}) {
+  const [failed, setFailed] = useState<string>();
+  return <span className="shipping-product-line">
+    <span className="shipping-product-photo">
+      {imageId && imageId !== failed
+        ? <img src={new URL("files/" + encodeURIComponent(imageId), document.baseURI).href}
+          alt="" loading="lazy" onError={() => setFailed(imageId)} />
+        : <ImageOff size={16} aria-label="暂无商品图片" />}
+    </span>
+    <span className="shipping-product-name">
+      <OptionTag label={name} colorKey={colorKey} />
+      {(project || code) && <small>{[project, code].filter(Boolean).join(" · ")}</small>}
+    </span>
+  </span>;
+}
+
+export function ShipmentItemPreviews({ items, showProject }: { items: ShipmentItem[]; showProject?: boolean }) {
+  if (!items.length) return <span className="muted">—</span>;
+  return <ul className="shipping-product-previews">{items.map((item) => (
+    <li key={itemKey(item)}>
+      <ProductLine name={item.name} project={showProject ? item.project_name : undefined} code={item.code}
+        imageId={item.image_id} colorKey={itemKey(item)} />
+      <span className="shipping-preview-quantity">× {item.quantity}
+        {showProject && !item.product_id && <small>待关联</small>}
+        {item.available === false && item.product_id && <small>产品已移除</small>}
+      </span>
+    </li>
+  ))}</ul>;
 }
 
 export function ShipmentItemEditor({ products, items, onChange, showProject, disabled, multi, unknownProject }: {
@@ -28,20 +62,17 @@ export function ShipmentItemEditor({ products, items, onChange, showProject, dis
   unknownProject?: { id: string; name: string };
 }) {
   const [query, setQuery] = useState("");
-  const [selection, setSelection] = useState("");
   const [legacy, setLegacy] = useState("");
   const used = new Set(items.filter((item) => item.product_id).map(itemKey));
   const key = (p: ProductChoice) => p.project_id + "/" + p.id;
   const matches = products.filter((p) => (multi || !used.has(key(p))) && [p.name, p.code, p.english_code, p.project_name]
     .filter(Boolean).join(" ").toLowerCase().includes(query.trim().toLowerCase()));
-  function add(product = matches.find((p) => key(p) === selection)) {
-    if (!product) return;
+  function add(product: ProductChoice) {
     const replaced = items.find((item) => item.legacy_key === legacy);
     const current = items.find((item) => itemKey(item) === key(product));
     onChange([...items.filter((item) => item !== replaced && item !== current), { product_id: product.id, project_id: product.project_id,
-      project_name: product.project_name, name: product.name, code: product.code, available: true,
+      project_name: product.project_name, name: product.name, code: product.code, image_id: product.image_id, available: true,
       quantity: (current?.quantity || 0) + (replaced?.quantity || 1) }]);
-    setSelection("");
     setLegacy("");
   }
   function addUnknown() {
@@ -52,7 +83,9 @@ export function ShipmentItemEditor({ products, items, onChange, showProject, dis
   }
   return <div className="shipping-item-editor">
     {items.map((item) => <div key={itemKey(item)} className="shipping-item-edit-row">
-      <span><strong>{item.name}</strong>{showProject && item.project_name && <small>{item.project_name}</small>}
+      <span><ProductLine name={item.name} project={showProject ? item.project_name : undefined} code={item.code}
+        imageId={item.image_id || products.find((product) => key(product) === itemKey(item))?.image_id}
+        colorKey={itemKey(item)} />
         {!item.product_id && multi && <small className="shipping-unmatched-label">待关联</small>}</span>
       {item.product_id || multi ? <>
         <input type="number" aria-label={item.name + "数量"} min={1} max={1000000000} step={1}
@@ -71,34 +104,28 @@ export function ShipmentItemEditor({ products, items, onChange, showProject, dis
           onClick={() => setLegacy(item.legacy_key || "")}>{legacy === item.legacy_key ? "选择对应商品" : "关联产品"}</button>
       </>}
     </div>)}
-    {multi ? <details className="shipping-multi-picker" open={legacy ? true : undefined}>
+    <details className="shipping-multi-picker" open={legacy ? true : undefined}>
       <summary className="btn"><ChevronDown size={14} />选择发货商品</summary>
       <div className="shipping-multi-options">
-        <input aria-label="搜索产品" placeholder="搜索产品，或填写未关联商品名称" value={query} maxLength={150}
+        <input aria-label="搜索产品" placeholder={unknownProject ? "搜索产品，或填写未关联商品名称" : "搜索产品名称或编号"} value={query} maxLength={150}
           disabled={disabled} onChange={(event) => setQuery(event.target.value)} />
-        <div className="shipping-multi-list">{matches.map((p) => <label key={key(p)}>
-          <input type="checkbox" checked={!legacy && used.has(key(p))} disabled={disabled} onChange={(event) => {
-            if (event.target.checked) add(p);
-            else onChange(items.filter((item) => itemKey(item) !== key(p)));
-          }} />
-          <span>{showProject ? p.project_name + " / " : ""}{p.name} <small>{p.code}</small></span>
-        </label>)}</div>
+        <div className="shipping-multi-list">{matches.map((product) => {
+          const line = <ProductLine name={product.name} project={showProject ? product.project_name : undefined}
+            code={product.code} imageId={product.image_id} colorKey={key(product)} />;
+          return multi ? <label key={key(product)}>
+            <input type="checkbox" checked={!legacy && used.has(key(product))} disabled={disabled} onChange={(event) => {
+              if (event.target.checked) add(product);
+              else onChange(items.filter((item) => itemKey(item) !== key(product)));
+            }} />
+            {line}
+          </label> : <button key={key(product)} type="button" disabled={disabled} onClick={() => add(product)}>{line}</button>;
+        })}</div>
+        {!matches.length && <small className="muted">没有匹配的产品</small>}
         {unknownProject && query.trim() && <button type="button" className="btn small" disabled={disabled} onClick={addUnknown}>
           <Plus size={14} />登记未关联商品「{query.trim()}」
         </button>}
       </div>
-    </details> : <div className="shipping-item-picker">
-      <input aria-label="搜索产品" placeholder="搜索产品名称或编号" disabled={disabled} value={query}
-        onChange={(event) => { setQuery(event.target.value); setSelection(""); }} />
-      <select aria-label="选择发货商品" disabled={disabled || !matches.length} value={selection}
-        onChange={(event) => setSelection(event.target.value)}>
-        <option value="">{matches.length ? "选择发货商品" : "没有匹配的产品"}</option>
-        {matches.map((p) => <option key={key(p)} value={key(p)}>{showProject ? p.project_name + " / " : ""}{p.name} · {p.code}</option>)}
-      </select>
-      <button type="button" className="btn" disabled={disabled || !selection} onClick={() => add()}>
-        <Plus size={14} />{legacy ? "关联" : "添加"}
-      </button>
-    </div>}
+    </details>
   </div>;
 }
 

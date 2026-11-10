@@ -3798,31 +3798,23 @@ button.material-photo {
   position: relative;
   min-width: 0;
 }
-.column-filter select {
-  appearance: none;
+.column-filter .material-category-trigger {
   background: transparent;
   border: 0;
   border-radius: 3px;
   box-shadow: none;
   color: inherit;
-  cursor: pointer;
   font: inherit;
   min-height: 26px;
   min-width: 0;
   width: 100%;
-  padding: 3px 17px 3px 1px;
+  padding: 2px 2px 2px 1px;
 }
-.column-filter select:hover,
-.column-filter select:focus-visible {
+.column-filter .material-category-trigger:hover,
+.column-filter .material-category-trigger:focus-visible {
   background: var(--accent-soft);
 }
-.column-filter > svg {
-  position: absolute;
-  right: 1px;
-  top: 50%;
-  transform: translateY(-50%);
-  pointer-events: none;
-}
+.column-filter .option-tag.slate { background: transparent; color: inherit; padding-inline: 0; }
 .configurable-table th:not(.fixed-code, .fixed-actions) {
   position: relative;
 }
@@ -3869,6 +3861,14 @@ button.material-photo {
   display: flex; align-items: center; justify-content: space-between; gap: 5px; width: 100%; min-height: 32px;
   padding: 4px 8px; border: 1px solid #dce1de; border-radius: 6px; background: #fff; text-align: left;
 }
+.option-tag { display: inline-block; max-width: 100%; padding: 2px 7px; border-radius: 4px; font-weight: 600; white-space: nowrap; }
+.option-tag.amber { background: #fff1cd; color: #704609; }
+.option-tag.green { background: #e0f4e7; color: #1b603f; }
+.option-tag.violet { background: #eee5ff; color: #5d3596; }
+.option-tag.rose { background: #ffe9eb; color: #923549; }
+.option-tag.blue { background: #e3efff; color: #24569a; }
+.option-tag.teal { background: #dcf4f0; color: #18665d; }
+.option-tag.slate { background: #eaf0f6; color: #485b75; }
 .material-category-trigger span, .material-category-options button span {
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
 }
