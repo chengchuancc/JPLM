@@ -281,6 +281,44 @@ class IntegrationTests(unittest.TestCase):
         self.request(child_path, 'DELETE', {'version': child['updated_at']}, project=False)
         self.assertEqual(self.request('shipping/records?channel=other&deleted=1')['rows'][0]['id'], child['id'])
 
+    def test_global_order_handling_projects_are_shared_without_product_lines(self):
+        other = self.request('projects', 'POST', {'name': '协办项目'})['id']
+        unrelated = self.request('projects', 'POST', {'name': '无关项目'})['id']
+        path = 'global-shipping/orders'
+        payload = {'project_id': self.project_id, 'reference': '#HANDLING', 'tracking': 'YT-HANDLING',
+                   'details': {'name': '仅主项目可见'}, 'handling_project_ids': [self.project_id, other]}
+        record = self.request(path, 'POST', payload, project=False)
+        self.assertEqual(record['handling_project_ids'], [other])
+        self.assertEqual(record['shipment_items'], [])
+        for project in (self.project_id, other):
+            result = self.request('shipping/records?channel=other', project=project)['rows']
+            self.assertEqual([row['id'] for row in result], [record['id']])
+        self.assertEqual(self.request('shipping/records?channel=other', project=unrelated)['total'], 0)
+        archive = self.request('backup', raw=True)
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            backup = directory / 'backup.zip'
+            backup.write_bytes(archive)
+            staged, _ = app.stage_restore(backup, directory)
+            with app.connect(staged) as db:
+                self.assertEqual(app.shipping.handling_projects(db, self.project_id, record['id']), [other])
+        admin = self.cookie
+        account = {'name': '协办成员', 'email': 'handling@example.test', 'password': 'member'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('projects/' + other, 'PUT', {'members': [member]})
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+        shared = self.request(path + '?project=' + other, project=False)['rows'][0]['packages'][0]
+        self.assertEqual(shared['handling_project_ids'], [other])
+        self.assertNotIn('details', shared)
+        self.assertEqual(self.request('shipping/records/' + record['id'], project=other)['tracking'], 'YT-HANDLING')
+        self.cookie = admin
+        edit_path = path + '/' + self.project_id + '/' + record['id']
+        updated = self.request(edit_path, 'PUT', {**payload, 'version': record['updated_at'],
+                                                 'handling_project_ids': []}, project=False)
+        self.assertEqual(updated['handling_project_ids'], [])
+        self.assertEqual(self.request('shipping/records?channel=other', project=other)['total'], 0)
+
     def test_shipping_clipboard_paste_and_creation_order(self):
         paste = 'shipping/orders/paste'
         result = self.request(paste, 'POST', {

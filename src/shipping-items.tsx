@@ -11,17 +11,14 @@ export function itemPayload(items: ShipmentItem[]) {
     ? { project_id, product_id, quantity } : { project_id, product_id, quantity, name, legacy_key });
 }
 
-export function ShipmentItems({ items, links = false, showProject = false, flagEmpty = false }: {
-  items: ShipmentItem[]; links?: boolean; showProject?: boolean; flagEmpty?: boolean;
+export function ShipmentItems({ items, showProject = false, flagEmpty = false }: {
+  items: ShipmentItem[]; showProject?: boolean; flagEmpty?: boolean;
 }) {
   if (!items.length) return flagEmpty ? <span className="shipping-chip shipping-items-empty">未填商品</span> : <span className="muted">—</span>;
   return <span className="shipping-item-tags">{items.map((item) => {
     const name = (showProject && item.project_name ? item.project_name + " / " : "") + item.name + " × " + item.quantity;
-    return links && item.product_id && item.available ?
-      <a key={itemKey(item)} className="shipping-chip" href={"#projects/" + item.project_id + "/products/" + item.product_id}
-        title={item.code}>{name}</a> :
-      <span key={itemKey(item)} className={"shipping-chip" + (!item.product_id || item.available === false ? " unresolved" : "")}
-        title={item.code}>{name}{!item.product_id ? "（待关联）" : item.available === false ? "（产品已移除）" : ""}</span>;
+    return <span key={itemKey(item)} className={"shipping-chip" + (!item.product_id || item.available === false ? " unresolved" : "")}
+      title={item.code}>{name}{!item.product_id ? "（待关联）" : item.available === false ? "（产品已移除）" : ""}</span>;
   })}</span>;
 }
 

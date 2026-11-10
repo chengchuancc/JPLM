@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, CornerDownRight, Plus, Search, Trash2 } from "lucide-react";
 import { Dialog } from "./dialog";
 import { FieldVisibility } from "./material-table";
@@ -18,6 +18,7 @@ type RecordRow = {
   tracking: string; shipped_on: string; shipped: boolean; source: string; carrier: string;
   created_at: string; updated_at: string; details?: Details; devices?: Device[];
   shipment_items: ShipmentItem[]; can_open: boolean; can_edit: boolean;
+  handling_project_ids: string[];
 };
 type Order = { order_key: string; order_number: string; packages: RecordRow[] };
 type Page = { rows: Order[]; total: number; page: number; page_size: number; projects: Project[];
@@ -69,7 +70,13 @@ function orderRows(order: Order) {
   return ordered;
 }
 
-function RecordCell({ column, row, open }: { column: ShippingColumn; row: RecordRow; open: (target: RelatedTarget) => void }) {
+function recordProjects(row: RecordRow) {
+  return new Set([row.project_id, ...(row.handling_project_ids || []), ...row.shipment_items.map((item) => item.project_id)]);
+}
+
+function RecordCell({ column, row, projects, open }: {
+  column: ShippingColumn; row: RecordRow; projects: Project[]; open: (target: RelatedTarget) => void;
+}) {
   const key = column.key;
   if (key === "shipment_items") return <ShipmentItems items={row.shipment_items} showProject flagEmpty />;
   if (key === "created_at") return <span>{formatTime(row.created_at)}</span>;
@@ -85,7 +92,9 @@ function RecordCell({ column, row, open }: { column: ShippingColumn; row: Record
       {row.devices!.length > 1 && <small>+{row.devices!.length - 1}</small>}
     </div> : <>—</>;
   }
-  const value = key === "shipped_on" ? row.shipped_on : key === "owner" ? row.project_name : row.details?.[key];
+  const related = key === "owner" ? recordProjects(row) : null;
+  const value = related ? projects.filter((p) => related.has(p.id)).map((p) => p.name).join("、")
+    : key === "shipped_on" ? row.shipped_on : row.details?.[key];
   return <span title={String(value ?? "")}>{value === "" || value == null ? "—" : value}</span>;
 }
 
@@ -95,7 +104,12 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
 }) {
   const { item, parent } = editor;
   const writable = projects.filter((p) => !p.archived_at);
-  const [project, setProject] = useState(item?.project_id || parent?.project_id || (writable.length === 1 ? writable[0].id : ""));
+  const fixedProject = item?.project_id || parent?.project_id;
+  const [selected, setSelected] = useState(() => {
+    const record = item || parent;
+    return record ? [...recordProjects(record)] : writable.length === 1 ? [writable[0].id] : [];
+  });
+  const project = fixedProject || selected[0] || "";
   const [reference, setReference] = useState(item?.reference ?? parent?.reference ?? "");
   const [tracking, setTracking] = useState(item?.tracking || "");
   const [shippedOn, setShippedOn] = useState(item?.shipped_on || "");
@@ -112,6 +126,8 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const projectOption = writable.find((p) => p.id === project);
+  const selectedNames = projects.filter((p) => selected.includes(p.id)).map((p) => p.name);
+  const scopedProducts = products.filter((p) => selected.includes(p.project_id));
   const setField = (key: string, value: string) => setDetails((previous) => ({ ...previous, [key]: value }));
   const title = item ? "编辑发货" : parent ? "登记补发子订单" : "登记发货";
   return <Dialog title={title} onClose={() => { if (!busy) close(); }} wide>
@@ -123,6 +139,7 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
         const path = "global-shipping/orders" + (item ? "/" + project + "/" + item.id : "");
         const row = await request(path, item ? "PUT" : "POST", {
           project_id: project, reference, tracking, shipped_on: shippedOn, details,
+          handling_project_ids: writable.filter((p) => selected.includes(p.id)).map((p) => p.id),
           shipment_items: itemPayload(items), devices: devices.map((device) => device.serial),
           version: item?.updated_at, parent_id: parent?.id,
         });
@@ -139,13 +156,30 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
           <option value="">自动</option><option value="shipped">已发货</option><option value="pending">待发货</option>
         </select></label>
         <label>发货日期<input type="date" value={shippedOn} onChange={(e) => setShippedOn(e.target.value)} disabled={busy} /></label>
-        <label>经办项目<select aria-label="经办项目" value={project} onChange={(event) => {
-          setProject(event.target.value); setDevices([]);
-        }}
-          required disabled={busy || !!item || !!parent}>
-          <option value="">选择项目</option>
-          {writable.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
-        </select></label>
+        <div className="global-handling-projects">
+          <span>经办项目</span>
+          <details className="shipping-multi-picker">
+            <summary className="btn" aria-label="选择经办项目"><ChevronDown size={14} />
+              <span title={selectedNames.join("、")}>{selectedNames.join("、") || "选择经办项目"}</span>
+            </summary>
+            <div className="shipping-multi-options shipping-multi-list">
+              {projects.map((p) => {
+                const hasGoods = items.some((line) => line.project_id === p.id);
+                return <label key={p.id}>
+                  <input type="checkbox" checked={selected.includes(p.id)}
+                    disabled={busy || !!p.archived_at || p.id === fixedProject || hasGoods}
+                    onChange={(event) => {
+                      const next = event.target.checked ? [...selected, p.id] : selected.filter((id) => id !== p.id);
+                      if ((fixedProject || next[0]) !== project) setDevices([]);
+                      setSelected(next);
+                    }} />
+                  <span>{p.name}{p.id === project && <small> · 主项目</small>}
+                    {p.id !== project && hasGoods && <small> · 已选商品</small>}</span>
+                </label>;
+              })}
+            </div>
+          </details>
+        </div>
         {project && <>
           <div>国家 / 地区<ShippingPicker kind="country" request={projectRequest(project)} value={details.country}
             disabled={busy} onChange={(value) => setField("country", value)} /></div>
@@ -158,10 +192,9 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
           <label key={key}>{label}<input value={details[key] ?? ""} onChange={(e) => setField(key, e.target.value)} disabled={busy} /></label>)}
       </div>
       <h3>发货商品</h3>
-      <ShipmentItemEditor products={products} items={items} onChange={(next) => {
-        setItems(next);
-        if (!project && next[0]) setProject(next[0].project_id);
-      }} disabled={busy} showProject multi unknownProject={projectOption} />
+      {selected.length ? <ShipmentItemEditor products={scopedProducts} items={items} onChange={setItems}
+        disabled={busy} showProject multi unknownProject={projectOption} />
+        : <p className="muted">请先选择经办项目</p>}
       {!!locked.length && <ShipmentItems items={locked} showProject />}
       {project && <details className="global-order-extra"><summary>发货设备{devices.length ? " · " + devices.length + " 台" : ""}</summary>
         <DevicePicker key={project} request={projectRequest(project)} devices={devices} setDevices={setDevices} />
@@ -190,7 +223,9 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   const [search, setSearch] = useState("");
   const [project, setProject] = useState("");
   const [status, setStatus] = useState("");
-  const [page, setPage] = useState(1);
+  const [range, setRange] = useState({ first: 1, last: 1 });
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreError, setMoreError] = useState("");
   const [revision, setRevision] = useState(0);
   const [busy, setBusy] = useState(true);
   const [deleting, setDeleting] = useState(false);
@@ -203,6 +238,11 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   const [focused, setFocused] = useState(initialRecord);
   const pending = useRef(initialRecord);
   const grid = useRef<HTMLDivElement>(null);
+  const top = useRef<HTMLDivElement>(null);
+  const tail = useRef<HTMLDivElement>(null);
+  const generation = useRef(0);
+  const moreRequest = useRef(false);
+  const scrollAnchor = useRef<{ height: number; top: number }>(undefined);
   const [hidden, setHidden] = useState<string[]>(() => {
     try {
       const value = JSON.parse(localStorage.getItem("plm-global-order-columns") || "null");
@@ -215,7 +255,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   const tableWidth = displayed.reduce((total, column) => total + column.width, 156);
   useShipmentRowLocation(grid, focused, !!data && !busy);
   function open(row: RecordRow, target?: RelatedTarget) {
-    const scope = row.can_open ? row.project_id : row.shipment_items[0]?.project_id;
+    const scope = row.can_open ? row.project_id : row.shipment_items[0]?.project_id || row.handling_project_ids?.[0];
     if (scope) setDetail({ project: scope, full: row.can_open,
       target: target || { kind: "shipment", id: row.id, reference: row.reference } });
   }
@@ -225,23 +265,69 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   }, [!!editor]);
   useEffect(() => {
     let active = true;
-    setBusy(true); setError("");
-    const query = new URLSearchParams({ q: search, project, status, page: String(page) });
+    const epoch = ++generation.current;
+    moreRequest.current = false;
+    scrollAnchor.current = undefined;
+    setBusy(true); setError(""); setMoreError(""); setLoadingMore(false);
+    const query = new URLSearchParams({ q: search, project, status });
     if (pending.current) query.set("locate", pending.current);
     request("global-shipping/orders?" + query).then((value: Page) => {
       if (!active) return;
       if (value.location) {
         pending.current = "";
-        setPage(value.page);
         const group = value.rows.find((row) => row.order_key === value.location!.order_key);
         if (group && orderRows(group)[0]?.row.id !== value.location.id) {
           setOpened((previous) => ({ ...previous, [value.location!.order_key]: true }));
         }
       }
+      setRange({ first: value.page, last: value.page });
       setData(value);
     }, (e) => { if (active) setError(e.message); }).finally(() => { if (active) setBusy(false); });
-    return () => { active = false; };
-  }, [request, search, project, status, page, revision]);
+    return () => { active = false; if (epoch === generation.current) generation.current++; };
+  }, [request, search, project, status, revision]);
+  useLayoutEffect(() => {
+    const anchor = scrollAnchor.current;
+    const container = grid.current;
+    if (anchor && container) {
+      container.scrollTop = anchor.top + container.scrollHeight - anchor.height;
+      scrollAnchor.current = undefined;
+    }
+  }, [data?.rows]);
+  useEffect(() => {
+    if (!data || busy || loadingMore || moreError || error) return;
+    const hasEarlier = range.first > 1;
+    const hasLater = range.last * data.page_size < data.total;
+    if (!hasEarlier && !hasLater) return;
+    const observer = new IntersectionObserver((entries) => {
+      if (moreRequest.current) return;
+      const direction = entries.some((entry) => entry.isIntersecting && entry.target === top.current) ? -1
+        : entries.some((entry) => entry.isIntersecting && entry.target === tail.current) ? 1 : 0;
+      if (!direction) return;
+      const target = direction === -1 ? range.first - 1 : range.last + 1;
+      const epoch = generation.current;
+      moreRequest.current = true;
+      setLoadingMore(true);
+      const query = new URLSearchParams({ q: search, project, status, page: String(target) });
+      request("global-shipping/orders?" + query).then((next: Page) => {
+        if (epoch !== generation.current) return;
+        if (direction < 0 && grid.current) {
+          scrollAnchor.current = { height: grid.current.scrollHeight, top: grid.current.scrollTop };
+        }
+        setData((current) => {
+          if (!current) return next;
+          const fetched = new Set(next.rows.map((row) => row.order_key));
+          const retained = current.rows.filter((row) => !fetched.has(row.order_key));
+          return { ...next, rows: direction < 0 ? [...next.rows, ...retained] : [...retained, ...next.rows] };
+        });
+        setRange((current) => direction < 0 ? { ...current, first: target } : { ...current, last: target });
+      }, (e) => { if (epoch === generation.current) setMoreError(e.message); }).finally(() => {
+        if (epoch === generation.current) { moreRequest.current = false; setLoadingMore(false); }
+      });
+    }, { root: grid.current, rootMargin: "100px 0px 200px 0px" });
+    if (hasEarlier && top.current) observer.observe(top.current);
+    if (hasLater && tail.current) observer.observe(tail.current);
+    return () => observer.disconnect();
+  }, [data, busy, loadingMore, moreError, error, range, request, search, project, status]);
   useEffect(() => {
     let active = true;
     request("global-shipping/products").then((result) => { if (active) setCatalog(result); },
@@ -249,7 +335,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     return () => { active = false; };
   }, [request, revision]);
 
-  function resetFocus() { pending.current = ""; setFocused(""); setPage(1); }
+  function resetFocus() { pending.current = ""; setFocused(""); grid.current?.scrollTo({ top: 0 }); }
   function afterSave(id: string) {
     setEditor(undefined); setNotice("发货记录已保存");
     setSearch(""); setQuery(""); setProject(""); setStatus("");
@@ -261,7 +347,8 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     try {
       await request("global-shipping/orders/" + row.project_id + "/" + row.id, "DELETE", { version: row.updated_at });
       if (focused === row.id) setFocused("");
-      if (data?.rows.length === 1 && page > 1) setPage(page - 1);
+      const next = data?.rows.flatMap((order) => order.packages).find((candidate) => candidate.id !== row.id);
+      pending.current = next?.id || "";
       setRevision((value) => value + 1);
       setNotice("已删除，可在项目台账的「已删除」中恢复");
     } catch (e) { setError((e as Error).message); }
@@ -298,6 +385,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     {error && <p role="alert" className="form-error">{error} <button className="btn small" type="button"
       onClick={() => { resetFocus(); setRevision((value) => value + 1); }}>刷新</button></p>}
     <div className="table-wrap shipping-table global-shipping-table" ref={grid} aria-label="全局发货订单" aria-busy={busy}>
+      <div ref={top} className="shipping-scroll-sentinel" aria-hidden="true" />
       <table style={{ width: tableWidth }}>
         <ShippingTableHeader columns={displayed} index actionWidth={111} />
         <tbody>{data?.rows.map((order, index) => {
@@ -314,7 +402,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
             <tr key={row.id} data-shipment-id={row.id}
               className={[depth && "shipping-child-row", row.id === focused && "shipping-located-row"].filter(Boolean).join(" ")}>
               <td className="shipping-row-index">{depth ? <CornerDownRight size={13} aria-label="子订单" />
-                : (page - 1) * (data?.page_size || 50) + index + 1}</td>
+                : (range.first - 1) * (data?.page_size || 50) + index + 1}</td>
               {displayed.map((column) => <td key={column.key} className={columnClass(column)}>
                 {column.key === "reference" ? <div className="shipping-hierarchy" style={{ paddingLeft: Math.min(depth, 2) * 8 }}>
                   {!depth && hasChildren && <button type="button" className="shipping-icon-btn" aria-expanded={expanded}
@@ -326,7 +414,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
                     {row.reference || (!depth ? order.order_number || "无订单号" : "子订单 " + subIndex)}
                   </button>
                   {!depth && hasChildren && <span className="shipping-child-count" title={records.length - 1 + " 个子订单"}>{records.length - 1}</span>}
-                </div> : <RecordCell column={column} row={row} open={(target) => open(row, target)} />}
+                </div> : <RecordCell column={column} row={row} projects={projects} open={(target) => open(row, target)} />}
               </td>)}
               <td className="shipping-row-action">
                 {row.can_edit && <>
@@ -341,17 +429,17 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
         })}</tbody>
       </table>
       {!error && !data?.rows.length && <p className="shipping-empty">{busy ? "正在加载…" : "暂无发货订单"}</p>}
+      <div ref={tail} className="shipping-scroll-sentinel" aria-hidden="true" />
     </div>
     <div className="shipping-count global-shipping-paging">
-      <span>共 {data?.total || 0} 个订单</span>
-      <button className="btn small" type="button" disabled={busy || page <= 1} onClick={() => { setFocused(""); setPage(page - 1); }}>上一页</button>
-      <button className="btn small" type="button" disabled={busy || !data || page * data.page_size >= data.total}
-        onClick={() => { setFocused(""); setPage(page + 1); }}>下一页</button>
+      <span role="status">已显示 {data?.rows.length || 0} / {data?.total || 0} 个订单{loadingMore ? " · 加载中…" : ""}</span>
+      {moreError && <button className="btn small" type="button" onClick={() => setMoreError("")}>加载失败，重试</button>}
     </div>
     {detail && <RelatedRecordDialog target={detail.target} request={(path, method, payload) =>
       projectRequest(detail.project)(detail.full && path.startsWith("shipping/records/") ? path + "?scope=global" : path, method, payload)}
       close={() => setDetail(undefined)} shipmentNavigation={(row) => {
-        const scopes = new Set([detail.project, row.project_id, ...row.shipment_items.map((item) => item.project_id)]);
+        const scopes = new Set([detail.project, row.project_id, ...(row.handling_project_ids || []),
+          ...row.shipment_items.map((item) => item.project_id)]);
         return projects.filter((p) => scopes.has(p.id)).map((p) => <a className="btn small" key={p.id}
           href={"#projects/" + p.id + "/shipping/" + row.id}>定位到 {p.name}</a>);
       }} />}

@@ -35,8 +35,9 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-table {
   --shipping-group-height: 26px;
   position: relative; overflow: auto;
-  overscroll-behavior: contain; scrollbar-gutter: stable;
+  overscroll-behavior: contain; scrollbar-gutter: stable; overflow-anchor: none;
 }
+.shipping-scroll-sentinel { height: 1px; width: 100%; }
 .shipping-table table { table-layout: fixed; border-collapse: separate; border-spacing: 0; min-width: 100%; }
 .shipping-table th, .shipping-table td {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis; height: 36px;
@@ -105,7 +106,6 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 }
 .shipping-chip:hover, .shipping-relation-add:hover { border-color: #779ad8; }
 .shipping-goods .shipping-chip { color: #24583c; background: #e0f0e6; }
-.shipping-goods a.shipping-chip:hover { border-color: #6ba588; }
 .shipping-chip.unresolved { background: #fff1d0; color: #69470b; }
 .shipping-relation-add { padding: 2px 4px; }
 .shipping-load-tail { min-height: 2px; }
@@ -178,7 +178,7 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-record-fields .shipping-details dd { margin: 0; }
 .shipping-detail-back { margin-bottom: 8px; }
 .shipping-detail-empty { margin-top: 12px; }
-.shipping-detail-navigation, .shipping-location-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.shipping-detail-navigation { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .shipping-detail-navigation:not(:empty) { margin: 8px 0; }
 .shipping-global-jump { min-width: 19px; padding-inline: 2px; }
 .shipping-item-tags { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
@@ -214,6 +214,13 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .global-shipping-form { display: grid; gap: 10px; }
 .global-shipping-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
 .global-shipping-fields > :is(label, div) { display: grid; align-content: start; gap: 3px; min-width: 0; }
+.global-handling-projects details { position: relative; min-width: 0; }
+.global-handling-projects summary { width: 100%; justify-content: flex-start; }
+.global-handling-projects summary svg { flex-shrink: 0; }
+.global-handling-projects summary span { overflow: hidden; text-overflow: ellipsis; }
+.global-handling-projects .shipping-multi-options {
+  position: absolute; inset: 100% 0 auto; z-index: 2; margin: 4px 0 0; box-shadow: 0 5px 12px #23385922;
+}
 .global-order-extra > summary { cursor: pointer; color: #3e5678; }
 .global-order-extra[open] > summary { margin-bottom: 6px; }
 @media (min-width: 761px) {

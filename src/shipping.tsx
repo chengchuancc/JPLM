@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent, type ReactNode } from "react";
+import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, CornerDownRight, ExternalLink, Link2, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
 import { Dialog } from "./dialog";
 import { FieldVisibility } from "./material-table";
@@ -318,7 +318,9 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   const [orderEdit, setOrderEdit] = useState<{ row: Order; key: string; value: string }>();
   const orderSaving = useRef(false);
   const grid = useRef<HTMLDivElement>(null);
+  const top = useRef<HTMLDivElement>(null);
   const tail = useRef<HTMLDivElement>(null);
+  const scrollAnchor = useRef<{ height: number; top: number }>(undefined);
   const view = orders ? "orders" : channel;
   const rows = data?.rows || [];
   const shipmentHistory = rows.flatMap((row) => isOrder(row) ? [] : row.shipment_items);
@@ -366,7 +368,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
 
   useEffect(() => {
     const node = tail.current;
-    if (!node || busy || !more || loadError) return;
+    if (!node || busy || loadingEarlier || !more || loadError) return;
     let requested = false;
     const observer = new IntersectionObserver(([entry]) => {
       if (!entry.isIntersecting || requested) return;
@@ -375,7 +377,27 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     }, { root: grid.current, rootMargin: "0px 0px 220px 0px" });
     observer.observe(node);
     return () => { requested = true; observer.disconnect(); };
-  }, [busy, more, loadError, page]);
+  }, [busy, loadingEarlier, more, loadError, page]);
+  useEffect(() => {
+    const node = top.current;
+    if (!node || firstPage <= 1 || busy || loadingEarlier || loadError) return;
+    let requested = false;
+    const observer = new IntersectionObserver(([entry]) => {
+      if (!entry.isIntersecting || requested) return;
+      requested = true;
+      void loadEarlier();
+    }, { root: grid.current, rootMargin: "100px 0px 0px 0px" });
+    observer.observe(node);
+    return () => { requested = true; observer.disconnect(); };
+  }, [firstPage, busy, loadingEarlier, loadError, grouped, channel]);
+  useLayoutEffect(() => {
+    const anchor = scrollAnchor.current;
+    const container = grid.current;
+    if (anchor && container) {
+      container.scrollTop = anchor.top + container.scrollHeight - anchor.height;
+      scrollAnchor.current = undefined;
+    }
+  }, [data?.rows]);
 
   useEffect(() => {
     onDraftChange(!!edit || !!orderEdit);
@@ -397,6 +419,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   }
   function resetList(scroll = true) {
     listEpoch.current++;
+    scrollAnchor.current = undefined;
     locatePending.current = "";
     setFirstPage(1);
     if (scroll) grid.current?.scrollTo({ top: 0 });
@@ -416,6 +439,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
       if (grouped) query.set("roots", "1");
       const earlier: Page = await request(path + "records?" + query);
       if (epoch !== listEpoch.current) return;
+      if (grid.current) scrollAnchor.current = { height: grid.current.scrollHeight, top: grid.current.scrollTop };
       setData((current) => current && { ...current, rows: [...earlier.rows,
         ...current.rows.filter((row) => !earlier.rows.some((prior) => prior.id === row.id))] });
       setFirstPage(earlier.page);
@@ -790,6 +814,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     <div className="table-wrap shipping-table" ref={grid} aria-busy={busy || saving}
       aria-label={orders ? "KS 发货信息" : "发货台账"} tabIndex={0} onPaste={(event) => void pasteOrders(event)}
       onKeyDown={orderKeys}>
+      <div ref={top} className="shipping-scroll-sentinel" aria-hidden="true" />
       <table style={{ width: tableWidth }}>
         <ShippingTableHeader columns={columns} index actionWidth={readOnly ? undefined : actionWidth} />
         <tbody>
@@ -829,10 +854,8 @@ export default function ShippingManagement({ request, products, admin, readOnly,
       </div>}
       <div ref={tail} className="shipping-load-tail" style={{ width: tableWidth }}>{busy ? "正在加载…" : ""}</div>
     </div>
-    <div className="shipping-count shipping-location-footer" role="status">
-      {firstPage > 1 && <button className="btn small" type="button" disabled={loadingEarlier || busy}
-        onClick={() => void loadEarlier()}>加载前面的记录</button>}
-      <span>已加载 {rows.length} / {data?.total ?? rows.length} {grouped ? "组" : "条"}</span>
+    <div className="shipping-count" role="status">
+      已加载 {rows.length} / {data?.total ?? rows.length} {grouped ? "组" : "条"}{loadingEarlier ? " · 加载中…" : ""}
     </div>
     {detail && <RelatedRecordDialog target={detail} request={request} close={() => setDetail(undefined)}
       shipmentNavigation={(row) => row.channel === "other" && !row.deleted_at &&

@@ -185,7 +185,7 @@ function ShipmentDetails({ id, request, open, navigation }: {
     </section>}
     {row.channel === "other" &&
       <section className="shipping-detail-section"><h3>发货商品</h3>
-        <ShipmentItems items={row.shipment_items} showProject links />
+        <ShipmentItems items={row.shipment_items} showProject />
       </section>}
     {row.ks_order_id && <section className="shipping-detail-section"><h3>KS 订单数量</h3>
       <DetailsList fields={[["sku", "SKU"], ...items]} details={row.order_details} showEmpty />

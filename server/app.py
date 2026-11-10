@@ -655,7 +655,8 @@ def stage_restore(archive_path, directory):
             if version >= 10:
                 project_tables += ('project_covers',)
             inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
-            shipping_tables = (shipping.TABLES if version >= shipping.PRODUCTS_VERSION else
+            shipping_tables = (shipping.TABLES if version >= shipping.HANDLING_PROJECTS_VERSION else
+                               shipping.PRODUCT_TABLES if version >= shipping.PRODUCTS_VERSION else
                                shipping.SOURCE_TABLES if version >= shipping.SOURCES_VERSION else
                                shipping.CARRIER_TABLES if version >= shipping.CREATED_AT_VERSION else
                                shipping.LEGACY_TABLES if version >= shipping.VERSION else ())
@@ -706,6 +707,10 @@ def stage_restore(archive_path, directory):
                     JOIN shipping_records s ON s.project_id=i.project_id AND s.id=i.shipment_id
                     WHERE s.channel<>'other' OR s.items_configured<>1 LIMIT 1""").fetchone():
                     raise Problem('备份中的发货商品关联无效')
+                if version >= shipping.HANDLING_PROJECTS_VERSION and db.execute("""SELECT 1
+                    FROM shipping_handling_projects h JOIN shipping_records s ON s.project_id=h.project_id AND s.id=h.shipment_id
+                    WHERE s.channel<>'other' LIMIT 1""").fetchone():
+                    raise Problem('备份中的经办项目关联无效')
                 db.execute("DELETE FROM settings WHERE key='password'")
                 if version >= 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                     raise Problem('备份中没有管理员账户')
@@ -1088,6 +1093,8 @@ class Handler(BaseHTTPRequestHandler):
                     result = shipping.save_shipment(db, project, record_id, payload, stamp, self.user['id'],
                                                     writable=writable, cross_project=True)
                     reference = result['reference']
+                if method != 'DELETE' and not item_path and 'handling_project_ids' in data:
+                    shipping.save_handling_projects(db, project, record_id, data['handling_project_ids'], writable)
                 touch_project(db)
                 action = '删除发货记录' if method == 'DELETE' else '修改发货商品' if item_path else '修改发货记录' if record_path else '登记发货'
                 log_activity(db, self.user, action, record_id, reference)

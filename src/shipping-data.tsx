@@ -14,6 +14,7 @@ export type Shipment = {
   parent_id: string | null; parent_reference: string | null; parent_tracking: string | null;
   child_count: number; deleted_at: string | null;
   project_id?: string; shared?: boolean; can_edit_items?: boolean; items_configured: number; shipment_items: ShipmentItem[];
+  handling_project_ids?: string[];
 };
 export const shipmentLabel = (row: Pick<Shipment, "reference" | "tracking">) =>
   row.reference || row.tracking || "发货记录";
