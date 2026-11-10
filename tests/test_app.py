@@ -1250,6 +1250,40 @@ class IntegrationTests(unittest.TestCase):
         saved=next(p for p in self.state()['parts'] if p['id']==material)
         self.assertEqual(saved['code'],original);self.assertTrue(saved['code'].startswith('AQ11'))
         self.assertEqual(saved['numbering_product_id'],first)
+    def test_part_bom_edits_share_version_lines_and_preserve_material_number(self):
+        first = self.request('products', 'POST', {'name': '产品A', 'english_code': 'ALPHA'})['id']
+        second = self.request('products', 'POST', {'name': '产品B', 'english_code': 'BETA'})['id']
+        versions = {v['product_id']: v['id'] for v in self.state()['bom_versions']}
+        old_version, new_product_version = versions[first], versions[second]
+        material = self.request('bom-materials', 'POST', {
+            'name': '共享电容', 'material_level': 2, 'version_id': old_version, 'qty': 4,
+        })
+        latest = self.request('bom-versions', 'POST', {'product_id': first, 'copy_from': old_version})['id']
+        latest_line = next(l for l in self.state()['bom_lines'] if l['version_id'] == latest)
+        self.request('bom-lines/' + material['line_id'], 'DELETE')
+        part_path = 'parts/' + material['id']
+        changes = {'add': [new_product_version, latest], 'remove': [material['line_id']]}
+        for _ in range(2):
+            self.request(part_path, 'PUT', {'bom_changes': changes})
+        lines = {l['version_id']: l for l in self.state()['bom_lines']}
+        self.assertEqual(set(lines), {new_product_version, latest})
+        self.assertEqual(lines[latest], latest_line)
+        self.assertEqual((lines[new_product_version]['part_id'], lines[new_product_version]['qty']),
+                         (material['id'], 1))
+
+        other = self.request('projects', 'POST', {'name': '外部项目'})['id']
+        self.request('products', 'POST', {'name': '外部产品'}, project=other)
+        outside_version = self.request('state', project=other)['bom_versions'][0]['id']
+        self.request(part_path, 'PUT', {'bom_changes': {'add': [outside_version], 'remove': [latest_line['id']]}}, 404)
+        self.assertEqual({l['version_id']: l for l in self.state()['bom_lines']}, lines)
+
+        self.request(part_path, 'PUT', {'bom_changes': {'remove': [latest_line['id']]}})
+        state = self.state()
+        self.assertEqual(state['bom_lines'], [lines[new_product_version]])
+        part = next(p for p in state['parts'] if p['id'] == material['id'])
+        self.assertEqual(part['numbering_product_id'], first)
+        self.assertTrue(part['code'].startswith('AL'))
+
     def test_updating_product_english_code_preserves_ids_history_and_aliases(self):
         product=self.request('products','POST',{'name':'产品'})['id'];version=self.state()['bom_versions'][0]['id']
         material=self.request('bom-materials','POST',{'name':'主控板','version_id':version,'category':'电子物料'})['id']

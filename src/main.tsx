@@ -64,6 +64,7 @@ import {
   Quote,
   Purchase,
   Movement,
+  BomLine,
   FileRecord,
   User,
   UserOption,
@@ -332,6 +333,70 @@ function Empty({
 function Badge({ children }: { children: React.ReactNode }) {
   return <span className="badge">{children}</span>;
 }
+type BomLinkOptions = {
+  products: Product[];
+  versions: State["bom_versions"];
+  linked: BomLine[];
+};
+
+function BomLinksInput({
+  products,
+  versions,
+  selected,
+  onChange,
+  disabled,
+}: Omit<BomLinkOptions, "linked"> & {
+  selected: string[];
+  onChange: (ids: string[]) => void;
+  disabled: boolean;
+}) {
+  return (
+    <div className="wide-field bom-links-input">
+      <label className="form-label">
+        关联 BOM
+        <select
+          aria-label="关联 BOM"
+          value=""
+          disabled={disabled}
+          onChange={(event) => {
+            if (event.target.value) onChange([...selected, event.target.value]);
+          }}
+        >
+          <option value="" disabled>选择产品和版本（默认用量 1）</option>
+          {products.map((product) => (
+            <optgroup key={product.id} label={product.name}>
+              {versions.filter((version) => version.product_id === product.id).reverse().map((version) => (
+                <option key={version.id} value={version.id} disabled={selected.includes(version.id)}>
+                  {product.name} · {version.name}
+                </option>
+              ))}
+            </optgroup>
+          ))}
+        </select>
+      </label>
+      {selected.length > 0 && (
+        <div className="selected-records">
+          {selected.map((id) => {
+            const version = versions.find((item) => item.id === id);
+            if (!version) return null;
+            const name = products.find((product) => product.id === version.product_id)?.name;
+            const label = `${name} · ${version.name}`;
+            return (
+              <span className="record-tag" key={id}>
+                {label}
+                <button type="button" disabled={disabled} aria-label={"取消关联 " + label}
+                  onClick={() => onChange(selected.filter((item) => item !== id))}>
+                  <X size={12} />
+                </button>
+              </span>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function EntityForm({
   fields,
   initial = {},
@@ -340,6 +405,7 @@ function EntityForm({
   label = "保存",
   images,
   suppliers,
+  bomLinks,
 }: {
   fields: Field[];
   initial?: any;
@@ -351,11 +417,14 @@ function EntityForm({
     finish: () => Promise<void>;
   };
   suppliers?: { options: SupplierOption[]; linked: string[] };
+  bomLinks?: BomLinkOptions;
 }) {
   const [values, setValues] = useState<any>(initial);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [selected, setSelected] = useState<File[]>([]);
+  const originalBomLines = useRef(bomLinks?.linked || []);
+  const [bomIds, setBomIds] = useState(() => originalBomLines.current.map((line) => line.version_id));
   const originalSuppliers = useRef(suppliers?.linked || []);
   const [supplierDraft, setSupplierDraft] = useState<SupplierDraft>({
     ids: originalSuppliers.current, names: [], pending: "",
@@ -383,9 +452,14 @@ function EntityForm({
         setError("");
         setBusy(true);
         try {
-          await submit(suppliers ? {
-            ...values, supplier_changes: supplierChanges(supplierDraft, originalSuppliers.current),
-          } : values);
+          const payload = { ...values };
+          if (suppliers) payload.supplier_changes = supplierChanges(supplierDraft, originalSuppliers.current);
+          if (bomLinks) {
+            const add = bomIds.filter((id) => !originalBomLines.current.some((line) => line.version_id === id));
+            const remove = originalBomLines.current.filter((line) => !bomIds.includes(line.version_id)).map((line) => line.id);
+            if (add.length || remove.length) payload.bom_changes = { add, remove };
+          }
+          await submit(payload);
           if (images) {
             if (selected.length) {
               await images.upload(selected);
@@ -470,6 +544,8 @@ function EntityForm({
             </label>
             {f.name === "name" && suppliers && <SupplierLinksInput options={suppliers.options}
               draft={supplierDraft} onChange={setSupplierDraft} disabled={busy} />}
+            {f.name === "name" && bomLinks && <BomLinksInput products={bomLinks.products}
+              versions={bomLinks.versions} selected={bomIds} onChange={setBomIds} disabled={busy} />}
           </React.Fragment>
         ))}
       </div>
@@ -1779,6 +1855,10 @@ function Workspace({
   const productHasMovements =
     !!product && state.movements.some((row) => row.product_id === product.id);
   const part = findPart(detail);
+  const partBomLines = part ? state.bom_lines.filter((line) => line.part_id === part.id) : [];
+  const partBomProducts = [...new Set(partBomLines.map((line) =>
+    state.bom_versions.find((item) => item.id === line.version_id)?.product_id,
+  ))].map((id) => state.products.find((item) => item.id === id)?.name).filter(Boolean);
   const purchase = state.purchases.find((p) => p.id === detail);
   const supplier = findSupplier(detail);
   const suppliedMaterials = supplier
@@ -2170,7 +2250,7 @@ function Workspace({
     },
     {
       name: "numbering_product_id",
-      label: "编号所属产品",
+      label: "料号前缀来源",
       create: { resource: "products" },
       options: state.products.map((p) => ({
         value: p.id,
@@ -3529,7 +3609,16 @@ function Workspace({
                     <dl className="info-list">
                       <dt>物料编码</dt>
                       <dd className="mono">{part.code}</dd>
-                      <dt>编号所属产品</dt>
+                      <dt>关联产品</dt>
+                      <dd>
+                        {partBomProducts.length ? (
+                          <button className="text-link" onClick={() => setTab("boms")}>
+                            {partBomProducts.join("、")}
+                            <ChevronRight size={14} />
+                          </button>
+                        ) : "未关联 BOM"}
+                      </dd>
+                      <dt>料号前缀来源</dt>
                       <dd>
                         {findProduct(part.numbering_product_id || "")?.name ||
                           "通用物料"}
@@ -3626,38 +3715,48 @@ function Workspace({
               )}
               {tab === "files" && fileManager("parts", part.id)}
               {tab === "boms" && (
-                <div className="table-wrap">
-                  <table>
-                    <thead>
-                      <tr>
-                        <th>关联产品</th>
-                        <th>BOM 版本</th>
-                        <th className="num">用量</th>
-                        <th>位号</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {state.bom_lines
-                        .filter((l) => l.part_id === part.id)
-                        .map((l) => {
+                <>
+                  {!archived && (
+                    <div className="section-toolbar">
+                      <h3>关联 BOM</h3>
+                      <Button small onClick={() => setModal({ kind: "part", item: part })}>
+                        <Pencil size={14} />
+                        编辑 BOM 关联
+                      </Button>
+                    </div>
+                  )}
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <th>关联产品</th>
+                          <th>BOM 版本</th>
+                          <th className="num">用量</th>
+                          <th>位号</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {partBomLines.map((l) => {
                           const v = state.bom_versions.find(
                             (v) => v.id === l.version_id,
                           );
+                          if (!v) return null;
                           return (
                             <tr key={l.id}>
                               <td>
                                 <button
                                   className="text-link"
                                   onClick={() => {
-                                    go("products", v!.product_id);
-                                    setVersion(v!.id);
+                                    go("products", v.product_id);
+                                    setVersion(v.id);
+                                    setMaterialLevel(part.material_level);
                                   }}
                                 >
-                                  {findProduct(v?.product_id || "")?.name}
+                                  {findProduct(v.product_id)?.name}
                                   <ArrowUpRight size={14} />
                                 </button>
                               </td>
-                              <td>{v?.name}</td>
+                              <td>{v.name}</td>
                               <td className="num">
                                 {amount(l.qty)} {part.unit}
                               </td>
@@ -3665,12 +3764,13 @@ function Workspace({
                             </tr>
                           );
                         })}
-                    </tbody>
-                  </table>
-                  {!state.bom_lines.some((l) => l.part_id === part.id) && (
-                    <Empty text="该物料还未添加到任何 BOM。" />
-                  )}
-                </div>
+                      </tbody>
+                    </table>
+                    {!partBomLines.length && (
+                      <Empty title="未关联 BOM" />
+                    )}
+                  </div>
+                </>
               )}
               {tab === "purchases" && (
                 <div className="table-wrap">
@@ -4599,6 +4699,11 @@ function Workspace({
                     options: supplierOptions,
                     linked: state.quotes.filter((quote) => quote.part_id === modal.item.id)
                       .map((quote) => quote.supplier_id),
+                  } : undefined}
+                  bomLinks={modal.kind === "part" ? {
+                    products: state.products,
+                    versions: state.bom_versions,
+                    linked: state.bom_lines.filter((line) => line.part_id === modal.item.id),
                   } : undefined}
                   onCancel={() => setModal(null)}
                   images={
@@ -7111,10 +7216,10 @@ function ElectronicImportForm({
         </label>
         {!context.version_id && !parent && (
           <label>
-            编号所属产品
+            料号前缀来源
             <ChoiceSelect
               create={{ resource: "products" }}
-              aria-label="导入编号所属产品"
+              aria-label="导入料号前缀来源"
               disabled={busy}
               value={product}
               onValueChange={(id) => {

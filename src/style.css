@@ -3395,6 +3395,9 @@ td .text-link:hover {
 .selected-records:not(:empty) {
   margin-bottom: 13px;
 }
+.bom-links-input .selected-records:not(:empty) {
+  margin: 7px 0 0;
+}
 .supplier-links-input {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;

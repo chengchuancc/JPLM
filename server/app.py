@@ -1643,6 +1643,23 @@ class Handler(BaseHTTPRequestHandler):
         db.executemany('DELETE FROM quotes WHERE project_id=? AND part_id=? AND supplier_id=?',
                        ((db.project_id, part_id, supplier_id) for supplier_id in remove))
 
+    def change_part_boms(self, db, part_id, changes):
+        if not isinstance(changes, dict) or changes.keys() - {'add', 'remove'}:
+            raise Problem('BOM 关联格式错误')
+        add, remove = (changes.get(key, []) for key in ('add', 'remove'))
+        if any(not isinstance(ids, list) or any(not isinstance(value, str) or not value
+                                               for value in ids) for ids in (add, remove)):
+            raise Problem('BOM 关联格式错误')
+        for line_id in dict.fromkeys(remove):
+            if db.execute('SELECT 1 FROM bom_lines WHERE id=? AND part_id=? AND project_id=?',
+                          (line_id, part_id, db.project_id)).fetchone():
+                self.mutate(db, '/api/bom-lines/' + line_id, 'DELETE', {})
+        for version_id in dict.fromkeys(add):
+            if not db.execute('SELECT 1 FROM bom_lines WHERE version_id=? AND part_id=? AND project_id=?',
+                              (version_id, part_id, db.project_id)).fetchone():
+                self.mutate(db, '/api/bom-lines', 'POST',
+                            {'version_id': version_id, 'part_id': part_id, 'qty': 1})
+
     def mutate(self,db,path,method,d):
         seg=path.strip('/').split('/'); resource=seg[1]; id=seg[2] if len(seg)>2 else None
         if resource in ('users', 'account', 'reset-password'):
@@ -1885,6 +1902,8 @@ class Handler(BaseHTTPRequestHandler):
                 if values['material_level']==2: set_material_parents(db,id,parent_ids)
             if resource=='parts' and 'supplier_changes' in d:
                 self.change_part_suppliers(db, id, d['supplier_changes'])
+            if resource=='parts' and 'bom_changes' in d:
+                self.change_part_boms(db, id, d['bom_changes'])
             if resource in ('parts', 'products'):
                 noun = '物料' if resource == 'parts' else '产品'
                 log_activity(db, self.user, ('新增' if method == 'POST' else '修改') + noun,
