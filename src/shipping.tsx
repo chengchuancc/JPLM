@@ -10,6 +10,7 @@ import { type Request, type Channel, type Order, type Device, type Shipment, typ
 import { ShippingPicker } from "./shipping-options";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
+import { ShippingTableHeader, type ShippingGroup } from "./shipping-table-header";
 
 type ImportReport = { added: number; updated: number; unchanged: number; duplicate: number; invalid: number;
   errors: { row: number; error: string }[] };
@@ -150,17 +151,27 @@ function OrderPicker({ request, close, select }: { request: Request; close: () =
   </Dialog>;
 }
 
-type Column = { key: string; label: string; width: number; fixed?: boolean; type?: "date" | "number" | "quantity" };
-const fieldColumns = (fields: string[][], width: number, type?: Column["type"]): Column[] =>
+type Field = { key: string; label: string; width: number; fixed?: boolean; type?: "date" | "number" | "quantity" };
+type Column = Field & { group: ShippingGroup };
+const fieldColumns = (fields: string[][], width: number, type?: Field["type"]): Field[] =>
   fields.map(([key, label]) => ({ key, label, width, type }));
-const createdColumn: Column = { key: "created_at", label: "添加时间 ↓", width: 151 };
+const groupedFields = (group: ShippingGroup, fields: Field[]): Column[] => fields.map((field) => ({ ...field, group }));
+const createdColumn: Field = { key: "created_at", label: "添加时间 ↓", width: 151 };
+const goodsColumns = [...fieldColumns(items, 88, "quantity"), ...fieldColumns([["sku", "SKU"]], 135)];
+const orderContacts = [...contactFields, ["country_code", "国家代码"], ["address_status", "地址确认"]];
+const orderDetailKeys = new Set([...orderContacts, ...items, ["sku"], ["notes"]].map(([key]) => key));
 const orderColumns: Column[] = [
-  { key: "backer", label: "Backer 编号", width: 130, fixed: true },
-  createdColumn,
-  ...fieldColumns(orderFields.filter(([key]) => !items.some(([item]) => item === key)), 145),
-  ...fieldColumns(items, 88, "quantity"),
-  { key: "status", label: "发货状态", width: 96 },
-  { key: "shipments", label: "发货记录", width: 100 },
+  ...groupedFields("order", [
+    { key: "backer", label: "Backer 编号", width: 130, fixed: true }, createdColumn,
+    ...fieldColumns(orderFields.filter(([key]) => !orderDetailKeys.has(key)), 145),
+  ]),
+  ...groupedFields("goods", goodsColumns),
+  ...groupedFields("transport", [
+    { key: "status", label: "发货状态", width: 96 },
+    { key: "shipments", label: "发货记录", width: 100 },
+  ]),
+  ...groupedFields("customer", fieldColumns(orderContacts, 145)),
+  ...groupedFields("notes", [{ key: "notes", label: "备注", width: 192 }]),
 ];
 const orderWritable = (key: string) => key === "backer" || orderFields.some(([field]) => field === key);
 const orderMovement: Record<string, [number, number]> = {
@@ -169,22 +180,29 @@ const orderMovement: Record<string, [number, number]> = {
 function shipmentColumns(channel: Channel): Column[] {
   const contacts = channel === "ks" ? contactFields : otherContactFields;
   return [
-    { key: "reference", label: channel === "ks" ? "发货编号" : "订单号", width: 170, fixed: true },
-    createdColumn,
-    { key: channel === "ks" ? "backer" : "source", label: channel === "ks" ? "Backer 编号" : "来源", width: 120 },
-    { key: "devices", label: "发货设备 S/N", width: 146 },
-    { key: "shipped_on", label: "发货日期", width: 135, type: "date" },
-    { key: "tracking", label: "运单号", width: 175 },
-    { key: "status", label: "发货状态", width: 94 },
-    { key: "carrier", label: "货代 / 承运商", width: 190 },
-    ...fieldColumns(contacts.filter(([key]) => ["name", "country"].includes(key)), 125),
-    ...(channel === "ks" ? [...fieldColumns(items, 88, "quantity"), ...fieldColumns([["sku", "SKU"]], 135)]
-      : [{ key: "shipment_items", label: "发货商品", width: 275 }]),
-    ...fieldColumns(costs, 100, "number"),
-    ...fieldColumns(contacts.filter(([key]) => !["name", "country"].includes(key)), 158),
-    { key: "notes", label: "备注", width: 192 },
+    ...groupedFields("order", [
+      { key: "reference", label: channel === "ks" ? "发货编号" : "订单号", width: 170, fixed: true },
+      createdColumn,
+      { key: channel === "ks" ? "backer" : "source", label: channel === "ks" ? "Backer 编号" : "来源", width: 120 },
+    ]),
+    ...groupedFields("goods", channel === "ks" ? goodsColumns : [{ key: "shipment_items", label: "发货商品", width: 275 }]),
+    ...groupedFields("transport", [
+      { key: "devices", label: "发货设备 S/N", width: 146 },
+      { key: "shipped_on", label: "发货日期", width: 135, type: "date" },
+      { key: "tracking", label: "运单号", width: 175 },
+      { key: "status", label: "发货状态", width: 94 },
+      { key: "carrier", label: "货代 / 承运商", width: 190 },
+      ...fieldColumns(costs, 100, "number"),
+    ]),
+    ...groupedFields("customer", contacts.map(([key, label]) => ({
+      key, label, width: key === "name" || key === "country" ? 125 : 158,
+    }))),
+    ...groupedFields("notes", [{ key: "notes", label: "备注", width: 192 }]),
   ];
 }
+
+const columnClass = (column: Column) =>
+  column.fixed ? "shipping-record-key" : column.group === "goods" ? "shipping-goods" : "";
 
 function isOrderField(channel: Channel, key: string) {
   return channel === "ks" && (key === "sku" || [...contactFields, ...items].some(([field]) => field === key));
@@ -714,7 +732,7 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
       <td className="shipping-row-index">{writable && !editing && <button type="button" className="shipping-mobile-edit"
         aria-label={"编辑第 " + index + " 行"} title="编辑" disabled={saving} onClick={() => begin(row)}><Pencil size={12} /></button>}
         {index}</td>
-      {columns.map((column) => <td key={column.key} onDoubleClick={(event) => {
+      {columns.map((column) => <td key={column.key} className={columnClass(column)} onDoubleClick={(event) => {
         if (writable && !editing && !["reference", "backer", "devices", "tracking", "created_at"].includes(column.key) &&
           !isOrderField(channel, column.key)) {
           const cell = event.currentTarget;
@@ -818,20 +836,15 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
       aria-label={orders ? "KS 发货信息" : "发货台账"} tabIndex={0} onPaste={(event) => void pasteOrders(event)}
       onKeyDown={orderKeys}>
       <table style={{ width: tableWidth }}>
-        <colgroup><col style={{ width: 45 }} />{columns.map((column) => <col key={column.key} style={{ width: column.width }} />)}
-          {!readOnly && <col style={{ width: actionWidth }} />}</colgroup>
-        <thead><tr><th className="shipping-row-index" scope="col">#</th>
-          {columns.map((column) => <th key={column.key} scope="col">{column.label}</th>)}
-          {!readOnly && <th className="shipping-row-action" scope="col">操作</th>}
-        </tr></thead>
+        <ShippingTableHeader columns={columns} index actionWidth={readOnly ? undefined : actionWidth} />
         <tbody>
           {!orders && edit?.id === "" && !draftAnchor && shipmentRow(edit, "＋")}
           {canPaste && <tr className="shipping-paste-row">
             <td className="shipping-row-index">＋</td>
-            {columns.map(({ key }) => <td key={key} data-order-row="" data-order-field={key}
-              className={cursor?.id === "" && cursor.key === key ? "shipping-cell-selected" : ""}
-              onClick={() => selectCell("", key)}>
-              {key === "backer" && <button type="button" className="text-link"
+            {columns.map((column) => <td key={column.key} data-order-row="" data-order-field={column.key}
+              className={columnClass(column) + (cursor?.id === "" && cursor.key === column.key ? " shipping-cell-selected" : "")}
+              onClick={() => selectCell("", column.key)}>
+              {column.key === "backer" && <button type="button" className="text-link"
                 onClick={() => selectCell("", "backer")}>粘贴新记录</button>}
             </td>)}
             <td className="shipping-row-action"></td>
@@ -843,7 +856,7 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
             }
             return <tr key={row.id}><td className="shipping-row-index">{index + 1}</td>
               {columns.map((column) => <td key={column.key} data-order-row={row.id} data-order-field={column.key}
-                className={cursor?.id === row.id && cursor.key === column.key ? "shipping-cell-selected" : ""}
+                className={columnClass(column) + (cursor?.id === row.id && cursor.key === column.key ? " shipping-cell-selected" : "")}
                 onClick={(event) => {
                   if (!orderEdit && event.target instanceof Element && !event.target.closest("button")) selectCell(row.id, column.key);
                 }}

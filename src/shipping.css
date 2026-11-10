@@ -33,6 +33,7 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
   height: 32px; min-height: 32px; padding: 0 9px; font-size: 12px;
 }
 .shipping-table {
+  --shipping-group-height: 26px;
   position: relative; overflow: auto;
   overscroll-behavior: contain; scrollbar-gutter: stable;
 }
@@ -44,16 +45,24 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 }
 .shipping-table tbody tr:last-child td { border-bottom: 1px solid var(--border); }
 .shipping-table th { position: sticky; top: 0; z-index: 3; background: #f1f4f9; font-weight: 600; }
+.shipping-table .shipping-group-head th:not([rowspan]) {
+  height: var(--shipping-group-height); background: #e7edf6; color: #405371; font-size: 11px;
+}
+.shipping-table .shipping-field-head th { top: var(--shipping-group-height); }
+.shipping-table .shipping-group-head th.shipping-goods { background: #dceee4; color: #23533c; }
+.shipping-table .shipping-field-head th.shipping-goods { background: #e9f5ee; color: #23533c; }
+.shipping-table td.shipping-goods { background: #f4faf6; }
 .shipping-table .shipping-row-index { position: sticky; left: 0; text-align: center; color: var(--muted); }
-.shipping-table td:nth-child(-n+2), .shipping-table td.shipping-row-action { z-index: 1; background: #fff; }
-.shipping-table :is(th,td):nth-child(2) { position: sticky; left: 45px; box-shadow: 2px 0 2px #23385912; }
-.shipping-table th:nth-child(-n+2) { z-index: 4; }
+.shipping-table td:is(.shipping-row-index,.shipping-record-key,.shipping-row-action) { z-index: 1; background: #fff; }
+.shipping-table .shipping-record-key { position: sticky; left: 45px; box-shadow: 2px 0 2px #23385912; }
+.shipping-table th:is(.shipping-row-index,.shipping-record-key) { z-index: 5; }
 .shipping-table td .text-link { color: #184aa8; font-size: inherit; }
 .shipping-table td button { vertical-align: middle; }
 .shipping-table td > button.text-link, .shipping-table td > a, .shipping-table td > span {
   display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
 }
 .shipping-table tbody tr.shipping-row-editing td { background: #edf3ff; }
+.shipping-table tbody tr.shipping-row-editing td.shipping-goods { background: #e5f3eb; }
 .shipping-table td input, .shipping-table td select, .shipping-table td textarea {
   width: 100%; min-width: 0; min-height: 27px; margin: 0; padding: 2px 4px;
   font-size: 12px; border-radius: 3px;
@@ -63,6 +72,7 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
   box-shadow: inset 0 0 0 1px var(--accent);
 }
 .shipping-table .shipping-paste-row td { background: #f5f8fe; }
+.shipping-table .shipping-paste-row td.shipping-goods { background: #ecf7ef; }
 .shipping-table td.shipping-cell-selected { box-shadow: inset 0 0 0 2px var(--accent); background: #eef4ff; }
 .shipping-paste-hint { margin: 0 0 8px; font-size: 12px; }
 .shipping-table .shipping-row-action { text-align: center; }
@@ -76,7 +86,9 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-icon-btn.shipping-delete:hover:not(:disabled) { background: #fff1f0; border-color: #f4c1bc; color: #a42620; }
 .shipping-child-count { flex: 0 0 auto; color: #4d5e78; background: #e9eff8; border-radius: 3px; padding: 1px 4px; }
 .shipping-child-marker { flex: 0 0 auto; color: #617998; }
-.shipping-table tbody tr.shipping-child-row:not(.shipping-row-editing) td:nth-child(-n+2) { background: #f3f7fd; }
+.shipping-table tbody tr.shipping-child-row:not(.shipping-row-editing) td:is(.shipping-row-index,.shipping-record-key) {
+  background: #f3f7fd;
+}
 .shipping-table .shipping-children-message { color: var(--muted); padding-inline-start: 55px; }
 .shipping-detail-section h4 { font-size: 13px; margin: 8px 0 4px; }
 .shipping-mobile-edit { display: none; }
@@ -86,6 +98,8 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
   color: #194591; border: 1px solid transparent; border-radius: 4px; min-height: 23px; flex-shrink: 0;
 }
 .shipping-chip:hover, .shipping-relation-add:hover { border-color: #779ad8; }
+.shipping-goods .shipping-chip { color: #24583c; background: #e0f0e6; }
+.shipping-goods a.shipping-chip:hover { border-color: #6ba588; }
 .shipping-chip.unresolved { background: #fff1d0; color: #69470b; }
 .shipping-relation-add { padding: 2px 4px; }
 .shipping-load-tail { min-height: 2px; }
@@ -170,8 +184,6 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-item-picker select { min-width: 0; }
 .global-shipping-filters select { height: 32px; min-height: 32px; padding: 0 8px; font-size: 12px; }
 .global-shipping-table table { min-width: 690px; }
-.global-shipping-table :is(th, td):nth-child(2) { left: auto; box-shadow: none; }
-.global-shipping-table td:nth-child(2) { position: static; }
 .global-order-toggle { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; }
 .global-order-toggle strong { overflow: hidden; text-overflow: ellipsis; }
 .global-order-toggle small { color: var(--muted); flex-shrink: 0; }

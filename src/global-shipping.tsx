@@ -5,6 +5,7 @@ import { formatTime, RelatedRecordDialog } from "./record-details";
 import { CarrierTags, SourceTag, Status, Tracking, type Details, type ProductChoice, type Request, type ShipmentItem } from "./shipping-data";
 import { canSaveItems, itemKey, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import { ShippingPicker } from "./shipping-options";
+import { ShippingTableHeader } from "./shipping-table-header";
 
 type Project = { id: string; name: string; archived_at: string | null };
 type Package = { id: string; project_id: string; project_name: string | null; reference: string; tracking: string;
@@ -13,6 +14,13 @@ type Package = { id: string; project_id: string; project_name: string | null; re
 type Order = { order_key: string; order_number: string; created_at: string; package_count: number;
   shipped_count: number; packages: Package[] };
 type Page = { rows: Order[]; total: number; page_size: number; projects: Project[] };
+const columns = [
+  { key: "order", label: "订单号", group: "order", width: 170 },
+  { key: "source", label: "来源", group: "order", width: 150 },
+  { key: "created", label: "最近登记", group: "order", width: 135 },
+  { key: "items", label: "发货商品", group: "goods" },
+  { key: "status", label: "发货进度", group: "transport", width: 100 },
+] as const;
 
 function orderItems(packages: Package[]) {
   const totals = new Map<string, ShipmentItem>();
@@ -154,8 +162,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange 
       onClick={() => setRevision((value) => value + 1)}>重试</button></p>}
     <div className="table-wrap shipping-table global-shipping-table" aria-label="全局发货订单" aria-busy={busy}>
       <table>
-        <colgroup><col style={{ width: 170 }} /><col style={{ width: 150 }} /><col /><col style={{ width: 120 }} /><col style={{ width: 100 }} /></colgroup>
-        <thead><tr><th>订单号</th><th>来源</th><th>发货商品</th><th>最近登记</th><th>发货进度</th></tr></thead>
+        <ShippingTableHeader columns={columns} />
         <tbody>{data?.rows.map((order) => {
           const expanded = !!opened[order.order_key];
           const sources = [...new Set(order.packages.map((pack) => pack.source).filter(Boolean))];
@@ -167,8 +174,8 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange 
                 <strong className="mono">{order.order_number || "无订单号"}</strong><small>{order.package_count} 包</small>
               </button></td>
               <td><span className="shipping-item-tags">{sources.length ? sources.map((source) => <SourceTag key={source} value={source} />) : "—"}</span></td>
-              <td><ShipmentItems items={orderItems(order.packages)} showProject links /></td>
               <td>{formatTime(order.created_at)}</td>
+              <td className="shipping-goods"><ShipmentItems items={orderItems(order.packages)} showProject links /></td>
               <td>{order.shipped_count > 0 && order.shipped_count < order.package_count
                 ? <span className="shipping-status">部分发货</span> : <Status sent={order.shipped_count > 0} />}</td>
             </tr>
