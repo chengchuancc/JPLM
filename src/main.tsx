@@ -77,6 +77,7 @@ import {
 } from "./material-table";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
+import { ShippingManagement } from "./shipping";
 import { Dialog } from "./dialog";
 
 const money = (n: number) =>
@@ -145,6 +146,7 @@ const navs = [
   { id: "inventory", name: "库存查询", icon: Warehouse },
   { id: "movements", name: "库存流水", icon: ArrowLeftRight },
   { id: "inspection", name: "生产检测", icon: ClipboardCheck },
+  { id: "shipping", name: "发货管理", icon: Truck },
 ];
 type Modal = { kind: string; item?: any; extra?: any } | null;
 type Field = {
@@ -2486,6 +2488,8 @@ function Workspace({
             readOnly={archived}
             onDraftChange={(dirty) => { draftOpen.current = dirty; }}
           />}
+          {view === "shipping" && project && <ShippingManagement request={businessApi}
+            admin={currentUser.role === "admin"} readOnly={archived} />}
           {view === "project-settings" && project && (
             <ProjectSettings project={{ ...project, ...state.project }} user={currentUser}
               onDeleted={() => go("projects")} onSaved={async () => {

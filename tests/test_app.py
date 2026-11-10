@@ -18,6 +18,7 @@ class IntegrationTests(unittest.TestCase):
         cls.server.shutdown();cls.server.server_close();cls.thread.join();cls.tmp.cleanup()
     def setUp(self):
         with app.transaction() as db:
+            for table in reversed(app.shipping.TABLES): db.execute('DELETE FROM '+table)
             for table in reversed(app.inspection.TABLES): db.execute('DELETE FROM '+table)
             for t in reversed(app.TABLES): db.execute('DELETE FROM '+t)
             for table in ('sessions', 'activity', 'import_runs', 'project_covers', 'project_members', 'projects', 'users', 'settings'):
@@ -51,6 +52,51 @@ class IntegrationTests(unittest.TestCase):
     def test_stock_lifecycle_and_history(self):
         self.move('入库',10);out=self.move('出库',4)['id'];self.move('退库',2,original_id=out);self.move('报废',1,reason='损坏')
         self.assertEqual(self.stock(),7);self.assertEqual([m['balance'] for m in self.state()['movements']],[10,6,8,7])
+
+    def test_shipping_import_and_ledgers_keep_project_and_device_links(self):
+        from urllib.parse import urlencode
+        def upload(action, csv_text):
+            boundary = 'shipping-boundary'
+            body = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="orders.csv"\r\n'
+                    'Content-Type: text/csv\r\n\r\n').encode() + csv_text.encode() + f'\r\n--{boundary}--\r\n'.encode()
+            return self.request('shipping/orders/' + action, 'POST', body,
+                                headers={'Content-Type': 'multipart/form-data; boundary=' + boundary})
+        csv_text = 'Backer Number,Shipping Name,Shipping Address 1,Shipping Postal Code\n88,Test Person,Example St,00123'
+        self.assertEqual(upload('preview', csv_text)['added'], 1)
+        self.assertEqual(self.request('shipping/orders')['total'], 0)
+        self.assertEqual(upload('import', csv_text)['added'], 1)
+        self.assertEqual(upload('import', csv_text)['unchanged'], 1)
+        order = self.request('shipping/orders?q=88')['rows'][0]
+        self.assertEqual(order['details']['postcode'], '00123')
+        serial = '1234562611100001'
+        self.request('inspection/devices', 'POST', {'serial': serial})
+        other = self.request('projects', 'POST', {'name': '其他项目'})['id']
+        self.assertEqual(self.request('shipping/orders', project=other)['total'], 0)
+        self.assertEqual(self.request('shipping/devices?q=123456', project=other), [])
+        first = {'channel': 'ks', 'ks_order_id': order['id'], 'devices': [serial, serial], 'tracking': '001'}
+        self.request('shipping/records', 'POST', first, 404, project=other)
+        self.request('shipping/records', 'POST', {**first, 'devices': ['UNREGISTERED']}, 404)
+        ks = self.request('shipping/records', 'POST', first)
+        self.request('shipping/records', 'POST', {'channel': 'other', 'reference': '#SP-1', 'devices': [serial],
+                                                  'details': {'source': 'Shopify', 'base': 1}})
+        rows = self.request('shipping/records?' + urlencode({'channel': 'ks', 'backer': '88'}))['rows']
+        self.assertEqual([r['id'] for r in rows], [ks['id']])
+        self.assertEqual([d['serial'] for d in rows[0]['devices']], [serial])
+        self.assertEqual(self.request('shipping/orders?status=shipped')['rows'][0]['shipped'], 1)
+        self.assertEqual(len(self.request('shipping/device-records?serial=' + serial)), 2)
+        self.request('shipping/records/' + ks['id'], 'PUT', {**first, 'version': 'stale'}, 409)
+        self.request('shipping/records/' + ks['id'], 'PUT', {**first, 'version': rows[0]['updated_at'], 'devices': []})
+        self.assertEqual(len(self.request('shipping/device-records?serial=' + serial)), 1)
+        self.assertEqual(self.request('shipping/records?channel=other&status=pending')['total'], 1)
+        archive = self.request('backup', raw=True)
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            backup = directory / 'backup.zip'
+            backup.write_bytes(archive)
+            staged, _ = app.stage_restore(backup, directory)
+            with app.connect(staged) as db:
+                self.assertEqual(app.shipping.list_orders(db, self.project_id, {})['total'], 1)
+                self.assertEqual(len(app.shipping.for_device(db, self.project_id, serial)), 1)
 
     def test_inspection_templates_rules_and_project_permissions(self):
         config = {'name': '压力测试', 'serial_mode': 'dated', 'fields': [

@@ -1,0 +1,41 @@
+.shipping-toolbar, .shipping-tools, .shipping-pagination {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 8px;
+}
+.shipping-toolbar { justify-content: space-between; margin-bottom: 12px; }
+.shipping-tools input { width: min(260px, 100%); }
+.shipping-tools select { width: auto; }
+.shipping-table th, .shipping-table td { white-space: nowrap; }
+.shipping-pagination { justify-content: flex-end; margin-top: 10px; }
+.shipping-notice, .shipping-empty { padding: 10px 0; color: var(--muted); }
+.shipping-empty { padding: 20px; text-align: center; }
+.shipping-status {
+  display: inline-flex; padding: 3px 7px; border-radius: 5px; color: #69470b; background: #fff1d0;
+  font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.shipping-status.sent { color: #145838; background: #e0f3e7; }
+.shipping-serial-cell .text-link { margin-left: 6px; }
+.shipping-form-fields { gap: 10px 14px; }
+.shipping-form-fields label { min-width: 0; }
+.shipping-order-picker, .shipping-device-picker { margin-bottom: 14px; }
+.shipping-device-picker { margin-top: 14px; }
+.shipping-order-picker h3, .shipping-device-picker h3 { margin-bottom: 7px; }
+.shipping-order-summary { margin-top: 8px; padding: 9px; background: var(--bg); border-radius: 6px; }
+.shipping-details { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 14px; margin: 9px 0; }
+.shipping-details dt { color: var(--muted); font-size: 12px; }
+.shipping-details dd { margin: 1px 0 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.shipping-picker-list { max-height: 200px; overflow: auto; margin-top: 7px; border: 1px solid var(--border); border-radius: 5px; }
+.shipping-picker-list button {
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 5px;
+  width: 100%; text-align: left; padding: 7px; border-bottom: 1px solid var(--border);
+}
+.shipping-picker-list button:hover { background: var(--bg); }
+.shipping-picker-list small, .shipping-device-detail small { color: var(--muted); }
+.shipping-device-picker .selected-records { margin: 7px 0 0; }
+.shipping-device-detail { list-style: none; padding: 0; margin: 8px 0 0; }
+.shipping-device-detail li { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--border); }
+.shipping-import-report { margin-top: 10px; }
+@media (max-width: 620px) {
+  .shipping-details { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .shipping-toolbar form { width: 100%; }
+  .shipping-toolbar form input { flex: 1 1 100%; }
+}

@@ -130,7 +130,7 @@ function ResultLabel({ value }: { value: string }) {
   return <span className={"inspection-result " + tone}>{value}</span>;
 }
 
-function CameraReader({ live, onRead, close }: {
+export function CameraReader({ live, onRead, close }: {
   live: boolean; onRead: (value: string) => void; close: () => void;
 }) {
   const video = useRef<HTMLVideoElement>(null);
@@ -715,7 +715,17 @@ function InspectionImport({ template, request, baseUrl, onImported }: {
   );
 }
 
-function InspectionRecordDetails({ record, close }: { record: RecordRow; close: () => void }) {
+function InspectionRecordDetails({ record, request, close }: { record: RecordRow; request: Request; close: () => void }) {
+  const [shipments, setShipments] = useState<{
+    reference: string; channel: string; shipped_on: string; tracking: string; backer: string | null;
+  }[]>([]);
+  useEffect(() => {
+    let active = true;
+    request("shipping/device-records?" + new URLSearchParams({ serial: record.serial })).then(
+      (rows) => { if (active) setShipments(rows); }, () => {},
+    );
+    return () => { active = false; };
+  }, [record.serial]);
   return createPortal(
     <Dialog title="检测记录明细" wide onClose={close}>
       <div className="inspection-record-summary">
@@ -731,6 +741,14 @@ function InspectionRecordDetails({ record, close }: { record: RecordRow; close: 
         {record.source_id && <div><dt>原记录 ID</dt><dd>{record.source_id}</dd></div>}
         {record.deleted_at && <div><dt>删除时间</dt><dd>{formatTime(record.deleted_at)}</dd></div>}
       </dl>
+      {!!shipments.length && <section className="inspection-detail-group">
+        <h3>关联发货</h3>
+        <ul className="shipping-device-detail">{shipments.map((item, index) => (
+          <li key={index}><span>{item.channel === "ks" ? "KS" : "其他"} · {item.reference}
+            {item.backer && " · Backer #" + item.backer}</span>
+            <small>{[item.shipped_on, item.tracking].filter(Boolean).join(" · ")}</small></li>
+        ))}</ul>
+      </section>}
       {sections(record.form.fields).map(([group, fields]) => (
         <section className="inspection-detail-group" key={group}>
           <h3>{group}</h3>
@@ -899,7 +917,7 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
         <span>{page} / {totalPages}</span>
         <button type="button" className="btn small" disabled={page >= totalPages || busy} onClick={() => setPage(page + 1)}>下一页</button>
       </div>
-      {openedRecord && <InspectionRecordDetails record={openedRecord} close={() => setOpenedRecord(null)} />}
+      {openedRecord && <InspectionRecordDetails record={openedRecord} request={request} close={() => setOpenedRecord(null)} />}
     </section>
   );
 }

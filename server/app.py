@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
 import inspection
+import shipping
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, migrate_projects,
@@ -114,7 +115,7 @@ def init_db(directory=None, bootstrap=None):
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(projects)')}:
             db.execute('ALTER TABLE projects ADD COLUMN deleted_at TEXT '
                        'CHECK(deleted_at IS NULL OR archived_at IS NOT NULL)')
-        for statement in inspection.SCHEMA:
+        for statement in (*inspection.SCHEMA, *shipping.SCHEMA):
             db.execute(statement)
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(inspection_records)')}:
             db.execute('ALTER TABLE inspection_records ADD COLUMN deleted_at TEXT')
@@ -653,7 +654,8 @@ def stage_restore(archive_path, directory):
             if version >= 10:
                 project_tables += ('project_covers',)
             inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
-            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables}
+            shipping_tables = shipping.TABLES if version >= shipping.VERSION else ()
+            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables, *shipping_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
             if not required_tables <= source_tables:
@@ -662,7 +664,8 @@ def stage_restore(archive_path, directory):
             with connect(staged) as db:
                 db.execute('BEGIN')
                 db.execute('PRAGMA defer_foreign_keys=ON')
-                for table in ('users', *project_tables, *TABLES, *inspection_tables, 'settings', 'import_runs', 'activity'):
+                for table in ('users', *project_tables, *TABLES, *inspection_tables, *shipping_tables,
+                              'settings', 'import_runs', 'activity'):
                     if table not in source_tables or (version == 6 and table in ('users', 'activity')):
                         continue
                     target_columns = [row['name'] for row in db.execute(f'PRAGMA table_info({table})')]
@@ -864,6 +867,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError,BrokenPipeError,TimeoutError): return
         except Problem as e: self.send({'error':e.message},e.status)
         except inspection.InspectionError as e: self.send({'error':str(e)},e.status)
+        except shipping.ShippingError as e: self.send({'error':str(e)},e.status)
         except sqlite3.IntegrityError as e:
             msg = '英文代号已使用' if 'products.english_code' in str(e) else '关联记录不匹配或仍被其他记录引用' if 'FOREIGN KEY' in str(e) else '编码或关联物料重复，请检查输入'
             self.send({'error':msg},409)
@@ -973,6 +977,8 @@ class Handler(BaseHTTPRequestHandler):
     def project_request(self, project_id, path, method):
         if path.startswith('/api/inspection/'):
             return self.inspection_request(project_id, path.removeprefix('/api/inspection/'), method)
+        if path.startswith('/api/shipping/'):
+            return self.shipping_request(project_id, path.removeprefix('/api/shipping/'), method)
         if path == '/api/recover' and method == 'POST':
             return self.set_project_deleted(project_id, deleted=False)
         if path == '/api/cover' and method in ('GET', 'POST', 'DELETE'):
@@ -1006,6 +1012,59 @@ class Handler(BaseHTTPRequestHandler):
             for fid in result.pop('_delete_files', []):
                 remove_upload(fid)
         self.send(result)
+
+    def shipping_request(self, project_id, resource, method):
+        query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
+        if method == 'GET':
+            with connect() as db:
+                db.execute('BEGIN')
+                enter_project(db, project_id, self.user)
+                if resource == 'orders':
+                    return self.send(shipping.list_orders(db, project_id, query))
+                if resource == 'records':
+                    return self.send(shipping.list_shipments(db, project_id, query.get('channel'), query))
+                if resource == 'devices':
+                    return self.send(shipping.find_devices(db, project_id, query))
+                if resource == 'device-records':
+                    serial = shipping.string(query.get('serial'), 100)
+                    return self.send(shipping.for_device(db, project_id, serial))
+        if resource in ('orders/preview', 'orders/import') and method == 'POST':
+            self.require_admin()
+            _, uploads = self.multipart()
+            if len(uploads) != 1:
+                raise Problem('请选择一个 KS 订单文件')
+            filename, _, blob = uploads[0]
+            entries, invalid, duplicate = shipping.parse_orders(blob, filename)
+            if resource == 'orders/preview':
+                with connect() as db:
+                    db.execute('BEGIN')
+                    enter_project(db, project_id, self.user, write=True)
+                    return self.send(shipping.apply_orders(db, project_id, entries, invalid, duplicate, now(), uid))
+            if invalid:
+                raise Problem('文件中有无效订单，请先修正再导入')
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                self.require_admin()
+                report = shipping.apply_orders(db, project_id, entries, invalid, duplicate, now(), uid, commit=True)
+                if report['added'] or report['updated']:
+                    touch_project(db)
+                    log_activity(db, self.user, '导入 KS 订单', '', 'KS 发货信息',
+                                 f"新增 {report['added']} 条，更新 {report['updated']} 条")
+            return self.send(report)
+        editing = re.fullmatch(r'records/([a-f0-9]{24})', resource)
+        if (resource == 'records' and method == 'POST') or (editing and method == 'PUT'):
+            data = self.body()
+            if not isinstance(data, dict):
+                raise Problem('发货记录格式无效')
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                result = shipping.save_shipment(db, project_id, editing[1] if editing else uid(),
+                                                data, now(), self.user['id'])
+                touch_project(db)
+                log_activity(db, self.user, '修改发货记录' if editing else '登记发货',
+                             result['id'], result['reference'])
+            return self.send(result)
+        raise Problem('接口不存在', 404)
 
     def inspection_request(self, project_id, resource, method):
         query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
