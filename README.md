@@ -71,6 +71,10 @@ BOM 内新建物料自动采用当前产品作为编号所属产品；一级物�
 
 关联交互参考 [飞书多维表格双向关联字段](https://www.feishu.cn/hc/zh-CN/articles/653027931590-%E4%BD%BF%E7%94%A8%E5%A4%9A%E7%BB%B4%E8%A1%A8%E6%A0%BC%E5%8F%8C%E5%90%91%E5%85%B3%E8%81%94%E5%AD%97%E6%AE%B5)。本系统独立运行，不连接飞书账户。
 
+## 发货子记录
+
+KS 和其他发货台账都可以展开和新增子记录。已有记录可在行内编辑时关联或解除父记录；删除的记录可从「已删除」恢复。
+
 ## 构建与测试
 
 修改源码后需要 Node.js 18+（推荐 20+）：
@@ -82,14 +86,14 @@ python3 -m unittest discover -s tests -v
 python3 scripts/package-release.py
 ```
 
-部署包生成在上级 `releases/jiecheng-plm-1.8.3.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
+部署包生成在上级 `releases/jiecheng-plm-1.8.4.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
 
 ## 部署到服务器
 
 将部署包上传并解压到空目录：
 
 ```sh
-tar -xzf jiecheng-plm-1.8.3.tar.gz
+tar -xzf jiecheng-plm-1.8.4.tar.gz
 cd jiecheng-plm
 ./start.sh --host 127.0.0.1 --port 8787
 ```

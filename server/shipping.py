@@ -9,6 +9,7 @@ from electronic_import import ElectronicBomError, normalized, read_csv, read_xls
 
 VERSION = 14
 CREATED_AT_VERSION = 15
+RECORD_RELATIONS_VERSION = 16
 LEGACY_TABLES = ('shipping_ks_orders', 'shipping_records', 'shipping_devices')
 TABLES = (*LEGACY_TABLES, 'shipping_carriers')
 SCHEMA = (
@@ -24,6 +25,7 @@ SCHEMA = (
         ks_order_id TEXT, shipped_on TEXT NOT NULL, tracking TEXT NOT NULL,
         details TEXT NOT NULL, source_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         operator_id TEXT REFERENCES users(id),
+        parent_id TEXT, deleted_at TEXT,
         PRIMARY KEY (project_id,id), UNIQUE (project_id,channel,source_id),
         CHECK(channel='ks' OR ks_order_id IS NULL),
         FOREIGN KEY (project_id,ks_order_id) REFERENCES shipping_ks_orders(project_id,id)
@@ -49,9 +51,13 @@ DETAIL_KEYS = (*CONTACT, *ITEMS, *COSTS, 'source', 'carrier', 'notes')
 ORDER_KEYS = (*CONTACT, *ITEMS, 'pb', 'sku', 'country_code', 'address_status', 'notes',
               'pledged', 'amount_due', 'paid', 'balance')
 PAGE_SIZE = 50
-SHIPMENT_SELECT = '''SELECT s.*,o.backer,o.details AS order_details,u.name AS operator
+SHIPMENT_SELECT = '''SELECT s.*,o.backer,o.details AS order_details,u.name AS operator,
+    p.reference AS parent_reference,p.tracking AS parent_tracking,
+    (SELECT count(*) FROM shipping_records c WHERE c.project_id=s.project_id
+        AND c.parent_id=s.id AND c.deleted_at IS NULL) AS child_count
     FROM shipping_records s
     LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id
+    LEFT JOIN shipping_records p ON p.project_id=s.project_id AND p.id=s.parent_id
     LEFT JOIN users u ON u.id=s.operator_id'''
 
 
@@ -61,8 +67,12 @@ def initialize(db, version):
     if version == VERSION:
         db.execute("ALTER TABLE shipping_ks_orders ADD COLUMN created_at TEXT NOT NULL DEFAULT ''")
         fill_created_at(db)
+    if VERSION <= version < RECORD_RELATIONS_VERSION:
+        db.execute('ALTER TABLE shipping_records ADD COLUMN parent_id TEXT')
+        db.execute('ALTER TABLE shipping_records ADD COLUMN deleted_at TEXT')
     db.execute('CREATE INDEX IF NOT EXISTS idx_shipping_orders_created ON shipping_ks_orders(project_id,created_at DESC)')
     db.execute('CREATE INDEX IF NOT EXISTS idx_shipping_records_created ON shipping_records(project_id,channel,created_at DESC,id DESC)')
+    db.execute('CREATE INDEX IF NOT EXISTS idx_shipping_parent ON shipping_records(project_id,parent_id,deleted_at,created_at DESC,id DESC)')
 
 
 def fill_created_at(db):
@@ -171,7 +181,10 @@ def shipment_devices(db, project, shipment_ids):
 def list_shipments(db, project, channel, query):
     if channel not in ('ks', 'other'):
         raise ShippingError('发货渠道无效')
-    where = ['s.project_id=?', 's.channel=?']
+    where = ['s.project_id=?', 's.channel=?', 's.deleted_at IS NOT NULL' if query.get('deleted') == '1'
+             else 's.deleted_at IS NULL']
+    if query.get('roots') == '1':
+        where.append('s.parent_id IS NULL')
     params = [project, channel]
     backer = string(query.get('backer'), 80)
     if backer:
@@ -211,6 +224,65 @@ def get_shipment(db, project, shipment_id):
     return decode_shipment(row, shipment_devices(db, project, [shipment_id]).get(shipment_id, []))
 
 
+def list_children(db, project, shipment_id):
+    parent = db.execute('SELECT deleted_at FROM shipping_records WHERE project_id=? AND id=?',
+                        (project, shipment_id)).fetchone()
+    if not parent:
+        raise ShippingError('发货记录不存在', 404)
+    rows = db.execute(SHIPMENT_SELECT + ''' WHERE s.project_id=? AND s.parent_id=?
+        AND s.deleted_at IS NULL ORDER BY s.created_at DESC,s.id DESC''', (project, shipment_id)).fetchall()
+    devices = shipment_devices(db, project, [row['id'] for row in rows])
+    return [decode_shipment(row, devices.get(row['id'], [])) for row in rows]
+
+
+def validate_parent(db, project, shipment_id, channel, parent_id):
+    if not parent_id:
+        return None
+    parent = db.execute('''SELECT * FROM shipping_records WHERE project_id=? AND id=?
+        AND channel=? AND deleted_at IS NULL''', (project, parent_id, channel)).fetchone()
+    if not parent:
+        raise ShippingError('当前台账中找不到该父记录，或父记录已删除', 404)
+    if db.execute('''WITH RECURSIVE ancestors(id) AS (
+        SELECT ? UNION SELECT r.parent_id FROM shipping_records r JOIN ancestors a ON r.id=a.id
+        WHERE r.project_id=? AND r.parent_id IS NOT NULL
+    ) SELECT 1 FROM ancestors WHERE id=?''', (parent_id, project, shipment_id)).fetchone():
+        raise ShippingError('不能将该记录设为自己的父记录，也不能关联到下级记录')
+    return parent
+
+
+def valid_parent_links(db):
+    if db.execute('''SELECT 1 FROM shipping_records c LEFT JOIN shipping_records p
+        ON p.project_id=c.project_id AND p.id=c.parent_id AND p.channel=c.channel
+        WHERE c.parent_id IS NOT NULL AND (p.id IS NULL OR (c.deleted_at IS NULL AND p.deleted_at IS NOT NULL))
+        LIMIT 1''').fetchone():
+        return False
+    parents = {(project, child): (project, parent) for project, child, parent in db.execute(
+        'SELECT project_id,id,parent_id FROM shipping_records WHERE parent_id IS NOT NULL')}
+    checked = set()
+    for record in parents:
+        chain = set()
+        while record in parents and record not in checked:
+            if record in chain:
+                return False
+            chain.add(record)
+            record = parents[record]
+        checked.update(chain)
+    return True
+
+
+def set_shipment_deleted(db, project, shipment_id, version, stamp, deleted):
+    row = get_shipment(db, project, shipment_id)
+    if version != row['updated_at'] or bool(row['deleted_at']) == deleted:
+        raise ShippingError('发货记录已更新，请刷新后重试', 409)
+    if deleted and row['child_count']:
+        raise ShippingError('该记录还有子记录，请先删除子记录或解除关联', 409)
+    if not deleted and row['parent_id']:
+        validate_parent(db, project, shipment_id, row['channel'], row['parent_id'])
+    db.execute('UPDATE shipping_records SET deleted_at=?,updated_at=? WHERE project_id=? AND id=?',
+               (stamp if deleted else None, stamp, project, shipment_id))
+    return row
+
+
 def shipped_condition(alias):
     return f"({alias}.shipped_on<>'' OR {alias}.tracking<>'')"
 
@@ -230,12 +302,13 @@ def list_orders(db, project, query):
     status = query.get('status')
     if status in ('shipped', 'pending'):
         shipped = ('EXISTS (SELECT 1 FROM shipping_records s WHERE s.project_id=o.project_id '
-                   'AND s.ks_order_id=o.id AND ' + shipped_condition('s') + ')')
+                   'AND s.ks_order_id=o.id AND s.deleted_at IS NULL AND ' + shipped_condition('s') + ')')
         where += ' AND ' + (shipped if status == 'shipped' else 'NOT ' + shipped)
     total = db.execute(f'SELECT count(*) FROM shipping_ks_orders o WHERE {where}', args).fetchone()[0]
     rows = db.execute(f'''SELECT o.*, count(s.id) AS shipments,
         count(CASE WHEN {shipped_condition('s')} THEN 1 END) AS shipped
         FROM shipping_ks_orders o LEFT JOIN shipping_records s ON s.project_id=o.project_id AND s.ks_order_id=o.id
+          AND s.deleted_at IS NULL
         WHERE {where} GROUP BY o.id
         ORDER BY (?='1' AND o.backer=? COLLATE NOCASE) DESC, o.created_at DESC,o.rowid
         LIMIT ? OFFSET ?''', (*args, query.get('lookup'), term, PAGE_SIZE, (page - 1) * PAGE_SIZE))
@@ -246,11 +319,12 @@ def get_order(db, project, order_id):
     row = db.execute(f'''SELECT o.*, count(s.id) AS shipments,
         count(CASE WHEN {shipped_condition('s')} THEN 1 END) AS shipped
         FROM shipping_ks_orders o LEFT JOIN shipping_records s ON s.project_id=o.project_id AND s.ks_order_id=o.id
+          AND s.deleted_at IS NULL
         WHERE o.project_id=? AND o.id=? GROUP BY o.id''', (project, order_id)).fetchone()
     if not row:
         raise ShippingError('KS 订单不存在', 404)
     links = db.execute('''SELECT id,reference,channel,shipped_on,tracking FROM shipping_records
-        WHERE project_id=? AND ks_order_id=? ORDER BY created_at DESC,id DESC''',
+        WHERE project_id=? AND ks_order_id=? AND deleted_at IS NULL ORDER BY created_at DESC,id DESC''',
         (project, order_id))
     return {**decode_order(row), 'shipment_links': [{**dict(link), 'backer': row['backer']} for link in links]}
 
@@ -264,7 +338,7 @@ def find_devices(db, project, query):
          AND r.deleted_at IS NULL ORDER BY r.updated_at DESC,r.id DESC LIMIT 1) AS result,
         (SELECT group_concat(s.reference,'、') FROM shipping_devices sd JOIN shipping_records s
           ON s.project_id=sd.project_id AND s.id=sd.shipment_id
-          WHERE sd.project_id=d.project_id AND sd.serial=d.serial) AS shipments
+          WHERE sd.project_id=d.project_id AND sd.serial=d.serial AND s.deleted_at IS NULL) AS shipments
         FROM inspection_devices d WHERE d.project_id=? AND instr(lower(d.serial),?)>0
         ORDER BY (lower(d.serial)=?) DESC,d.serial LIMIT 20''', (project, term, term))]
 
@@ -273,7 +347,8 @@ def for_device(db, project, serial):
     return [dict(row) for row in db.execute('''SELECT s.id,s.reference,s.channel,s.shipped_on,s.tracking,o.backer
         FROM shipping_devices d JOIN shipping_records s ON s.project_id=d.project_id AND s.id=d.shipment_id
         LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id
-        WHERE d.project_id=? AND d.serial=? ORDER BY s.created_at DESC,s.id DESC''', (project, serial))]
+        WHERE d.project_id=? AND d.serial=? AND s.deleted_at IS NULL
+        ORDER BY s.created_at DESC,s.id DESC''', (project, serial))]
 
 
 def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=None, imported=False):
@@ -283,15 +358,20 @@ def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=Non
         raise ShippingError('发货记录已更新，请刷新后重试', 409)
     if old and data.get('version') != old['updated_at']:
         raise ShippingError('发货记录已存在，请刷新后重试', 409)
+    if old and old['deleted_at']:
+        raise ShippingError('请先恢复发货记录再编辑', 409)
     channel = data.get('channel')
     if channel not in ('ks', 'other') or (old and channel != old['channel']):
         raise ShippingError('发货渠道无效')
+    parent_id = string(data.get('parent_id', old['parent_id'] if old else None), 100) or None
+    parent = validate_parent(db, project, shipment_id, channel, parent_id)
     order = string(data.get('ks_order_id'), 100) or None
     if order and (channel != 'ks' or not db.execute(
         'SELECT 1 FROM shipping_ks_orders WHERE project_id=? AND id=?', (project, order),
     ).fetchone()):
         raise ShippingError('KS 订单不存在', 404)
-    if channel == 'ks' and not order and not (imported or (old and not old['ks_order_id'])):
+    if channel == 'ks' and not order and not (imported or (old and not old['ks_order_id'])
+                                              or (parent and not parent['ks_order_id'])):
         raise ShippingError('请选择 KS 订单')
     reference = string(data.get('reference'), 150)
     if not reference:
@@ -320,14 +400,14 @@ def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=Non
             raise ShippingError(f'设备 {serial} 尚未在当前项目登记', 404)
     if old:
         db.execute('''UPDATE shipping_records SET reference=?,ks_order_id=?,shipped_on=?,tracking=?,details=?,
-                      updated_at=?,operator_id=? WHERE project_id=? AND id=?''',
-                   (reference, order, shipped_on, tracking, json_data(details), stamp, actor, project, shipment_id))
+                      updated_at=?,operator_id=?,parent_id=? WHERE project_id=? AND id=?''',
+                   (reference, order, shipped_on, tracking, json_data(details), stamp, actor, parent_id, project, shipment_id))
     else:
         db.execute('''INSERT INTO shipping_records
                       (project_id,id,channel,reference,ks_order_id,shipped_on,tracking,details,source_id,
-                       created_at,updated_at,operator_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''',
+                       created_at,updated_at,operator_id,parent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                    (project, shipment_id, channel, reference, order, shipped_on, tracking,
-                    json_data(details), source_id, stamp, stamp, actor))
+                    json_data(details), source_id, stamp, stamp, actor, parent_id))
     db.executemany('DELETE FROM shipping_devices WHERE project_id=? AND shipment_id=? AND serial=?',
                    ((project, shipment_id, serial) for serial in previous - set(serials)))
     db.executemany('INSERT INTO shipping_devices VALUES(?,?,?)',

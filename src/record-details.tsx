@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 import { Dialog } from "./dialog";
 import type { RecordRow } from "./inspection";
-import { contactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList,
+import { contactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList, shipmentLabel,
   type Request, type Order, type Shipment } from "./shipping-data";
 import "./shipping.css";
 
@@ -56,8 +56,8 @@ function ShipmentLinks({ rows, open }: { rows: ShipmentLink[]; open: Open }) {
   return <ul className="shipping-device-detail">{rows.map((item) => (
     <li key={item.id}>
       <button type="button" className="text-link mono"
-        onClick={() => open({ kind: "shipment", id: item.id, reference: item.reference })}>
-        {item.reference || "发货记录"}
+        onClick={() => open({ kind: "shipment", id: item.id, reference: shipmentLabel(item) })}>
+        {shipmentLabel(item)}
       </button>
       <small>{[item.channel === "ks" ? "KS" : "其他", item.backer && "Backer #" + item.backer,
         item.shipped_on, item.tracking].filter(Boolean).join(" · ")}</small>
@@ -134,14 +134,21 @@ function DeviceDetails({ serial, request, open }: { serial: string; request: Req
   </>;
 }
 
+function ChildShipmentLinks({ id, request, open }: { id: string; request: Request; open: Open }) {
+  const { value, error } = useDetail<ShipmentLink[]>(request, "shipping/records/" + id + "/children");
+  return value ? <ShipmentLinks rows={value} open={open} /> : <Loading error={error} />;
+}
+
 function ShipmentDetails({ id, request, open }: { id: string; request: Request; open: Open }) {
   const { value: row, error } = useDetail<Shipment>(request, "shipping/records/" + id);
   if (!row) return <Loading error={error} />;
   const title = row.channel === "ks" ? "发货编号" : "订单号";
+  const parentLabel = row.parent_reference || row.parent_tracking || "发货记录";
   return <>
     <div className="inspection-record-summary">
       <div><span>{title}</span> <strong className="mono">{row.reference || "—"}</strong></div>
-      <Status sent={!!(row.shipped_on || row.tracking)} />
+      {row.deleted_at ? <span className="muted">已删除 · {formatTime(row.deleted_at)}</span>
+        : <Status sent={!!(row.shipped_on || row.tracking)} />}
     </div>
     <div className="shipping-record-fields">
     <section className="shipping-detail-section">
@@ -159,6 +166,15 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
       </dl>
       <DetailsList fields={costs} details={row.details} showEmpty />
     </section>
+    {(row.parent_id || row.child_count > 0) && <section className="shipping-detail-section">
+      <h3>父子记录</h3>
+      {row.parent_id && <dl className="shipping-details"><div><dt>父记录</dt><dd>
+        <button type="button" className="text-link mono" onClick={() =>
+          open({ kind: "shipment", id: row.parent_id!, reference: parentLabel })}>{parentLabel}</button>
+      </dd></div></dl>}
+      {row.child_count > 0 && <><h4>子记录 · {row.child_count} 条</h4>
+        <ChildShipmentLinks id={id} request={request} open={open} /></>}
+    </section>}
     <section className="shipping-detail-section"><h3>收件资料</h3>
       <DetailsList fields={row.channel === "ks" ? [...contactFields, ["address_status", "地址确认"]] : contactFields}
         details={{ ...row.order_details, ...row.details }} showEmpty />

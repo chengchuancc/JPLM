@@ -114,6 +114,53 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(app.shipping.list_orders(db, self.project_id, {})['total'], 1)
                 self.assertEqual(len(app.shipping.for_device(db, self.project_id, serial)), 1)
 
+    def test_shipment_children_and_reversible_deletion(self):
+        records = 'shipping/records'
+        payload = {'channel': 'other', 'reference': '#PARENT'}
+        parent = self.request(records, 'POST', payload)
+        serial = '1234562611100001'
+        self.request('inspection/devices', 'POST', {'serial': serial})
+        child = self.request(records, 'POST', {**payload, 'parent_id': parent['id'], 'tracking': 'CHILD-TRACK',
+                                               'devices': [serial], 'details': {'notes': '补发'}})
+        parent_path = f"{records}/{parent['id']}"
+        child_path = f"{records}/{child['id']}"
+        self.assertEqual(child['parent_reference'], '#PARENT')
+        roots = self.request(records + '?channel=other&roots=1')['rows']
+        self.assertEqual([(r['id'], r['child_count']) for r in roots], [(parent['id'], 1)])
+        self.assertEqual(self.request(parent_path + '/children'), [child])
+        self.assertEqual(self.request(records + '?channel=other&q=CHILD-TRACK')['rows'], [child])
+        other = self.request('projects', 'POST', {'name': '隔离项目'})['id']
+        self.request(records, 'POST', {**payload, 'parent_id': parent['id']}, 404, project=other)
+        self.request(records, 'POST', {'channel': 'ks', 'parent_id': parent['id']}, 404)
+        self.request(parent_path + '/children', status=404, project=other)
+        self.request(parent_path, 'PUT', {**payload, 'version': parent['updated_at'], 'parent_id': child['id']}, 400)
+        self.request(parent_path, 'DELETE', {'version': parent['updated_at']}, 409)
+        self.request(child_path, 'DELETE', {'version': 'stale'}, 409)
+        self.request(child_path, 'DELETE', {'version': child['updated_at']})
+        self.assertEqual(self.request(parent_path + '/children'), [])
+        self.assertEqual(self.request('shipping/device-records?serial=' + serial), [])
+        self.assertEqual(self.request(records + '?channel=other&q=CHILD-TRACK')['rows'], [])
+        deleted = self.request(records + '?channel=other&deleted=1')['rows'][0]
+        self.assertEqual((deleted['tracking'], deleted['details'], deleted['devices']),
+                         (child['tracking'], child['details'], child['devices']))
+        self.request(parent_path, 'DELETE', {'version': parent['updated_at']})
+        self.request(child_path + '/restore', 'POST', {'version': deleted['updated_at']}, 404)
+        archive = self.request('backup', raw=True)
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            backup = directory / 'backup.zip'
+            backup.write_bytes(archive)
+            staged, _ = app.stage_restore(backup, directory)
+            with app.connect(staged) as db:
+                self.assertEqual(app.shipping.get_shipment(db, self.project_id, child['id']), deleted)
+        self.request(parent_path + '/restore', 'POST', {'version': self.request(parent_path)['updated_at']})
+        self.request(child_path + '/restore', 'POST', {'version': deleted['updated_at']})
+        restored = self.request(parent_path + '/children')[0]
+        self.assertIsNone(restored['deleted_at'])
+        self.assertEqual(self.request('shipping/device-records?serial=' + serial)[0]['id'], child['id'])
+        self.request(child_path, 'PUT', {**payload, 'parent_id': None, 'version': restored['updated_at']})
+        self.assertEqual(self.request(records + '?channel=other&roots=1')['total'], 2)
+
     def test_shipping_clipboard_paste_and_creation_order(self):
         paste = 'shipping/orders/paste'
         result = self.request(paste, 'POST', {

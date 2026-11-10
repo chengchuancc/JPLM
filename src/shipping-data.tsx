@@ -8,7 +8,11 @@ export type Shipment = {
   id: string; channel: Channel; reference: string; ks_order_id: string | null; backer: string | null;
   shipped_on: string; tracking: string; details: Details; order_details: Details; operator: string | null;
   created_at: string; updated_at: string; devices: Device[]; source_id: string | null;
+  parent_id: string | null; parent_reference: string | null; parent_tracking: string | null;
+  child_count: number; deleted_at: string | null;
 };
+export const shipmentLabel = (row: Pick<Shipment, "reference" | "tracking">) =>
+  row.reference || row.tracking || "发货记录";
 export type Page = { rows: (Order | Shipment)[]; total: number; page: number; page_size: number };
 export const path = "shipping/";
 export const contactFields = [

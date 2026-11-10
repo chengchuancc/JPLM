@@ -1,12 +1,12 @@
-import { useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
+import { Fragment, useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { Camera, Pencil, Plus, Search, Upload } from "lucide-react";
+import { Camera, ChevronDown, ChevronRight, CornerDownRight, Link2, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
 import { Dialog } from "./dialog";
 import { FieldVisibility } from "./material-table";
 import { CameraReader } from "./inspection";
 import { RelatedRecordDialog, formatTime, type RelatedTarget } from "./record-details";
 import { type Request, type Channel, type Order, type Device, type Shipment, type Page,
-  path, contactFields, orderFields, items, costs, sources, isOrder, CarrierTags, SourceTag, Status, Tracking } from "./shipping-data";
+  path, contactFields, orderFields, items, costs, sources, isOrder, CarrierTags, SourceTag, Status, Tracking, shipmentLabel } from "./shipping-data";
 import { CarrierPicker } from "./shipping-carrier";
 
 type ImportReport = { added: number; updated: number; unchanged: number; duplicate: number; invalid: number;
@@ -182,13 +182,75 @@ function shipmentColumns(channel: Channel): Column[] {
   ];
 }
 
-function emptyShipment(channel: Channel, order?: Order): Shipment {
+function emptyShipment(channel: Channel, order?: Order, parent?: Shipment): Shipment {
   return {
-    id: "", channel, reference: "", ks_order_id: order?.id || null, backer: order?.backer || null,
-    shipped_on: "", tracking: "", details: Object.fromEntries(items.flatMap(([key]) =>
-      order?.details[key] === undefined ? [] : [[key, order.details[key]]])),
-    order_details: order?.details || {}, operator: null, created_at: "", updated_at: "", devices: [], source_id: null,
+    id: "", channel, reference: channel === "other" ? parent?.reference || "" : "",
+    ks_order_id: order?.id || parent?.ks_order_id || null, backer: order?.backer || parent?.backer || null,
+    shipped_on: "", tracking: "", details: parent ? Object.fromEntries(
+      [...contactFields, ["source"]].flatMap(([key]) => parent.details[key] === undefined ? [] : [[key, parent.details[key]]])
+    ) : Object.fromEntries(items.flatMap(([key]) => order?.details[key] === undefined ? [] : [[key, order.details[key]]])),
+    order_details: order?.details || parent?.order_details || {}, operator: null, created_at: "", updated_at: "", devices: [], source_id: null,
+    parent_id: parent?.id || null, parent_reference: parent?.reference || null, parent_tracking: parent?.tracking || null,
+    child_count: 0, deleted_at: null,
   };
+}
+
+function ParentPicker({ request, row, select, close }: {
+  request: Request; row: Shipment; select: (parent?: Shipment) => void; close: () => void;
+}) {
+  const [term, setTerm] = useState("");
+  const [rows, setRows] = useState<Shipment[]>([]);
+  const [message, setMessage] = useState("");
+  const [busy, setBusy] = useState(false);
+  return <Dialog title="关联父记录" onClose={close}>
+    <form className="shipping-tools" onSubmit={async (event) => {
+      event.preventDefault();
+      if (busy || !term.trim()) return;
+      setBusy(true); setMessage(""); setRows([]);
+      try {
+        const result: Page = await request(path + "records?" + new URLSearchParams({ channel: row.channel, q: term.trim() }));
+        const matches = result.rows.filter((item): item is Shipment => !isOrder(item) && item.id !== row.id);
+        setRows(matches);
+        if (!matches.length) setMessage("未找到可关联的记录");
+      } catch (error) { setMessage((error as Error).message); }
+      finally { setBusy(false); }
+    }}>
+      <input autoFocus value={term} aria-label="搜索父记录" placeholder="订单号或运单号"
+        onChange={(event) => setTerm(event.target.value)} />
+      <button className="btn" type="submit" disabled={busy || !term.trim()}><Search size={15} />搜索</button>
+    </form>
+    {message && <p role="status">{message}</p>}
+    <div className="shipping-picker-list">{rows.map((parent) => <button key={parent.id} type="button"
+      className="btn" onClick={() => select(parent)}>
+      <strong>{shipmentLabel(parent)}</strong><small>{parent.tracking || formatTime(parent.created_at)}</small>
+    </button>)}</div>
+    {row.parent_id && <div className="dialog-actions">
+      <button type="button" className="btn" onClick={() => select()}>解除父记录关联</button>
+    </div>}
+  </Dialog>;
+}
+
+function ShipmentChildren({ id, request, revision, colSpan, render }: {
+  id: string; request: Request; revision: number; colSpan: number; render: (rows: Shipment[]) => ReactNode;
+}) {
+  const [children, setChildren] = useState<Shipment[]>();
+  const [error, setError] = useState("");
+  const [retry, setRetry] = useState(0);
+  useEffect(() => {
+    let active = true;
+    setError("");
+    request(path + "records/" + id + "/children").then(
+      (result) => { if (active) setChildren(result); },
+      (e) => { if (active) setError(e.message); },
+    );
+    return () => { active = false; };
+  }, [id, revision, retry]);
+  return <>{children && render(children)}
+    {(!children || error) && <tr><td colSpan={colSpan} className="shipping-children-message">
+      {error ? <>{error} <button className="btn small" type="button" onClick={() => setRetry((value) => value + 1)}>重试</button></>
+        : "正在加载子记录…"}
+    </td></tr>}
+  </>;
 }
 
 type Update = (changes: Partial<Shipment>) => void;
@@ -240,7 +302,8 @@ function ShipmentCell({ row, column, edit, saving, open, pick, request }: {
       onChange={(event) => set(event.target.value)} />;
   }
   if (key === "reference") return <button type="button" className="text-link mono shipping-reference"
-    onClick={() => open({ kind: "shipment", id: row.id, reference: row.reference })}>{row.reference || "查看记录"}</button>;
+    onClick={() => open({ kind: "shipment", id: row.id, reference: shipmentLabel(row) })}>
+    {row.reference || (row.parent_id ? "子记录" : "查看记录")}</button>;
   if (key === "tracking") return <Tracking shipment={row} />;
   if (key === "source") return <SourceTag value={row.details.source} />;
   const displayed = fromOrder ? value : field ? value : row.details[key];
@@ -255,6 +318,9 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   const [term, setTerm] = useState("");
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("");
+  const [deleted, setDeleted] = useState(false);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [treeRevision, setTreeRevision] = useState(0);
   const [page, setPage] = useState(1);
   const [data, setData] = useState<Page>();
   const [busy, setBusy] = useState(true);
@@ -265,7 +331,9 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   const [retry, setRetry] = useState(0);
   const [detail, setDetail] = useState<RelatedTarget>();
   const [edit, setEdit] = useState<Shipment>();
-  const [picker, setPicker] = useState<"order" | "devices">();
+  const [draftAnchor, setDraftAnchor] = useState<string>();
+  const initialParent = useRef<string | null>(null);
+  const [picker, setPicker] = useState<"order" | "devices" | "parent">();
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("");
   const [hiddenFields, setHiddenFields] = useState<Record<string, string[]>>(() => {
@@ -282,15 +350,21 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   const hidden = Array.isArray(hiddenFields[view]) ? hiddenFields[view] : [];
   const columns = availableColumns.filter((column) => column.fixed || !hidden.includes(column.key));
   const canPaste = orders && admin && !readOnly;
-  const tableWidth = columns.reduce((total, column) => total + column.width, readOnly ? 45 : 149);
+  const actionWidth = orders ? 104 : 126;
+  const tableWidth = columns.reduce((total, column) => total + column.width, 45 + (readOnly ? 0 : actionWidth));
   const more = !!data && page * data.page_size < data.total;
   const rows = data?.rows || [];
+  const grouped = !orders && !search && !status && !deleted;
+  const expandable = !orders && !status && !deleted;
+  const loadedIds = new Set(rows.map((row) => row.id));
 
   useEffect(() => {
     let active = true;
     setBusy(true);
     setLoadError("");
     const query = new URLSearchParams({ channel, q: search, status, page: String(page) });
+    if (grouped) query.set("roots", "1");
+    if (!orders && deleted) query.set("deleted", "1");
     request(path + (orders ? "orders?" : "records?") + query).then(
       (result: Page) => {
         if (!active) return;
@@ -304,7 +378,7 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
       (error) => { if (active) setLoadError(error.message); },
     ).finally(() => { if (active) setBusy(false); });
     return () => { active = false; };
-  }, [channel, orders, search, status, page, refresh, retry]);
+  }, [channel, orders, search, status, page, refresh, retry, grouped, deleted]);
 
   useEffect(() => {
     const node = tail.current;
@@ -337,8 +411,8 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     setSaveError("");
     return true;
   }
-  function resetList() {
-    grid.current?.scrollTo({ top: 0 });
+  function resetList(scroll = true) {
+    if (scroll) grid.current?.scrollTo({ top: 0 });
     setData(undefined);
     setBusy(true);
     setPage(1);
@@ -352,21 +426,32 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     setSearch("");
     setTerm("");
     setStatus("");
+    setDeleted(false);
+    setExpanded({});
     setNotice("");
     resetList();
   }
   function begin(row: Shipment) {
-    if (readOnly || (edit && !abandon())) return;
+    if (readOnly || deleted || row.deleted_at || saving || (edit && !abandon())) return;
     setNotice("");
     setSaveError("");
     setEdit(row);
-    if (!row.id) grid.current?.scrollTo({ top: 0, left: 0 });
+    initialParent.current = row.parent_id;
+    setDraftAnchor(!row.id ? row.parent_id || undefined : undefined);
+    if (!row.id && !row.parent_id) grid.current?.scrollTo({ top: 0, left: 0 });
+  }
+  function beginChild(parent: Shipment) {
+    if (saving || !abandon()) return;
+    setExpanded((value) => ({ ...value, [parent.id]: true }));
+    begin(emptyShipment(parent.channel, undefined, parent));
   }
   function beginFromOrder(order: Order) {
+    if (!abandon()) return;
     setOrders(false);
     setSearch("");
     setTerm("");
     setStatus("");
+    setDeleted(false);
     resetList();
     begin(emptyShipment("ks", order));
   }
@@ -379,12 +464,20 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
       const saved: Shipment = await request(path + "records" + (edit.id ? "/" + edit.id : ""), edit.id ? "PUT" : "POST", {
         channel: edit.channel, reference: edit.reference, shipped_on: edit.shipped_on, tracking: edit.tracking,
         details: edit.details, ks_order_id: edit.ks_order_id, devices: edit.devices.map((device) => device.serial),
-        version: edit.updated_at || undefined,
+        version: edit.updated_at || undefined, parent_id: edit.parent_id,
       });
       setEdit(undefined);
-      if (edit.id) {
-        const old = rows.find((row): row is Shipment => !isOrder(row) && row.id === saved.id);
-        if (search ||
+      const old = rows.find((row): row is Shipment => !isOrder(row) && row.id === saved.id);
+      setTreeRevision((value) => value + 1);
+      if (saved.parent_id && !edit.id) {
+        setExpanded((value) => ({ ...value, [saved.parent_id!]: true }));
+        if (expandable && saved.parent_id === draftAnchor) setData((previous) => previous && { ...previous, rows: previous.rows.map((row) =>
+          row.id === saved.parent_id && !isOrder(row) ? { ...row, child_count: row.child_count + 1 } : row) });
+        else {
+          setSearch(""); setTerm(""); setStatus(""); resetList();
+        }
+      } else if (edit.id) {
+        if (saved.parent_id !== initialParent.current || search ||
           (status && !!(old?.shipped_on || old?.tracking) !== !!(saved.shipped_on || saved.tracking))) resetList();
         else setData((previous) => previous && { ...previous, rows: previous.rows.map((row) => row.id === saved.id ? saved : row) });
       } else {
@@ -394,6 +487,21 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
         resetList();
       }
       setNotice("发货记录已保存");
+    } catch (error) { setSaveError((error as Error).message); }
+    finally { setSaving(false); }
+  }
+
+  async function changeDeleted(row: Shipment) {
+    if (readOnly || saving || !abandon()) return;
+    const restoring = !!row.deleted_at;
+    if (!restoring && !window.confirm("删除「" + shipmentLabel(row) + "」？可在「已删除」中恢复。")) return;
+    setSaving(true); setSaveError(""); setNotice("");
+    try {
+      await request(path + "records/" + row.id + (restoring ? "/restore" : ""), restoring ? "POST" : "DELETE",
+        { version: row.updated_at });
+      setTreeRevision((value) => value + 1);
+      resetList(false);
+      setNotice(restoring ? "发货记录已恢复" : "已删除，可在「已删除」中恢复");
     } catch (error) { setSaveError((error as Error).message); }
     finally { setSaving(false); }
   }
@@ -511,29 +619,63 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     return <span title={String(row.details[key] ?? "")}>{row.details[key] ?? "—"}</span>;
   }
 
-  const shipmentRow = (item: Shipment, index: number | string) => {
+  const shipmentRow = (item: Shipment, index: number | string, depth = 0): ReactNode => {
     const editing = edit && edit.id === item.id;
     const row = editing ? edit : item;
-    return <tr key={row.id || "new"} className={editing ? "shipping-row-editing" : ""} aria-busy={editing && saving}>
-      <td className="shipping-row-index">{!readOnly && !editing && <button type="button" className="shipping-mobile-edit"
+    const writable = !readOnly && !row.deleted_at;
+    const isExpanded = !!expanded[item.id];
+    const canExpand = expandable && !!item.child_count;
+    const parentLabel = row.parent_reference || row.parent_tracking || "发货记录";
+    const rowClass = [editing && "shipping-row-editing", depth > 0 && "shipping-child-row"].filter(Boolean).join(" ");
+    return <Fragment key={row.id || "new"}><tr className={rowClass} aria-busy={editing && saving}>
+      <td className="shipping-row-index">{writable && !editing && <button type="button" className="shipping-mobile-edit"
         aria-label={"编辑第 " + index + " 行"} title="编辑" disabled={saving} onClick={() => begin(row)}><Pencil size={12} /></button>}
         {index}</td>
       {columns.map((column) => <td key={column.key} onDoubleClick={(event) => {
-        if (!editing && !["reference", "backer", "devices", "status", "tracking", "created_at"].includes(column.key) &&
+        if (writable && !editing && !["reference", "backer", "devices", "status", "tracking", "created_at"].includes(column.key) &&
           !(channel === "ks" && contactFields.some(([key]) => key === column.key))) {
           const cell = event.currentTarget;
           begin(row);
           requestAnimationFrame(() => cell.querySelector<HTMLElement>("input,textarea,button")?.focus());
         }
       }}>
-        <ShipmentCell row={row} column={column} edit={editing ? update : undefined} saving={saving}
-          open={setDetail} pick={setPicker} request={request} />
+        {column.key === "reference" ? <div className="shipping-hierarchy" style={{ paddingLeft: Math.min(depth, 3) * 10 }}>
+          {canExpand ? <button type="button" className="shipping-icon-btn" aria-expanded={isExpanded}
+            aria-label={(isExpanded ? "收起子记录：" : "展开子记录：") + shipmentLabel(item)}
+            title={item.child_count + " 条子记录"} disabled={!!edit || saving}
+            onClick={() => setExpanded((value) => ({ ...value, [item.id]: !isExpanded }))}>
+            {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
+          </button> : depth > 0 && <CornerDownRight className="shipping-child-marker" size={13} aria-hidden="true" />}
+          <ShipmentCell row={row} column={column} edit={editing ? update : undefined} saving={saving}
+            open={setDetail} pick={setPicker} request={request} />
+          {!editing && canExpand && <span className="shipping-child-count">{item.child_count}</span>}
+          {editing ? <button className="shipping-icon-btn" type="button" title={row.parent_id ? "父记录：" + parentLabel : "关联父记录"}
+            aria-label="关联父记录" disabled={saving} onClick={() => setPicker("parent")}><Link2 size={14} /></button>
+            : !depth && row.parent_id && <button className="shipping-icon-btn" type="button"
+              title={"父记录：" + parentLabel} aria-label={"打开父记录：" + parentLabel}
+              onClick={() => setDetail({ kind: "shipment", id: row.parent_id!, reference: parentLabel })}>
+              <CornerDownRight size={13} /></button>}
+        </div> : <ShipmentCell row={row} column={column} edit={editing ? update : undefined} saving={saving}
+          open={setDetail} pick={setPicker} request={request} />}
       </td>)}
-      {!readOnly && <td className="shipping-row-action">{editing ? <>
+      {!readOnly && <td className="shipping-row-action">{row.deleted_at
+        ? <button type="button" className="btn small" disabled={saving} onClick={() => void changeDeleted(row)}>恢复</button>
+        : editing ? <>
         <button type="button" className="btn small primary" onClick={() => void save()} disabled={saving}>保存</button>
         <button type="button" className="btn small" disabled={saving} onClick={() => { setEdit(undefined); setSaveError(""); }}>取消</button>
-      </> : <button type="button" className="btn small" disabled={saving} onClick={() => begin(row)}>编辑</button>}</td>}
-    </tr>;
+      </> : <>
+        <button type="button" className="btn small" disabled={saving} onClick={() => begin(row)}>编辑</button>
+        <button type="button" className="btn small shipping-icon-btn" title="新增子记录" aria-label="新增子记录"
+          disabled={saving} onClick={() => beginChild(row)}><Plus size={14} /></button>
+        <button type="button" className="btn small shipping-icon-btn shipping-delete" title="删除" aria-label="删除"
+          disabled={saving} onClick={() => void changeDeleted(row)}><Trash2 size={13} /></button>
+      </>}</td>}
+    </tr>
+    {edit?.id === "" && draftAnchor && draftAnchor === row.id && shipmentRow(edit, "＋", depth + 1)}
+    {canExpand && isExpanded && <ShipmentChildren id={item.id} request={request} revision={treeRevision}
+      colSpan={columns.length + (readOnly ? 1 : 2)}
+      render={(children) => children.map((child, i) => shipmentRow(child, index + "." + (i + 1), depth + 1))} />}
+    </Fragment>;
   };
   return <section className="shipping-management">
     <div className="page-heading"><h1>发货管理</h1></div>
@@ -567,6 +709,10 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
         {channel === "ks" && <button className="btn" type="button" onClick={() => select("ks", !orders)}>
           {orders ? "返回 KS 发货台账" : "KS 发货信息"}
         </button>}
+        {!orders && <button type="button" className="btn" aria-pressed={deleted} onClick={() => {
+          if (!abandon()) return;
+          setDeleted(!deleted); setStatus(""); setTerm(""); setSearch(""); setNotice(""); resetList();
+        }}>{deleted ? "返回发货台账" : "已删除"}</button>}
         {!readOnly && (orders ? admin && <button className="btn primary" type="button" onClick={() => setImporting(true)}>
           <Upload size={15} />导入 KS 订单
         </button> : edit ? <>
@@ -574,7 +720,7 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
           <button type="button" className="btn primary" disabled={saving} onClick={() => void save()}>
             {saving ? "保存中…" : "保存当前行"}
           </button>
-        </> : <button className="btn primary" type="button" onClick={() => begin(emptyShipment(channel))}><Plus size={16} />登记发货</button>)}
+        </> : !deleted && <button className="btn primary" type="button" onClick={() => begin(emptyShipment(channel))}><Plus size={16} />登记发货</button>)}
       </div>
     </div>
     <datalist id="shipping-sources">{sources.map((source) => <option key={source} value={source} />)}</datalist>
@@ -586,13 +732,13 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
       onKeyDown={orderKeys}>
       <table style={{ width: tableWidth }}>
         <colgroup><col style={{ width: 45 }} />{columns.map((column) => <col key={column.key} style={{ width: column.width }} />)}
-          {!readOnly && <col style={{ width: 104 }} />}</colgroup>
+          {!readOnly && <col style={{ width: actionWidth }} />}</colgroup>
         <thead><tr><th className="shipping-row-index" scope="col">#</th>
           {columns.map((column) => <th key={column.key} scope="col">{column.label}</th>)}
           {!readOnly && <th className="shipping-row-action" scope="col">操作</th>}
         </tr></thead>
         <tbody>
-          {!orders && edit?.id === "" && shipmentRow(edit, "＋")}
+          {!orders && edit?.id === "" && !draftAnchor && shipmentRow(edit, "＋")}
           {canPaste && <tr className="shipping-paste-row">
             <td className="shipping-row-index">＋</td>
             {columns.map(({ key }) => <td key={key} data-order-row="" data-order-field={key}
@@ -604,7 +750,10 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
             <td className="shipping-row-action"></td>
           </tr>}
           {rows.map((row, index) => {
-            if (!isOrder(row)) return shipmentRow(row, index + 1);
+            if (!isOrder(row)) {
+              if (expandable && row.parent_id && expanded[row.parent_id] && loadedIds.has(row.parent_id)) return null;
+              return shipmentRow(row, index + 1);
+            }
             return <tr key={row.id}><td className="shipping-row-index">{index + 1}</td>
               {columns.map((column) => <td key={column.key} data-order-row={row.id} data-order-field={column.key}
                 className={cursor?.id === row.id && cursor.key === column.key ? "shipping-cell-selected" : ""}
@@ -618,13 +767,14 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
           })}
         </tbody>
       </table>
-      {!busy && !loadError && !rows.length && !edit && <p className="shipping-empty">暂无{orders ? "KS 订单" : "发货记录"}</p>}
+      {!busy && !loadError && !rows.length && !edit && <p className="shipping-empty">
+        暂无{orders ? "KS 订单" : deleted ? "已删除的发货记录" : "发货记录"}</p>}
       {loadError && <div className="shipping-load-error" role="alert">{loadError}
         <button type="button" className="btn small" onClick={() => setRetry((value) => value + 1)}>重试</button>
       </div>}
       <div ref={tail} className="shipping-load-tail" style={{ width: tableWidth }}>{busy ? "正在加载…" : ""}</div>
     </div>
-    <div className="shipping-count" role="status">已加载 {rows.length} / {data?.total ?? rows.length} 条</div>
+    <div className="shipping-count" role="status">已加载 {rows.length} / {data?.total ?? rows.length} {grouped ? "组" : "条"}</div>
     {detail && <RelatedRecordDialog target={detail} request={request} close={() => setDetail(undefined)} />}
     {picker === "order" && edit && <OrderPicker request={request} close={() => setPicker(undefined)} select={(order) => {
       const details = { ...edit.details };
@@ -638,6 +788,12 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
       <DevicePicker request={request} devices={edit.devices} setDevices={(devices) => update({ devices })} />
       <div className="dialog-actions"><button className="btn primary" type="button" onClick={() => setPicker(undefined)}>完成</button></div>
     </Dialog>}
+    {picker === "parent" && edit && <ParentPicker request={request} row={edit} close={() => setPicker(undefined)}
+      select={(parent) => {
+        update({ parent_id: parent?.id || null, parent_reference: parent?.reference || null,
+          parent_tracking: parent?.tracking || null });
+        setPicker(undefined);
+      }} />}
     {importing && <OrderImport request={request} close={() => setImporting(false)} done={() => {
       setImporting(false); resetList(); setNotice("KS 订单已导入");
     }} />}

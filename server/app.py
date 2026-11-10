@@ -681,6 +681,8 @@ def stage_restore(archive_path, directory):
                         optional.add('deleted_at')
                     if table == 'shipping_ks_orders' and version < shipping.CREATED_AT_VERSION:
                         optional.add('created_at')
+                    if table == 'shipping_records' and version < shipping.RECORD_RELATIONS_VERSION:
+                        optional.update(('parent_id', 'deleted_at'))
                     if not set(target_columns) - optional <= source_columns:
                         raise Problem('备份数据结构不完整')
                     columns = ','.join(name for name in target_columns if name in source_columns)
@@ -690,6 +692,8 @@ def stage_restore(archive_path, directory):
                     inspection.backfill_from_records(db)
                 if shipping.VERSION <= version < shipping.CREATED_AT_VERSION:
                     shipping.fill_created_at(db)
+                if shipping_tables and not shipping.valid_parent_links(db):
+                    raise Problem('备份中的发货父子关系无效')
                 db.execute("DELETE FROM settings WHERE key='password'")
                 if version >= 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                     raise Problem('备份中没有管理员账户')
@@ -1022,6 +1026,8 @@ class Handler(BaseHTTPRequestHandler):
     def shipping_request(self, project_id, resource, method):
         query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
         record_path = re.fullmatch(r'records/([a-f0-9]{24})', resource)
+        children_path = re.fullmatch(r'records/([a-f0-9]{24})/children', resource)
+        restore_path = re.fullmatch(r'records/([a-f0-9]{24})/restore', resource)
         order_path = re.fullmatch(r'orders/([a-f0-9]{24})', resource)
         if method == 'GET':
             with connect() as db:
@@ -1035,6 +1041,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(shipping.list_shipments(db, project_id, query.get('channel'), query))
                 if record_path:
                     return self.send(shipping.get_shipment(db, project_id, record_path[1]))
+                if children_path:
+                    return self.send(shipping.list_children(db, project_id, children_path[1]))
                 if resource == 'devices':
                     return self.send(shipping.find_devices(db, project_id, query))
                 if resource == 'carriers':
@@ -1084,6 +1092,19 @@ class Handler(BaseHTTPRequestHandler):
                 if order_path or result['added'] or result['updated']:
                     touch_project(db)
             return self.send(result)
+        if (record_path and method == 'DELETE') or (restore_path and method == 'POST'):
+            data = self.body()
+            if not isinstance(data, dict):
+                raise Problem('发货记录格式无效')
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                deleted = method == 'DELETE'
+                row = shipping.set_shipment_deleted(db, project_id, (record_path or restore_path)[1],
+                                                     data.get('version'), now(), deleted)
+                touch_project(db)
+                log_activity(db, self.user, '删除发货记录' if deleted else '恢复发货记录',
+                             row['id'], row['reference'] or row['tracking'])
+            return self.send({'ok': True})
         if (resource == 'records' and method == 'POST') or (record_path and method == 'PUT'):
             data = self.body()
             if not isinstance(data, dict):

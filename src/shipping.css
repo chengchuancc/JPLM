@@ -38,6 +38,17 @@
 .shipping-table .shipping-row-action { text-align: center; }
 .shipping-table .shipping-row-action button { min-height: 24px; padding: 2px 6px; }
 .shipping-table .shipping-row-action button + button { margin-left: 3px; }
+.shipping-hierarchy { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.shipping-hierarchy .shipping-reference { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.shipping-icon-btn { display: inline-grid; place-items: center; min-width: 22px; min-height: 24px; padding: 2px 4px;
+  border: 1px solid transparent; border-radius: 4px; background: transparent; color: #315789; flex: 0 0 auto; }
+.shipping-icon-btn:hover:not(:disabled) { background: #e8f0ff; border-color: #bed2f5; }
+.shipping-icon-btn.shipping-delete:hover:not(:disabled) { background: #fff1f0; border-color: #f4c1bc; color: #a42620; }
+.shipping-child-count { flex: 0 0 auto; color: #4d5e78; background: #e9eff8; border-radius: 3px; padding: 1px 4px; }
+.shipping-child-marker { flex: 0 0 auto; color: #617998; }
+.shipping-table tbody tr.shipping-child-row:not(.shipping-row-editing) td:nth-child(-n+2) { background: #f3f7fd; }
+.shipping-table .shipping-children-message { color: var(--muted); padding-inline-start: 55px; }
+.shipping-detail-section h4 { font-size: 13px; margin: 8px 0 4px; }
 .shipping-mobile-edit { display: none; }
 .shipping-relation-cell { display: flex; align-items: center; gap: 4px; min-width: 0; }
 .shipping-chip, .shipping-relation-add {

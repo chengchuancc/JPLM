@@ -128,6 +128,9 @@ def extract(path):
     ):
         table = tables[name]
         for rid, row in table.records.items():
+            parents = table.cell(row, '父记录') or []
+            require(len(parents) <= 1 and all(parent in table.records for parent in parents),
+                    '附件的父记录关联无效')
             linked = table.cell(row, 'Backer #Number') or []
             require(len(linked) <= 1, '一笔 KS 发货关联了多个 Backer')
             devices = []
@@ -145,6 +148,7 @@ def extract(path):
             details = table.details(row, COMMON if channel == 'ks' else {**COMMON, **OTHER})
             shipped_on = table.value(row, date_field)
             records.append(dict(channel=channel, source_id=rid,
+                                parent_source_id=parents[0] if parents else None,
                                 backer=backers[linked[0]] if linked else '',
                                 reference=shipping.string(table.value(row, ref_field), 150),
                                 tracking=shipping.string(table.value(row, 'Tracking Number'), 500),
@@ -154,6 +158,29 @@ def extract(path):
                                 updated_at=table.stamp(rid, 'modifiedTime')))
     return dict(orders=orders, records=records, source_links=links['source_links'],
                 fallback_number=links['fallback_number'])
+
+
+def parent_links(records):
+    return [(row['channel'], row['source_id'], row['parent_source_id'])
+            for row in records if row.get('parent_source_id')]
+
+
+def apply_parent_links(db, project, links):
+    count = 0
+    for channel, child_source_id, parent_source_id in links:
+        child = db.execute('''SELECT id,parent_id,deleted_at FROM shipping_records
+            WHERE project_id=? AND channel=? AND source_id=?''', (project, channel, child_source_id)).fetchone()
+        parent = db.execute('''SELECT id FROM shipping_records
+            WHERE project_id=? AND channel=? AND source_id=?''', (project, channel, parent_source_id)).fetchone()
+        require(child and parent and child['parent_id'] in (None, parent['id']), '原始父子关系与当前台账不一致')
+        if child['parent_id'] == parent['id']:
+            continue
+        require(not child['deleted_at'], '子记录已删除，请先恢复')
+        shipping.validate_parent(db, project, child['id'], channel, parent['id'])
+        db.execute('UPDATE shipping_records SET parent_id=? WHERE project_id=? AND id=?',
+                   (parent['id'], project, child['id']))
+        count += 1
+    return count
 
 
 def apply(db, project, payload):
@@ -188,6 +215,7 @@ def apply(db, project, payload):
         shipment_ids.append(shipment_id)
         added[channel] += 1
 
+    added_parents = apply_parent_links(db, project, parent_links(payload['records']))
     total = Counter()
     for record, shipment_id in zip(payload['records'], shipment_ids):
         row = db.execute('SELECT * FROM shipping_records WHERE project_id=? AND id=?',
@@ -206,13 +234,13 @@ def apply(db, project, payload):
         row = shipping.lookup_order(db, project, order['backer'])
         require(row and row['details'] == order['details'], 'KS 收件资料核对不一致')
     require(db.execute('PRAGMA foreign_key_check').fetchone() is None, '关联完整性检查失败')
-    if added or added_orders:
+    if added or added_orders or added_parents:
         db.project_id = project
         app.log_activity(db, {'id': None, 'name': '系统迁移'}, '导入飞书发货台账', '', '发货管理',
-                         f'新增 KS 资料 {added_orders}、KS 发货 {added["ks"]}、其他发货 {added["other"]}')
+                         f'新增 KS 资料 {added_orders}、KS 发货 {added["ks"]}、其他发货 {added["other"]}、父子关系 {added_parents}')
     return {**total, 'orders': len(order_ids), 'ks': sum(r['channel'] == 'ks' for r in payload['records']),
             'other': sum(r['channel'] == 'other' for r in payload['records']), 'added_orders': added_orders,
-            'added_shipments': sum(added.values()), 'source_links': payload['source_links'],
+            'added_shipments': sum(added.values()), 'added_parents': added_parents, 'source_links': payload['source_links'],
             'fallback_number': payload['fallback_number']}
 
 
@@ -231,6 +259,7 @@ def main():
         with args.output.open('x') as output:
             json.dump(payload, output, ensure_ascii=False, separators=(',', ':'))
         report = {'orders': len(payload['orders']), 'shipments': len(payload['records']),
+                  'parent_links': len(parent_links(payload['records'])),
                   'source_links': payload['source_links'], 'fallback_number': payload['fallback_number']}
     else:
         payload = json.loads(args.input.read_bytes())
