@@ -7,7 +7,7 @@ const groupLabels = {
 };
 
 export type ShippingGroup = keyof typeof groupLabels;
-type HeaderColumn = { key: string; label: string; group: ShippingGroup; width?: number; fixed?: boolean };
+type HeaderColumn = { key: string; label: string; group: ShippingGroup; width?: number; fixed?: boolean; hint?: string };
 
 export function ShippingTableHeader({ columns, index, actionWidth }: {
   columns: readonly HeaderColumn[]; index?: boolean; actionWidth?: number;
@@ -32,9 +32,10 @@ export function ShippingTableHeader({ columns, index, actionWidth }: {
         {actionWidth && <th className="shipping-row-action" scope="col" rowSpan={2}>操作</th>}
       </tr>
       <tr className="shipping-field-head">
-        {columns.map((column) => <th key={column.key} scope="col"
+        {columns.map((column) => <th key={column.key} scope="col" title={column.hint || column.label}
           className={column.fixed ? "shipping-record-key" : column.group === "goods" ? "shipping-goods" : undefined}>
           {column.label}
+          {column.hint && <small className="shipping-column-hint">{column.hint}</small>}
         </th>)}
       </tr>
     </thead>

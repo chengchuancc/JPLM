@@ -10,7 +10,9 @@ import { type Request, type Channel, type Order, type Device, type Shipment, typ
 import { ShippingPicker } from "./shipping-options";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
-import { ShippingTableHeader, type ShippingGroup } from "./shipping-table-header";
+import { ShippingTableHeader } from "./shipping-table-header";
+import { columnClass, createdColumn, fieldColumns, groupedFields, ksGoodsColumns, productFields, shipmentColumns,
+  type ShippingColumn as Column } from "./shipping-columns";
 
 type ImportReport = { added: number; updated: number; unchanged: number; duplicate: number; invalid: number;
   errors: { row: number; error: string }[] };
@@ -151,13 +153,6 @@ function OrderPicker({ request, close, select }: { request: Request; close: () =
   </Dialog>;
 }
 
-type Field = { key: string; label: string; width: number; fixed?: boolean; type?: "date" | "number" | "quantity" };
-type Column = Field & { group: ShippingGroup };
-const fieldColumns = (fields: string[][], width: number, type?: Field["type"]): Field[] =>
-  fields.map(([key, label]) => ({ key, label, width, type }));
-const groupedFields = (group: ShippingGroup, fields: Field[]): Column[] => fields.map((field) => ({ ...field, group }));
-const createdColumn: Field = { key: "created_at", label: "添加时间 ↓", width: 151 };
-const goodsColumns = [...fieldColumns(items, 88, "quantity"), ...fieldColumns([["sku", "SKU"]], 135)];
 const orderContacts = [...contactFields, ["country_code", "国家代码"], ["address_status", "地址确认"]];
 const orderDetailKeys = new Set([...orderContacts, ...items, ["sku"], ["notes"]].map(([key]) => key));
 const orderColumns: Column[] = [
@@ -165,11 +160,11 @@ const orderColumns: Column[] = [
     { key: "backer", label: "Backer 编号", width: 130, fixed: true }, createdColumn,
     ...fieldColumns(orderFields.filter(([key]) => !orderDetailKeys.has(key)), 145),
   ]),
-  ...groupedFields("goods", goodsColumns),
   ...groupedFields("transport", [
     { key: "status", label: "发货状态", width: 96 },
     { key: "shipments", label: "发货记录", width: 100 },
   ]),
+  ...groupedFields("goods", ksGoodsColumns),
   ...groupedFields("customer", fieldColumns(orderContacts, 145)),
   ...groupedFields("notes", [{ key: "notes", label: "备注", width: 192 }]),
 ];
@@ -177,33 +172,6 @@ const orderWritable = (key: string) => key === "backer" || orderFields.some(([fi
 const orderMovement: Record<string, [number, number]> = {
   ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1],
 };
-function shipmentColumns(channel: Channel): Column[] {
-  const contacts = channel === "ks" ? contactFields : otherContactFields;
-  return [
-    ...groupedFields("order", [
-      { key: "reference", label: channel === "ks" ? "发货编号" : "订单号", width: 170, fixed: true },
-      createdColumn,
-      { key: channel === "ks" ? "backer" : "source", label: channel === "ks" ? "Backer 编号" : "来源", width: 120 },
-    ]),
-    ...groupedFields("goods", channel === "ks" ? goodsColumns : [{ key: "shipment_items", label: "发货商品", width: 275 }]),
-    ...groupedFields("transport", [
-      { key: "devices", label: "发货设备 S/N", width: 146 },
-      { key: "shipped_on", label: "发货日期", width: 135, type: "date" },
-      { key: "tracking", label: "运单号", width: 175 },
-      { key: "status", label: "发货状态", width: 94 },
-      { key: "carrier", label: "货代 / 承运商", width: 190 },
-      ...fieldColumns(costs, 100, "number"),
-    ]),
-    ...groupedFields("customer", contacts.map(([key, label]) => ({
-      key, label, width: key === "name" || key === "country" ? 125 : 158,
-    }))),
-    ...groupedFields("notes", [{ key: "notes", label: "备注", width: 192 }]),
-  ];
-}
-
-const columnClass = (column: Column) =>
-  column.fixed ? "shipping-record-key" : column.group === "goods" ? "shipping-goods" : "";
-
 function isOrderField(channel: Channel, key: string) {
   return channel === "ks" && (key === "sku" || [...contactFields, ...items].some(([field]) => field === key));
 }
@@ -222,27 +190,14 @@ function emptyShipment(channel: Channel, order?: Order, parent?: Shipment): Ship
   };
 }
 
-function ProjectShipmentItems({ request, row, close, select }: {
-  request: Request; row: Shipment; close: () => void; select: (items: ShipmentItem[]) => void;
+function ProjectShipmentItems({ products, row, close, select }: {
+  products: ProductChoice[]; row: Shipment; close: () => void; select: (items: ShipmentItem[]) => void;
 }) {
-  const [products, setProducts] = useState<ProductChoice[]>([]);
-  const [error, setError] = useState("");
-  const [busy, setBusy] = useState(true);
-  const [items, setItems] = useState(() => row.shipment_items.filter((item) => item.project_id === row.project_id || !row.id));
-  const other = row.id ? row.shipment_items.filter((item) => item.project_id !== row.project_id) : [];
-  useEffect(() => {
-    let active = true;
-    request(path + "products").then((value) => { if (active) setProducts(value); },
-      (e) => { if (active) setError(e.message); }).finally(() => { if (active) setBusy(false); });
-    return () => { active = false; };
-  }, [request]);
+  const [items, setItems] = useState(row.shipment_items);
   return <Dialog title="发货商品" onClose={close} wide>
-    {error && <p role="alert" className="form-error">{error}</p>}
-    {busy ? <p className="muted">正在加载产品…</p> :
-      <ShipmentItemEditor products={products} items={items} onChange={setItems} disabled={!!error} />}
-    {!!other.length && <p><ShipmentItems items={other} showProject /></p>}
+    <ShipmentItemEditor products={products} items={items} onChange={setItems} />
     <div className="dialog-actions"><button type="button" className="btn primary"
-      disabled={busy || !!error || !canSaveItems(items)} onClick={() => select([...items, ...other])}>完成</button></div>
+      disabled={!canSaveItems(items)} onClick={() => select(items)}>完成</button></div>
   </Dialog>;
 }
 
@@ -305,16 +260,27 @@ function ShipmentChildren({ id, request, revision, colSpan, render }: {
 }
 
 type Update = (changes: Partial<Shipment>) => void;
-function ShipmentCell({ row, column, edit, saving, orderLocked, open, pick, request }: {
+function ShipmentCell({ row, column, edit, editItems, saving, orderLocked, open, pick, request }: {
   row: Shipment; column: Column; edit?: Update; open: (target: RelatedTarget) => void;
+  editItems?: (items: ShipmentItem[]) => void;
   saving: boolean; orderLocked?: boolean;
   pick: (field: "order" | "devices" | "items") => void;
   request: Request;
 }) {
   const key = column.key;
-  if (key === "shipment_items") return <div className="shipping-relation-cell">
-    <ShipmentItems items={row.shipment_items} links={!edit} />
-    {edit && <button type="button" className="shipping-relation-add" disabled={saving}
+  const product = column.product;
+  if (product) {
+    const match = row.shipment_items.find((item) => item.product_id === product.product_id && item.project_id === product.project_id);
+    return editItems ? <input type="number" aria-label={product.name + "数量"} value={match?.quantity ?? ""}
+      min={0} step={1} max={1000000000} disabled={saving} onChange={(event) => {
+        const quantity = event.target.valueAsNumber || 0;
+        editItems([...row.shipment_items.filter((item) => item !== match),
+          ...(quantity ? [{ ...product, available: match?.available, quantity }] : [])]);
+      }} /> : <span className="shipping-quantity">{match?.quantity ?? "—"}</span>;
+  }
+  if (key === "legacy_items") return <div className="shipping-relation-cell">
+    <ShipmentItems items={row.shipment_items.filter((item) => !item.product_id)} />
+    {editItems && row.shipment_items.some((item) => !item.product_id) && <button type="button" className="shipping-relation-add" disabled={saving}
       aria-label="编辑发货商品" onClick={() => pick("items")}><Plus size={14} /></button>}
   </div>;
   if (key === "devices") {
@@ -368,7 +334,6 @@ function ShipmentCell({ row, column, edit, saving, orderLocked, open, pick, requ
       value={field ? row[field] : row.details[key] ?? ""}
       onChange={(event) => set(event.target.value)} />;
   }
-  if (key === "reference" && row.shared) return <span className="mono" title="跨项目发货">{row.reference || "—"}</span>;
   if (key === "reference") return <button type="button" className="text-link mono shipping-reference"
     onClick={() => open({ kind: "shipment", id: row.id, reference: shipmentLabel(row) })}>
     {row.reference || (row.parent_id ? "子记录" : "查看记录")}</button>;
@@ -377,8 +342,9 @@ function ShipmentCell({ row, column, edit, saving, orderLocked, open, pick, requ
   return <span title={String(value ?? "")}>{value === "" ? "—" : value ?? "—"}</span>;
 }
 
-export default function ShippingManagement({ request, admin, readOnly, onDraftChange, initialRecord }: {
-  request: Request; admin: boolean; readOnly: boolean; onDraftChange: (dirty: boolean) => void; initialRecord?: string;
+export default function ShippingManagement({ request, products, admin, readOnly, onDraftChange, initialRecord }: {
+  request: Request; products: ProductChoice[]; admin: boolean; readOnly: boolean;
+  onDraftChange: (dirty: boolean) => void; initialRecord?: string;
 }) {
   const [channel, setChannel] = useState<Channel>(initialRecord ? "other" : "ks");
   const [focused, setFocused] = useState(initialRecord || "");
@@ -415,14 +381,16 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   const grid = useRef<HTMLDivElement>(null);
   const tail = useRef<HTMLDivElement>(null);
   const view = orders ? "orders" : channel;
-  const availableColumns = orders ? orderColumns : shipmentColumns(channel);
+  const rows = data?.rows || [];
+  const shipmentHistory = rows.flatMap((row) => isOrder(row) ? [] : row.shipment_items);
+  const availableColumns = orders ? orderColumns : shipmentColumns(channel,
+    channel === "other" ? productFields(products, shipmentHistory) : []);
   const hidden = Array.isArray(hiddenFields[view]) ? hiddenFields[view] : [];
   const columns = availableColumns.filter((column) => column.fixed || !hidden.includes(column.key));
   const canPaste = orders && admin && !readOnly;
   const actionWidth = orders ? 104 : 126;
   const tableWidth = columns.reduce((total, column) => total + column.width, 45 + (readOnly ? 0 : actionWidth));
   const more = !!data && page * data.page_size < data.total;
-  const rows = data?.rows || [];
   const grouped = !orders && !search && !status && !deleted && !focused;
   const expandable = !orders && !status && !deleted;
   const loadedIds = new Set(rows.map((row) => row.id));
@@ -503,7 +471,7 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     resetList();
   }
   function begin(row: Shipment) {
-    if (readOnly || deleted || row.shared || row.deleted_at || saving || (edit && !abandon())) return;
+    if (readOnly || deleted || row.deleted_at || row.shared && !row.can_edit_items || saving || (edit && !abandon())) return;
     setNotice("");
     setSaveError("");
     setEdit(row);
@@ -528,17 +496,34 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     begin(emptyShipment("ks", order));
   }
   const update: Update = (changes) => setEdit((row) => row && { ...row, ...changes });
+  function updateItems(shipment_items: ShipmentItem[]) {
+    update({ shipment_items });
+    setItemsDirty(true);
+  }
   async function save() {
     if (!edit || saving) return;
+    if (itemsDirty && !canSaveItems(edit.shipment_items)) {
+      setSaveError("请输入正整数数量，并关联未匹配的历史商品");
+      return;
+    }
     setSaving(true);
     setSaveError("");
     try {
+      if (edit.shared) {
+        if (itemsDirty) await request(path + "records/" + edit.id + "/shared-items", "PUT", {
+          version: edit.updated_at, shipment_items: itemPayload(edit.shipment_items),
+        });
+        setEdit(undefined);
+        resetList();
+        setNotice("发货商品已保存");
+        return;
+      }
       const saved: Shipment = await request(path + "records" + (edit.id ? "/" + edit.id : ""), edit.id ? "PUT" : "POST", {
         channel: edit.channel, reference: edit.reference, shipped_on: edit.shipped_on, tracking: edit.tracking,
         details: edit.details, ks_order_id: edit.ks_order_id, devices: edit.devices.map((device) => device.serial),
         version: edit.updated_at || undefined, parent_id: edit.parent_id,
         shipment_items: edit.channel === "other" && (!edit.id || itemsDirty) ?
-          itemPayload(edit.shipment_items.filter((item) => item.project_id === edit.project_id || !edit.id)) : undefined,
+          itemPayload(edit.shipment_items) : undefined,
       });
       setEdit(undefined);
       const old = rows.find((row): row is Shipment => !isOrder(row) && row.id === saved.id);
@@ -724,16 +709,18 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     const row = editing ? edit : item;
     const orderLocked = Boolean(item.id && item.ks_order_id);
     const writable = !readOnly && !row.deleted_at && !row.shared;
+    const writableItems = writable || !readOnly && !!row.can_edit_items;
     const isExpanded = !!expanded[item.id];
     const canExpand = expandable && !!item.child_count;
     const parentLabel = row.parent_reference || row.parent_tracking || "发货记录";
     const rowClass = [editing && "shipping-row-editing", depth > 0 && "shipping-child-row"].filter(Boolean).join(" ");
     return <Fragment key={row.id || "new"}><tr className={rowClass} aria-busy={editing && saving}>
-      <td className="shipping-row-index">{writable && !editing && <button type="button" className="shipping-mobile-edit"
+      <td className="shipping-row-index">{writableItems && !editing && <button type="button" className="shipping-mobile-edit"
         aria-label={"编辑第 " + index + " 行"} title="编辑" disabled={saving} onClick={() => begin(row)}><Pencil size={12} /></button>}
         {index}</td>
       {columns.map((column) => <td key={column.key} className={columnClass(column)} onDoubleClick={(event) => {
-        if (writable && !editing && !["reference", "backer", "devices", "tracking", "created_at"].includes(column.key) &&
+        if ((writable || writableItems && column.group === "goods") && !editing &&
+          !["reference", "backer", "devices", "tracking", "created_at"].includes(column.key) &&
           !isOrderField(channel, column.key)) {
           const cell = event.currentTarget;
           begin(row);
@@ -747,24 +734,26 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
             onClick={() => setExpanded((value) => ({ ...value, [item.id]: !isExpanded }))}>
             {isExpanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
           </button> : depth > 0 && <CornerDownRight className="shipping-child-marker" size={13} aria-hidden="true" />}
-          <ShipmentCell row={row} column={column} edit={editing ? update : undefined} saving={saving} orderLocked={orderLocked}
+          <ShipmentCell row={row} column={column} edit={editing && !row.shared ? update : undefined} saving={saving} orderLocked={orderLocked}
             open={setDetail} pick={setPicker} request={request} />
           {!editing && canExpand && <span className="shipping-child-count">{item.child_count}</span>}
-          {editing ? <button className="shipping-icon-btn" type="button" title={row.parent_id ? "父记录：" + parentLabel : "关联父记录"}
+          {editing && !row.shared ? <button className="shipping-icon-btn" type="button" title={row.parent_id ? "父记录：" + parentLabel : "关联父记录"}
             aria-label="关联父记录" disabled={saving} onClick={() => setPicker("parent")}><Link2 size={14} /></button>
             : !depth && row.parent_id && <button className="shipping-icon-btn" type="button"
               title={"父记录：" + parentLabel} aria-label={"打开父记录：" + parentLabel}
               onClick={() => setDetail({ kind: "shipment", id: row.parent_id!, reference: parentLabel })}>
               <CornerDownRight size={13} /></button>}
-        </div> : <ShipmentCell row={row} column={column} edit={editing ? update : undefined} saving={saving} orderLocked={orderLocked}
+        </div> : <ShipmentCell row={row} column={column} edit={editing && !row.shared ? update : undefined}
+          editItems={editing ? updateItems : undefined} saving={saving} orderLocked={orderLocked}
           open={setDetail} pick={setPicker} request={request} />}
       </td>)}
-      {!readOnly && <td className="shipping-row-action">{row.shared ? <small className="muted">跨项目</small> : row.deleted_at
+      {!readOnly && <td className="shipping-row-action">{row.deleted_at
         ? <button type="button" className="btn small" disabled={saving} onClick={() => void changeDeleted(row)}>恢复</button>
         : editing ? <>
         <button type="button" className="btn small primary" onClick={() => void save()} disabled={saving}>保存</button>
         <button type="button" className="btn small" disabled={saving} onClick={() => { setEdit(undefined); setSaveError(""); }}>取消</button>
-      </> : <>
+      </> : row.shared ? (row.can_edit_items ? <button type="button" className="btn small" onClick={() => begin(row)}>
+        编辑商品</button> : <small className="muted">跨项目</small>) : <>
         <button type="button" className="btn small" disabled={saving} onClick={() => begin(row)}>编辑</button>
         <button type="button" className="btn small shipping-icon-btn" title="新增子记录" aria-label="新增子记录"
           disabled={saving} onClick={() => beginChild(row)}><Plus size={14} /></button>
@@ -890,10 +879,9 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
           parent_tracking: parent?.tracking || null });
         setPicker(undefined);
       }} />}
-    {picker === "items" && edit && <ProjectShipmentItems request={request} row={edit}
+    {picker === "items" && edit && <ProjectShipmentItems products={products} row={edit}
       close={() => setPicker(undefined)} select={(shipment_items) => {
-        update({ shipment_items });
-        setItemsDirty(true);
+        updateItems(shipment_items);
         setPicker(undefined);
       }} />}
     {importing && <OrderImport request={request} close={() => setImporting(false)} done={() => {

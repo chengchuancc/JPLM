@@ -2495,6 +2495,10 @@ function Workspace({
           />}
           {view === "shipping" && project && <Suspense fallback={<p className="muted">正在加载发货管理…</p>}>
             <ShippingManagement key={detail} request={businessApi} admin={currentUser.role === "admin"} readOnly={archived}
+              products={state.products.map((product) => ({
+                id: product.id, name: product.name, code: product.code, english_code: product.english_code,
+                project_id: project.id, project_name: project.name,
+              })).sort((a, b) => a.code.localeCompare(b.code))}
               initialRecord={detail}
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}

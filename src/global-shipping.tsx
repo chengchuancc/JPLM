@@ -1,27 +1,22 @@
 import { Fragment, useEffect, useState } from "react";
 import { ChevronDown, ChevronRight, Plus, Search } from "lucide-react";
 import { Dialog } from "./dialog";
-import { formatTime, RelatedRecordDialog } from "./record-details";
-import { CarrierTags, SourceTag, Status, Tracking, type Details, type ProductChoice, type Request, type ShipmentItem } from "./shipping-data";
+import { FieldVisibility } from "./material-table";
+import { formatTime, RelatedRecordDialog, type RelatedTarget } from "./record-details";
+import { CarrierTags, SourceTag, Status, Tracking, type Details, type Device, type ProductChoice, type Request, type ShipmentItem } from "./shipping-data";
 import { canSaveItems, itemKey, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import { ShippingPicker } from "./shipping-options";
 import { ShippingTableHeader } from "./shipping-table-header";
+import { columnClass, productFields, shipmentColumns, type ShippingColumn } from "./shipping-columns";
 
 type Project = { id: string; name: string; archived_at: string | null };
 type Package = { id: string; project_id: string; project_name: string | null; reference: string; tracking: string;
-  shipped_on: string; shipped: boolean; source: string; carrier: string; updated_at: string;
+  shipped_on: string; shipped: boolean; source: string; carrier: string; created_at: string; updated_at: string;
+  details?: Details; devices?: Device[];
   shipment_items: ShipmentItem[]; can_open: boolean; can_edit: boolean };
 type Order = { order_key: string; order_number: string; created_at: string; package_count: number;
   shipped_count: number; packages: Package[] };
 type Page = { rows: Order[]; total: number; page_size: number; projects: Project[] };
-const columns = [
-  { key: "order", label: "订单号", group: "order", width: 170 },
-  { key: "source", label: "来源", group: "order", width: 150 },
-  { key: "created", label: "最近登记", group: "order", width: 135 },
-  { key: "items", label: "发货商品", group: "goods" },
-  { key: "status", label: "发货进度", group: "transport", width: 100 },
-] as const;
-
 function orderItems(packages: Package[]) {
   const totals = new Map<string, ShipmentItem>();
   for (const pack of packages) for (const item of pack.shipment_items) {
@@ -29,6 +24,52 @@ function orderItems(packages: Package[]) {
     totals.set(key, { ...item, quantity: item.quantity + (totals.get(key)?.quantity || 0) });
   }
   return [...totals.values()];
+}
+
+function PackageCell({ column, order, pack, items, open }: {
+  column: ShippingColumn; order: Order; pack?: Package; items: ShipmentItem[];
+  open: (pack: Package, target?: RelatedTarget) => void;
+}) {
+  const packages = pack ? [pack] : order.packages;
+  const values = (select: (p: Package) => string | number | null | undefined) =>
+    [...new Set(packages.map(select).filter((value) => value !== "" && value != null))];
+  const key = column.key;
+  if (column.product) {
+    const quantity = items.find((item) => itemKey(item) === itemKey({ ...column.product!, quantity: 0 }))?.quantity;
+    return <span className="shipping-quantity">{quantity ?? "—"}</span>;
+  }
+  if (key === "legacy_items") return <ShipmentItems items={items.filter((item) => !item.product_id)} />;
+  if (key === "created_at") return <span>{formatTime(pack?.created_at || order.created_at)}</span>;
+  if (key === "status") {
+    return !pack && order.shipped_count > 0 && order.shipped_count < order.package_count
+      ? <span className="shipping-status">部分发货</span> : <Status sent={pack ? !!pack.shipped : order.shipped_count > 0} />;
+  }
+  if (key === "source") {
+    const sources = values((p) => p.source);
+    return sources.length ? <div className="shipping-relation-cell">
+      {sources.map((source) => <SourceTag key={source} value={source ?? undefined} />)}
+    </div> : <>—</>;
+  }
+  if (key === "carrier") return <CarrierTags value={values((p) => p.carrier).join("、")} />;
+  if (key === "tracking") {
+    const tracking = values((p) => p.tracking);
+    return <div className="shipping-relation-cell">
+      <Tracking shipment={{ channel: "other", tracking: String(tracking[0] || ""), details: {} }} />
+      {tracking.length > 1 && <small title={tracking.join("、")}>+{tracking.length - 1}</small>}
+    </div>;
+  }
+  if (key === "devices") {
+    const devices = packages.flatMap((p) => (p.devices || []).map((device) => ({ device, pack: p })));
+    const first = devices[0];
+    return first ? <div className="shipping-relation-cell">
+      <button type="button" className="shipping-chip mono" title={first.device.serial}
+        onClick={() => open(first.pack, { kind: "device", serial: first.device.serial })}>{first.device.serial.slice(0, 6)}</button>
+      {devices.length > 1 && <small>+{devices.length - 1}</small>}
+    </div> : <>—</>;
+  }
+  const fieldValues = values((p) => key === "shipped_on" ? p.shipped_on
+    : key === "owner" ? p.project_name || "跨项目" : p.details?.[key]);
+  return <span title={fieldValues.join("、")}>{fieldValues.length > 1 ? "多笔 · 展开查看" : fieldValues[0] ?? "—"}</span>;
 }
 
 function PackageEditor({ request, projectRequest, projects, item, order, onClose, onSaved }: {
@@ -94,7 +135,10 @@ function PackageEditor({ request, projectRequest, projects, item, order, onClose
         </>}
       </div>}
       <h3>发货商品</h3>
-      {products ? <ShipmentItemEditor products={products} items={items} onChange={setItems} disabled={busy} showProject />
+      {products ? <ShipmentItemEditor products={products} items={items} onChange={(next) => {
+        setItems(next);
+        if (!project && next[0]) setProject(next[0].project_id);
+      }} disabled={busy} showProject />
         : !error && <p className="muted">正在加载产品…</p>}
       {!!locked.length && <ShipmentItems items={locked} showProject />}
       {error && <p className="form-error" role="alert">{error}</p>}
@@ -119,10 +163,26 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange 
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
   const [opened, setOpened] = useState<Record<string, boolean>>({});
-  const [detail, setDetail] = useState<Package>();
+  const [detail, setDetail] = useState<{ pack: Package; target: RelatedTarget }>();
   const [editor, setEditor] = useState<{ order: string; item?: Package }>();
+  const [catalog, setCatalog] = useState<ProductChoice[]>([]);
+  const [hidden, setHidden] = useState<string[]>(() => {
+    try {
+      const value = JSON.parse(localStorage.getItem("plm-global-shipping-fields") || "[]");
+      return Array.isArray(value) ? value : [];
+    } catch { return []; }
+  });
   const projects = data?.projects || [];
   const canCreate = projects.some((p) => !p.archived_at);
+  const history = data?.rows.flatMap((order) => order.packages.flatMap((pack) => pack.shipment_items)) || [];
+  const available = shipmentColumns("other", productFields(
+    catalog.filter((p) => !project || p.project_id === project),
+    history.filter((p) => !project || p.project_id === project), true), true);
+  const columns = available.filter((column) => column.fixed || !hidden.includes(column.key));
+  const tableWidth = columns.reduce((total, column) => total + column.width, 171);
+  function open(pack: Package, target?: RelatedTarget) {
+    if (pack.can_open) setDetail({ pack, target: target || { kind: "shipment", id: pack.id, reference: pack.reference } });
+  }
   useEffect(() => {
     onDraftChange(!!editor);
     return () => onDraftChange(false);
@@ -135,6 +195,12 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange 
       .finally(() => { if (active) setBusy(false); });
     return () => { active = false; };
   }, [request, search, project, status, page, revision]);
+  useEffect(() => {
+    let active = true;
+    request("global-shipping/products").then((result) => { if (active) setCatalog(result); },
+      () => { /* Product columns on the loaded records are still available. */ });
+    return () => { active = false; };
+  }, [request, revision]);
   return <section className="shipping-management">
     <div className="shipping-header"><h1>全局发货</h1></div>
     <div className="shipping-toolbar">
@@ -145,6 +211,11 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange 
         <button type="submit" className="btn"><Search size={15} />搜索</button>
       </form>
       <div className="shipping-tools global-shipping-filters">
+        <FieldVisibility columns={available} hidden={hidden} onChange={(next) => {
+          setHidden(next);
+          try { localStorage.setItem("plm-global-shipping-fields", JSON.stringify(next)); }
+          catch { /* Column changes still apply to the current view. */ }
+        }} />
         <select aria-label="发货项目" value={project} onChange={(event) => { setProject(event.target.value); setPage(1); }}>
           <option value="">全部项目</option>
           {projects.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
@@ -161,44 +232,41 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange 
     {error && <p role="alert" className="form-error">{error} <button className="btn small" type="button"
       onClick={() => setRevision((value) => value + 1)}>重试</button></p>}
     <div className="table-wrap shipping-table global-shipping-table" aria-label="全局发货订单" aria-busy={busy}>
-      <table>
-        <ShippingTableHeader columns={columns} />
-        <tbody>{data?.rows.map((order) => {
+      <table style={{ width: tableWidth }}>
+        <ShippingTableHeader columns={columns} index actionWidth={126} />
+        <tbody>{data?.rows.map((order, index) => {
           const expanded = !!opened[order.order_key];
-          const sources = [...new Set(order.packages.map((pack) => pack.source).filter(Boolean))];
+          const items = orderItems(order.packages);
           return <Fragment key={order.order_key}>
             <tr>
-              <td><button type="button" className="text-link global-order-toggle" aria-expanded={expanded}
-                onClick={() => setOpened((previous) => ({ ...previous, [order.order_key]: !expanded }))}>
-                {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
-                <strong className="mono">{order.order_number || "无订单号"}</strong><small>{order.package_count} 包</small>
-              </button></td>
-              <td><span className="shipping-item-tags">{sources.length ? sources.map((source) => <SourceTag key={source} value={source} />) : "—"}</span></td>
-              <td>{formatTime(order.created_at)}</td>
-              <td className="shipping-goods"><ShipmentItems items={orderItems(order.packages)} showProject links /></td>
-              <td>{order.shipped_count > 0 && order.shipped_count < order.package_count
-                ? <span className="shipping-status">部分发货</span> : <Status sent={order.shipped_count > 0} />}</td>
+              <td className="shipping-row-index">{(page - 1) * (data?.page_size || 50) + index + 1}</td>
+              {columns.map((column) => <td key={column.key} className={columnClass(column)}>
+                {column.key === "reference" ? <button type="button" className="text-link global-order-toggle" aria-expanded={expanded}
+                  onClick={() => setOpened((previous) => ({ ...previous, [order.order_key]: !expanded }))}>
+                  {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                  <strong className="mono">{order.order_number || "无订单号"}</strong><small>{order.package_count} 包</small>
+                </button> : <PackageCell column={column} order={order} items={items} open={open} />}
+              </td>)}
+              <td className="shipping-row-action">
+                {canCreate && order.order_number && <button className="btn small" type="button"
+                  onClick={() => setEditor({ order: order.order_number })}><Plus size={14} />登记包裹</button>}
+              </td>
             </tr>
-            {expanded && <tr><td colSpan={5} className="global-order-packages">
-              {order.packages.map((pack) => <div className="global-package" key={pack.project_id + "/" + pack.id}>
-                <div className="global-package-meta">
-                  <strong>{pack.project_name || "跨项目包裹"}</strong>
-                  <Status sent={pack.shipped} />
-                  <Tracking shipment={{ channel: "other", tracking: pack.tracking, details: { carrier: pack.carrier || "" } }} />
-                  <CarrierTags value={pack.carrier} />
-                  <span className="muted">{pack.shipped_on}</span>
-                </div>
-                <ShipmentItems items={pack.shipment_items} showProject links />
-                <div className="shipping-tools">
-                  {pack.can_open && <button className="btn small" type="button" onClick={() => setDetail(pack)}>查看包裹</button>}
-                  {pack.can_edit && <button className="btn small" type="button"
-                    onClick={() => setEditor({ order: order.order_number, item: pack })}>编辑发货商品</button>}
-                  {pack.can_open && <a className="btn small" href={"#projects/" + pack.project_id + "/shipping/" + pack.id}>项目台账</a>}
-                </div>
-              </div>)}
-              {canCreate && order.order_number && <button className="btn small" type="button"
-                onClick={() => setEditor({ order: order.order_number })}><Plus size={14} />登记包裹</button>}
-            </td></tr>}
+            {expanded && order.packages.map((pack, i) => <tr className="shipping-child-row global-package-row" key={pack.project_id + "/" + pack.id}>
+              <td className="shipping-row-index">{i + 1}</td>
+              {columns.map((column) => <td key={column.key} className={columnClass(column)}>
+                {column.key === "reference" ? <div className="shipping-hierarchy">
+                  <span aria-hidden="true">↳</span>
+                  {pack.can_open ? <button className="text-link mono" type="button" onClick={() => open(pack)}>
+                    {pack.reference || "包裹 " + (i + 1)}</button> : <span>{pack.reference || "包裹 " + (i + 1)}</span>}
+                </div> : <PackageCell column={column} order={order} pack={pack} items={pack.shipment_items} open={open} />}
+              </td>)}
+              <td className="shipping-row-action">
+                {pack.can_edit && <button className="btn small" type="button" aria-label="编辑发货商品"
+                  onClick={() => setEditor({ order: order.order_number, item: pack })}>商品</button>}
+                {pack.can_open && <a className="btn small" href={"#projects/" + pack.project_id + "/shipping/" + pack.id}>项目台账</a>}
+              </td>
+            </tr>)}
           </Fragment>;
         })}</tbody>
       </table>
@@ -210,8 +278,9 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange 
       <button className="btn small" type="button" disabled={busy || !data || page * data.page_size >= data.total}
         onClick={() => setPage(page + 1)}>下一页</button>
     </div>
-    {detail && <RelatedRecordDialog target={{ kind: "shipment", id: detail.id, reference: detail.reference }}
-      request={projectRequest(detail.project_id)} close={() => setDetail(undefined)} />}
+    {detail && <RelatedRecordDialog target={detail.target} request={(path, method, payload) =>
+      projectRequest(detail.pack.project_id)(path.startsWith("shipping/records/") ? path + "?scope=global" : path, method, payload)}
+      close={() => setDetail(undefined)} />}
     {editor && <PackageEditor request={request} projectRequest={projectRequest} projects={projects} order={editor.order}
       item={editor.item} onClose={() => setEditor(undefined)} onSaved={() => {
         setEditor(undefined); setRevision((value) => value + 1);

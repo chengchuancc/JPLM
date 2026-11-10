@@ -1058,13 +1058,8 @@ class Handler(BaseHTTPRequestHandler):
                 stamp = now()
                 if item_path:
                     row = shipping.get_shipment(db, project, item_path[2], allowed)
-                    if row['channel'] != 'other' or row['deleted_at']:
-                        raise Problem('发货记录不存在或已删除', 404)
-                    if data.get('version') != row['updated_at']:
-                        raise Problem('发货记录已更新，请刷新后重试', 409)
-                    shipping.save_shipment_items(db, row, data.get('shipment_items'), writable)
-                    db.execute('UPDATE shipping_records SET updated_at=?,operator_id=? WHERE project_id=? AND id=?',
-                               (stamp, self.user['id'], project, row['id']))
+                    shipping.update_shipment_items(db, row, data.get('version'), data.get('shipment_items'),
+                                                   writable, stamp, self.user['id'])
                     record_id, reference = row['id'], row['reference']
                 else:
                     record_id = uid()
@@ -1082,6 +1077,7 @@ class Handler(BaseHTTPRequestHandler):
     def shipping_request(self, project_id, resource, method):
         query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
         record_path = re.fullmatch(r'records/([a-f0-9]{24})', resource)
+        shared_path = re.fullmatch(r'records/([a-f0-9]{24})/shared-items', resource)
         children_path = re.fullmatch(r'records/([a-f0-9]{24})/children', resource)
         restore_path = re.fullmatch(r'records/([a-f0-9]{24})/restore', resource)
         order_path = re.fullmatch(r'orders/([a-f0-9]{24})', resource)
@@ -1098,10 +1094,12 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(shipping.list_shipments(db, project_id, query.get('channel'), query, allowed))
                 if record_path:
                     return self.send(shipping.get_shipment(db, project_id, record_path[1],
-                                                           shipping.accessible_projects(db, self.user)))
+                                                           shipping.accessible_projects(db, self.user),
+                                                           local=query.get('scope') != 'global'))
                 if children_path:
                     return self.send(shipping.list_children(db, project_id, children_path[1],
-                                                           shipping.accessible_projects(db, self.user)))
+                                                           shipping.accessible_projects(db, self.user),
+                                                           local=query.get('scope') != 'global'))
                 if resource == 'products':
                     return self.send(shipping.product_catalog(db, self.user, project_id))
                 if resource == 'devices':
@@ -1168,6 +1166,20 @@ class Handler(BaseHTTPRequestHandler):
                 log_activity(db, self.user, '删除发货记录' if deleted else '恢复发货记录',
                              row['id'], row['reference'] or row['tracking'])
             return self.send({'ok': True})
+        if shared_path and method == 'PUT':
+            data = self.body()
+            if not isinstance(data, dict):
+                raise Problem('发货商品格式无效')
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                row = shipping.get_shipment(db, project_id, shared_path[1], local=True)
+                if not row.get('shared') or not row['can_edit_items']:
+                    raise Problem('此记录无法在当前项目修改', 409)
+                shipping.update_shipment_items(db, row, data.get('version'), data.get('shipment_items'),
+                                               {project_id}, now(), self.user['id'], editable_project=project_id)
+                touch_project(db)
+                log_activity(db, self.user, '修改发货商品', row['id'], row['reference'])
+            return self.send({'ok': True})
         if (resource == 'records' and method == 'POST') or (record_path and method == 'PUT'):
             data = self.body()
             if not isinstance(data, dict):
@@ -1179,7 +1191,7 @@ class Handler(BaseHTTPRequestHandler):
                 touch_project(db)
                 log_activity(db, self.user, '修改发货记录' if record_path else '登记发货',
                              result['id'], result['reference'])
-                result = shipping.get_shipment(db, project_id, result['id'], shipping.accessible_projects(db, self.user))
+                result = shipping.get_shipment(db, project_id, result['id'], local=True)
             return self.send(result)
         raise Problem('接口不存在', 404)
 

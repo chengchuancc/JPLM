@@ -211,7 +211,9 @@ class IntegrationTests(unittest.TestCase):
             'version': original['updated_at'], 'shipment_items': [line(self.project_id, first, 3)],
         })
         record = self.request('shipping/records/' + original['id'])
-        self.assertEqual({p['name']: p['quantity'] for p in record['shipment_items']}, {'新主机': 3, '新配件': 2})
+        self.assertEqual({p['name']: p['quantity'] for p in record['shipment_items']}, {'新主机': 3})
+        complete = self.request('shipping/records/' + original['id'] + '?scope=global')
+        self.assertEqual({p['name']: p['quantity'] for p in complete['shipment_items']}, {'新主机': 3, '新配件': 2})
         self.request('shipping/records', 'POST', {'channel': 'other', 'reference': '#OTHER',
                                                  'shipment_items': [line(other, second, 1)]}, 403)
         self.request('shipping/records', 'POST', {'channel': 'other', 'reference': '#BAD',
@@ -230,6 +232,17 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(mirror['shared'])
         self.assertNotIn('address', mirror['details'])
         self.assertEqual(mirror['shipment_items'][0]['product_id'], second)
+        self.assertEqual(self.request('shipping/records/' + original['id'], project=other), mirror)
+        path = 'shipping/records/' + original['id'] + '/shared-items'
+        self.request(path, 'PUT', {'version': mirror['updated_at'],
+                                   'shipment_items': [line(self.project_id, first, 99)]}, 403, project=other)
+        self.request(path, 'PUT', {'version': mirror['updated_at'],
+                                   'shipment_items': [line(other, second, 5)]}, project=other)
+        self.request(path, 'PUT', {'version': mirror['updated_at'], 'shipment_items': []}, 409, project=other)
+        packages = self.request(global_list, project=False)['rows'][0]['packages']
+        updated = next(pack for pack in packages if pack['id'] == original['id'])
+        self.assertEqual(updated['shipment_items'][0]['quantity'], 5)
+        self.assertTrue(updated['shipped'])
         self.request('shipping/records/' + original['id'], status=404)
 
     def test_shipping_clipboard_paste_and_creation_order(self):

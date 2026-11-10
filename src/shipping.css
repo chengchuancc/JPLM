@@ -51,6 +51,8 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-table .shipping-field-head th { top: var(--shipping-group-height); }
 .shipping-table .shipping-group-head th.shipping-goods { background: #dceee4; color: #23533c; }
 .shipping-table .shipping-field-head th.shipping-goods { background: #e9f5ee; color: #23533c; }
+.shipping-column-hint { display: block; overflow: hidden; text-overflow: ellipsis; font-size: 10px; font-weight: 400; color: #587262; }
+.shipping-quantity { font-variant-numeric: tabular-nums; }
 .shipping-table td.shipping-goods { background: #f4faf6; }
 .shipping-table .shipping-row-index { position: sticky; left: 0; text-align: center; color: var(--muted); }
 .shipping-table td:is(.shipping-row-index,.shipping-record-key,.shipping-row-action) { z-index: 1; background: #fff; }
@@ -183,18 +185,12 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-item-edit-row button { min-width: 30px; }
 .shipping-item-picker select { min-width: 0; }
 .global-shipping-filters select { height: 32px; min-height: 32px; padding: 0 8px; font-size: 12px; }
-.global-shipping-table table { min-width: 690px; }
 .global-order-toggle { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; }
+.global-order-toggle svg { flex-shrink: 0; }
 .global-order-toggle strong { overflow: hidden; text-overflow: ellipsis; }
 .global-order-toggle small { color: var(--muted); flex-shrink: 0; }
-.global-shipping-table .global-order-packages { padding: 8px 12px; background: #f6f8fc; white-space: normal; }
-.global-package {
-  display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 2fr) auto; gap: 8px; align-items: center;
-  border-bottom: 1px solid var(--border); padding: 7px 0;
-}
-.global-package-meta, .global-shipping-paging { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
-.global-package-meta > strong { flex-basis: 100%; }
-.global-order-packages > .btn { margin-top: 6px; }
+.global-shipping-paging { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.global-package-row .shipping-row-action .btn { margin-inline: 2px; height: 25px; padding-inline: 6px; }
 .global-shipping-paging { justify-content: flex-end; }
 .global-shipping-paging > span { margin-right: auto; }
 .global-shipping-form { display: grid; gap: 10px; }

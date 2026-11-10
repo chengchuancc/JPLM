@@ -86,14 +86,14 @@ python3 -m unittest discover -s tests -v
 python3 scripts/package-release.py
 ```
 
-部署包生成在上级 `releases/jiecheng-plm-1.8.8.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
+部署包生成在上级 `releases/jiecheng-plm-1.8.9.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
 
 ## 部署到服务器
 
 将部署包上传并解压到空目录：
 
 ```sh
-tar -xzf jiecheng-plm-1.8.8.tar.gz
+tar -xzf jiecheng-plm-1.8.9.tar.gz
 cd jiecheng-plm
 ./start.sh --host 127.0.0.1 --port 8787
 ```

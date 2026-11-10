@@ -80,9 +80,11 @@ ORDER_KEYS = (*CONTACT, *ITEMS, 'pb', 'sku', 'country_code', 'address_status', '
 PAGE_SIZE = 50
 SHIPMENT_SELECT = '''SELECT s.*,o.backer,o.details AS order_details,u.name AS operator,
     p.reference AS parent_reference,p.tracking AS parent_tracking,
+    j.archived_at AS owner_archived_at,
     (SELECT count(*) FROM shipping_records c WHERE c.project_id=s.project_id
         AND c.parent_id=s.id AND c.deleted_at IS NULL) AS child_count
     FROM shipping_records s
+    JOIN projects j ON j.id=s.project_id
     LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id
     LEFT JOIN shipping_records p ON p.project_id=s.project_id AND p.id=s.parent_id
     LEFT JOIN users u ON u.id=s.operator_id'''
@@ -273,6 +275,7 @@ def list_global_orders(db, user, query):
         SELECT s.project_id,s.id,s.reference,s.tracking,s.shipped_on,s.updated_at,s.created_at,s.items_configured,
             t.reference AS order_number, {shipped_condition('s')} AS shipped,
             json_extract(s.details,'$.source') AS source,json_extract(s.details,'$.carrier') AS carrier,
+            CASE WHEN s.project_id IN (SELECT id FROM allowed) THEN s.details END AS full_details,
             CASE WHEN s.items_configured=0 THEN s.details ELSE '{{}}' END AS legacy_details,
             CASE WHEN trim(ltrim(trim(t.reference),'#'))='' THEN 'package:'||s.project_id||':'||t.root_id
                  ELSE 'order:'||lower(trim(ltrim(trim(t.reference),'#'))) END AS order_key,
@@ -308,10 +311,13 @@ def list_global_orders(db, user, query):
         for row in db.execute(f'''{cte} SELECT * FROM packages WHERE order_key IN ({marks})
             ORDER BY created_at DESC,id DESC''', (*params, *by_key)):
             package = {key: row[key] for key in ('id','project_id','reference','tracking','shipped_on','shipped',
-                                                 'source','carrier','updated_at','items_configured')}
+                                                 'source','carrier','created_at','updated_at','items_configured')}
             owner = projects.get(row['project_id'])
             package.update(project_name=owner['name'] if owner else None, can_open=bool(owner),
                            can_edit=bool(owner and not owner['archived_at']))
+            if owner:
+                package['details'] = json.loads(row['full_details'])
+                package['devices'] = shipment_devices(db, row['project_id'], [row['id']]).get(row['id'], [])
             package['shipment_items'] = shipment_items(db, row['project_id'], row['id'], allowed)
             if owner and not row['items_configured']:
                 package['shipment_items'] = [{'project_id': row['project_id'], 'product_id': None, 'legacy_key': key,
@@ -464,11 +470,13 @@ def decode_shipment(row, devices, db, allowed=None, view_project=None):
     if row['channel'] == 'other':
         shared = view_project is not None and row['project_id'] != view_project
         data['shipment_items'] = shipment_items(db, row['project_id'], row['id'],
-                                                {view_project} if shared else allowed)
+                                                {view_project} if view_project is not None else allowed)
         if shared:
             keep = ('id', 'project_id', 'channel', 'reference', 'tracking', 'shipped_on', 'created_at', 'updated_at',
                     'shipment_items', 'items_configured')
             return {**{key: data[key] for key in keep}, 'shared': True,
+                    'reference': row['parent_reference'] or row['reference'],
+                    'can_edit_items': not row['owner_archived_at'],
                     'details': {key: details[key] for key in ('source', 'shipment_status', 'carrier') if key in details},
                     'order_details': {}, 'devices': [], 'child_count': 0, 'deleted_at': None, 'parent_id': None}
         if not row['items_configured']:
@@ -478,14 +486,20 @@ def decode_shipment(row, devices, db, allowed=None, view_project=None):
     return data
 
 
-def get_shipment(db, project, shipment_id, allowed=None):
+def get_shipment(db, project, shipment_id, allowed=None, *, local=False):
     row = db.execute(SHIPMENT_SELECT + ' WHERE s.project_id=? AND s.id=?', (project, shipment_id)).fetchone()
+    if not row and local:
+        row = db.execute(SHIPMENT_SELECT + """ WHERE s.id=? AND s.channel='other' AND s.deleted_at IS NULL
+            AND j.deleted_at IS NULL AND EXISTS (SELECT 1 FROM shipping_items i
+                WHERE i.project_id=s.project_id AND i.shipment_id=s.id AND i.product_project_id=?)
+            ORDER BY s.project_id LIMIT 1""", (shipment_id, project)).fetchone()
     if not row:
         raise ShippingError('发货记录不存在', 404)
-    return decode_shipment(row, shipment_devices(db, project, [shipment_id]).get(shipment_id, []), db, allowed)
+    devices = shipment_devices(db, project, [shipment_id]).get(shipment_id, []) if row['project_id'] == project else []
+    return decode_shipment(row, devices, db, allowed, project if local else None)
 
 
-def list_children(db, project, shipment_id, allowed=None):
+def list_children(db, project, shipment_id, allowed=None, *, local=False):
     parent = db.execute('SELECT deleted_at FROM shipping_records WHERE project_id=? AND id=?',
                         (project, shipment_id)).fetchone()
     if not parent:
@@ -493,7 +507,17 @@ def list_children(db, project, shipment_id, allowed=None):
     rows = db.execute(SHIPMENT_SELECT + ''' WHERE s.project_id=? AND s.parent_id=?
         AND s.deleted_at IS NULL ORDER BY s.created_at DESC,s.id DESC''', (project, shipment_id)).fetchall()
     devices = shipment_devices(db, project, [row['id'] for row in rows])
-    return [decode_shipment(row, devices.get(row['id'], []), db, allowed) for row in rows]
+    return [decode_shipment(row, devices.get(row['id'], []), db, allowed, project if local else None) for row in rows]
+
+
+def update_shipment_items(db, row, version, items, writable, stamp, actor, *, editable_project=None):
+    if row['channel'] != 'other' or row['deleted_at']:
+        raise ShippingError('发货记录不存在或已删除', 404)
+    if version != row['updated_at']:
+        raise ShippingError('发货记录已更新，请刷新后重试', 409)
+    save_shipment_items(db, row, items, writable, editable_project=editable_project)
+    db.execute('UPDATE shipping_records SET updated_at=?,operator_id=? WHERE project_id=? AND id=?',
+               (stamp, actor, row['project_id'], row['id']))
 
 
 def validate_parent(db, project, shipment_id, channel, parent_id):

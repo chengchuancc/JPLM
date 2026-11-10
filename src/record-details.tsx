@@ -176,10 +176,10 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
       {row.child_count > 0 && <><h4>子记录 · {row.child_count} 条</h4>
         <ChildShipmentLinks id={id} request={request} open={open} /></>}
     </section>}
-    <section className="shipping-detail-section"><h3>收件资料</h3>
+    {!row.shared && <section className="shipping-detail-section"><h3>收件资料</h3>
       <DetailsList fields={row.channel === "ks" ? [...contactFields, ["address_status", "地址确认"]] : otherContactFields}
         details={row.channel === "ks" ? row.order_details : row.details} showEmpty />
-    </section>
+    </section>}
     {row.channel === "other" &&
       <section className="shipping-detail-section"><h3>发货商品</h3>
         <ShipmentItems items={row.shipment_items} showProject links />
@@ -187,14 +187,14 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
     {row.ks_order_id && <section className="shipping-detail-section"><h3>KS 订单数量</h3>
       <DetailsList fields={[["sku", "SKU"], ...items]} details={row.order_details} showEmpty />
     </section>}
-    <section className="shipping-detail-section"><h3>发货设备 <span className="muted">{row.devices.length} 台</span></h3>
+    {!row.shared && <section className="shipping-detail-section"><h3>发货设备 <span className="muted">{row.devices.length} 台</span></h3>
       <ul className="shipping-device-detail">
         {row.devices.map((device) => <li key={device.serial}>
           <button className="text-link mono" type="button" onClick={() => open({ kind: "device", serial: device.serial })}>{device.serial}</button>
           <small>{device.registered ? device.result || "待检测" : "未匹配设备"}</small></li>)}
         {!row.devices.length && <li>暂无关联设备</li>}
       </ul>
-    </section>
+    </section>}
     <section className="shipping-detail-section"><h3>备注与时间</h3>
       <DetailsList fields={[["notes", "备注"], ["updated_at", "更新时间"], ["source_id", "来源记录 ID"]]}
         details={{ ...row.details, updated_at: formatTime(row.updated_at), source_id: row.source_id || "" }} showEmpty />
