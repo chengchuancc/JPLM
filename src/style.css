@@ -1470,6 +1470,9 @@ td .text-link:hover {
 .stock-material-info small { display: block; font-size: 10px; }
 .inventory-detail-info { margin-top: 12px; gap: 8px 10px; align-items: center; }
 .inventory-detail-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+.btn.record-delete { margin-right: auto; color: #a12d35; }
+.btn.record-delete-confirm { color: #fff; background: #a12d35; border-color: #a12d35; }
+.btn.record-delete-confirm:hover { background: #83222a; border-color: #83222a; }
 .operation-switch {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -1569,6 +1572,9 @@ td .text-link:hover {
   width: 32px;
   height: 32px;
 }
+.purchase-material-cell, .purchase-order-number, .purchase-summary-actions { display: flex; align-items: center; gap: 6px; }
+.purchase-summary-actions { flex-wrap: wrap; }
+.purchase-order-number > .icon-btn { flex: 0 0 auto; width: 24px; height: 24px; }
 .purchase-material-name,
 .purchase-material-meta {
   min-width: 0;

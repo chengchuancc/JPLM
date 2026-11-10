@@ -16,7 +16,7 @@ import shipping
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
-    migrate_material_categories, migrate_projects,
+    RECORD_DELETION_VERSION, migrate_material_categories, migrate_projects,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -122,8 +122,9 @@ def init_db(directory=None, bootstrap=None):
         for statement in inspection.SCHEMA:
             db.execute(statement)
         shipping.initialize(db, version)
-        if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(inspection_records)')}:
-            db.execute('ALTER TABLE inspection_records ADD COLUMN deleted_at TEXT')
+        for table in ('inspection_records', 'movements', 'purchases', 'purchase_lines'):
+            if 'deleted_at' not in {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}:
+                db.execute(f'ALTER TABLE {table} ADD COLUMN deleted_at TEXT')
         if version == 12:
             inspection.backfill_from_records(db)
         if version < MATERIAL_CODE_PREFIX_VERSION:
@@ -476,11 +477,11 @@ def adjust_stock(db, part, delta, after=None):
             # 按登记顺序修正后续结存，保留编辑位置之前的历史。
             params = (db.project_id, part['id'], after)
             lowest = db.execute("""SELECT code,balance FROM movements WHERE project_id=? AND part_id=?
-                AND rowid>? ORDER BY balance LIMIT 1""", params).fetchone()
+                AND rowid>? AND deleted_at IS NULL ORDER BY balance LIMIT 1""", params).fetchone()
             if lowest and round(lowest['balance'] + delta, 6) < 0:
-                raise Problem(f'修改后流水 {lowest["code"]} 的库存结存会为负数', 409)
+                raise Problem(f'操作后流水 {lowest["code"]} 的库存结存会为负数', 409)
             db.execute("""UPDATE movements SET balance=ROUND(balance+?,6)
-                WHERE project_id=? AND part_id=? AND rowid>?""", (delta, *params))
+                WHERE project_id=? AND part_id=? AND rowid>? AND deleted_at IS NULL""", (delta, *params))
         db.execute('UPDATE parts SET stock=?,updated_at=? WHERE id=?', (balance, now(), part['id']))
     return balance
 
@@ -501,14 +502,47 @@ def movement_description(db, row, part):
     return text
 
 
+def check_movement_snapshot(row, expected):
+    if expected is not None and (not isinstance(expected, dict) or any(
+            key not in expected or expected[key] != row[key] for key in MOVEMENT_FIELDS)):
+        raise Problem('该流水已被修改，请刷新后重试', 409)
+
+
+def adjust_purchase_received(db, line_id, delta):
+    line = active_purchase_line(db, line_id)
+    received = round(line['received'] + delta, 6)
+    if received > line['qty']: raise Problem('入库数量超过待入库数量')
+    if received < 0: raise Problem('采购明细的已入库数量不足，无法调整')
+    if delta:
+        db.execute('UPDATE purchase_lines SET received=? WHERE id=?', (received, line_id))
+
+
+def delete_movement(db, movement_id, expected, actor):
+    row = exists(db, 'movements', movement_id)
+    if row['deleted_at']:
+        return movement_id
+    check_movement_snapshot(row, expected)
+    if db.execute('SELECT 1 FROM movements WHERE original_id=? AND deleted_at IS NULL LIMIT 1',
+                  (movement_id,)).fetchone():
+        raise Problem('该流水仍有关联的退库记录，请先处理退库记录', 409)
+    part = active_part(db, row['part_id'])
+    position = db.execute('SELECT rowid FROM movements WHERE id=?', (movement_id,)).fetchone()[0]
+    balance = adjust_stock(db, part, -movement_delta(row['type'], row['qty']), position)
+    if row['purchase_line_id']:
+        adjust_purchase_received(db, row['purchase_line_id'], -row['qty'])
+    db.execute('UPDATE movements SET deleted_at=? WHERE id=?', (now(), movement_id))
+    log_activity(db, actor, '删除库存流水', part['id'], row['code'],
+                 f'{movement_description(db, row, part)} · 当前结存 {balance:g} {part["unit"]}')
+    return movement_id
+
+
 def record_movement(db, data, actor=None, *, movement_id=None):
     old = exists(db, 'movements', movement_id) if movement_id else None
     position = None
     if old:
-        expected = data.get('expected')
-        if expected is not None and (not isinstance(expected, dict) or any(
-                key not in expected or expected[key] != old[key] for key in MOVEMENT_FIELDS)):
-            raise Problem('该流水已被修改，请刷新后重试', 409)
+        if old['deleted_at']:
+            raise Problem('库存流水已删除', 404)
+        check_movement_snapshot(old, data.get('expected'))
         position = db.execute('SELECT rowid FROM movements WHERE id=?', (movement_id,)).fetchone()[0]
         data = {**old, **data}
 
@@ -523,7 +557,7 @@ def record_movement(db, data, actor=None, *, movement_id=None):
 
     if purchase_line:
         if kind != '入库': raise Problem('仅入库可以关联采购明细')
-        line = exists(db, 'purchase_lines', purchase_line)
+        line = active_purchase_line(db, purchase_line)
         if line['part_id'] != part['id']: raise Problem('采购物料与入库物料不一致')
     purchase_changes = {}
     if old and old['purchase_line_id']:
@@ -531,31 +565,27 @@ def record_movement(db, data, actor=None, *, movement_id=None):
     if purchase_line:
         purchase_changes[purchase_line] = purchase_changes.get(purchase_line, 0) + qty
     for line_id, change in purchase_changes.items():
-        line = exists(db, 'purchase_lines', line_id)
-        received = round(line['received'] + change, 6)
-        if received > line['qty']: raise Problem('入库数量超过待入库数量')
-        if received < 0: raise Problem('采购明细的已入库数量不足，无法修改')
-        if change:
-            db.execute('UPDATE purchase_lines SET received=? WHERE id=?', (received, line_id))
+        adjust_purchase_received(db, line_id, change)
 
     if original_id:
         if kind != '退库': raise Problem('只有退库可以关联原出库记录')
         original = exists(db, 'movements', original_id)
-        if original['type'] != '出库' or original['part_id'] != part['id']: raise Problem('请选择该物料的原出库记录')
+        if original['deleted_at'] or original['type'] != '出库' or original['part_id'] != part['id']:
+            raise Problem('请选择该物料的原出库记录')
         if old and db.execute('SELECT rowid FROM movements WHERE id=?', (original_id,)).fetchone()[0] >= position:
             raise Problem('原出库记录必须早于退库记录')
         returned = db.execute("""SELECT COALESCE(SUM(qty),0) FROM movements
-            WHERE original_id=? AND id<>?""", (original_id, movement_id or '')).fetchone()[0]
+            WHERE original_id=? AND id<>? AND deleted_at IS NULL""", (original_id, movement_id or '')).fetchone()[0]
         if qty > round(original['qty'] - returned,6): raise Problem('退库数量超过原出库尚未退回的数量')
         product_id = original['product_id']
     if kind == '退库' and not original_id: raise Problem('退库需关联原出库记录')
     if old and old['type'] == '出库':
-        returned = round(db.execute('SELECT COALESCE(SUM(qty),0) FROM movements WHERE original_id=?',
-                                    (movement_id,)).fetchone()[0], 6)
+        returned = round(db.execute("""SELECT COALESCE(SUM(qty),0) FROM movements
+            WHERE original_id=? AND deleted_at IS NULL""", (movement_id,)).fetchone()[0], 6)
         if returned and (kind != '出库' or old['part_id'] != part['id'] or qty < returned):
             raise Problem(f'该流水已退库 {returned:g}，请先修正关联的退库记录', 409)
         if returned and product_id != old['product_id']:
-            db.execute('UPDATE movements SET product_id=? WHERE original_id=?', (product_id, movement_id))
+            db.execute('UPDATE movements SET product_id=? WHERE original_id=? AND deleted_at IS NULL', (product_id, movement_id))
 
     reason = str(data.get('reason') or '').strip()
     if kind == '报废' and not reason: raise Problem('请填写报废原因')
@@ -578,7 +608,7 @@ def record_movement(db, data, actor=None, *, movement_id=None):
         else:
             # 用新物料下一条流水反推当时库存，兼容有期初库存的旧数据。
             following = db.execute("""SELECT type,qty,balance FROM movements
-                WHERE project_id=? AND part_id=? AND rowid>? ORDER BY rowid LIMIT 1""",
+                WHERE project_id=? AND part_id=? AND rowid>? AND deleted_at IS NULL ORDER BY rowid LIMIT 1""",
                 (db.project_id, part['id'], position)).fetchone()
             opening = following['balance'] - movement_delta(following['type'], following['qty']) if following else part['stock']
             balance = round(opening + delta, 6)
@@ -602,6 +632,119 @@ def record_movement(db, data, actor=None, *, movement_id=None):
     log_activity(db, actor, kind, part['id'], f"{part['code']} {part['name']}",
                  f'{code} · {qty:g} {part["unit"]} · 结余 {balance:g} · 经办人 {handler_name}')
     return mid
+
+
+PURCHASE_FIELDS = ('supplier_id', 'date', 'notes', 'responsible_id')
+
+
+def active_purchase(db, purchase_id):
+    purchase = exists(db, 'purchases', purchase_id)
+    if purchase['deleted_at']:
+        raise Problem('采购单已删除', 404)
+    return purchase
+
+
+def active_purchase_line(db, line_id):
+    line = exists(db, 'purchase_lines', line_id)
+    if line['deleted_at']:
+        raise Problem('采购明细已移除', 404)
+    active_purchase(db, line['purchase_id'])
+    return line
+
+
+def purchase_lines_for_edit(db, purchase_id):
+    return {line['part_id']: dict(line) for line in db.execute("""SELECT l.*,
+        (l.received>0 OR EXISTS (SELECT 1 FROM movements m
+          WHERE m.purchase_line_id=l.id AND m.deleted_at IS NULL)) AS has_receipts
+        FROM purchase_lines l WHERE l.project_id=? AND l.purchase_id=? ORDER BY l.rowid""",
+        (db.project_id, purchase_id))}
+
+
+def check_purchase_snapshot(purchase, lines, expected):
+    if expected is not None:
+        snapshot = {key: purchase[key] for key in PURCHASE_FIELDS}
+        snapshot['lines'] = [{key: line[key] for key in ('part_id', 'qty', 'price')}
+                             for line in lines.values() if not line['deleted_at']]
+        if expected != snapshot:
+            raise Problem('该采购单已被修改，请刷新后重试', 409)
+
+
+def record_purchase(db, data, actor, previous=None):
+    rows = data.get('lines')
+    if not isinstance(rows, list) or not rows:
+        raise Problem('请至少添加一个采购物料')
+    supplier_id = exists(db, 'suppliers', data.get('supplier_id'))['id']
+    date = required(data.get('date'), '采购日期')
+    try:
+        datetime.strptime(date, '%Y-%m-%d')
+    except ValueError:
+        raise Problem('采购日期格式错误')
+    responsible_id = data.get('responsible_id')
+    responsible = previous['responsible_id'] if previous and responsible_id == previous['responsible_id'] else assign_user(
+        db, responsible_id or actor['id'])
+    notes = str(data.get('notes') or '')
+    purchase_id = previous['id'] if previous else uid()
+    old_lines = purchase_lines_for_edit(db, purchase_id) if previous else {}
+    if previous:
+        check_purchase_snapshot(previous, old_lines, data.get('expected'))
+        if previous['supplier_id'] != supplier_id and any(line['has_receipts'] for line in old_lines.values()):
+            raise Problem('已有入库记录，请先处理关联的入库流水再更换供应商', 409)
+
+    selected = set()
+    code = previous['code'] if previous else next_code(db, 'PO')
+    if previous:
+        db.execute('UPDATE purchases SET supplier_id=?,date=?,notes=?,responsible_id=? WHERE id=?',
+                   (supplier_id, date, notes, responsible, purchase_id))
+    else:
+        insert_scoped(db, 'purchases', dict(id=purchase_id, code=code, supplier_id=supplier_id,
+                                          date=date, notes=notes, created_at=now(), responsible_id=responsible))
+    for row in rows:
+        if not isinstance(row, dict) or not isinstance(row.get('part_id'), str):
+            raise Problem('采购物料格式错误')
+        part_id = row['part_id']
+        if part_id in selected:
+            raise Problem('同一物料不能重复添加到采购单', 409)
+        selected.add(part_id)
+        old_line = old_lines.get(part_id)
+        existing = old_line and not old_line['deleted_at']
+        part = exists(db, 'parts', part_id) if existing else active_part(db, part_id)
+        qty, price = num(row.get('qty'), True), num(row.get('price'))
+        if old_line and qty < old_line['received']:
+            raise Problem(f'物料「{part["name"]}」的采购数量不能少于已入库数量', 409)
+        if old_line:
+            db.execute('UPDATE purchase_lines SET qty=?,price=?,deleted_at=NULL WHERE id=?', (qty, price, old_line['id']))
+        else:
+            insert_scoped(db, 'purchase_lines', dict(id=uid(), purchase_id=purchase_id, part_id=part_id,
+                                                     qty=qty, price=price, received=0))
+        if not part['deleted_at']:
+            insert_scoped(db, 'quotes', dict(id=uid(), part_id=part_id, supplier_id=supplier_id, price=None, url=''),
+                          'ON CONFLICT(part_id,supplier_id) DO NOTHING')
+
+    for part_id, line in old_lines.items():
+        if part_id in selected or line['deleted_at']:
+            continue
+        if line['has_receipts']:
+            raise Problem('请先处理该物料关联的入库流水，再移除采购明细', 409)
+        db.execute('UPDATE purchase_lines SET deleted_at=? WHERE id=?', (now(), line['id']))
+    owner_name = exists(db, 'users', responsible)['name'] if responsible else '—'
+    log_activity(db, actor, '修改采购单' if previous else '新增采购单', purchase_id, code,
+                 f'{owner_name} · {len(selected)} 项物料')
+    return purchase_id
+
+
+def delete_purchase(db, purchase_id, expected, actor):
+    purchase = exists(db, 'purchases', purchase_id)
+    if purchase['deleted_at']:
+        return purchase_id
+    lines = purchase_lines_for_edit(db, purchase_id)
+    check_purchase_snapshot(purchase, lines, expected)
+    if any(line['has_receipts'] for line in lines.values()):
+        raise Problem('采购单已有入库记录，请先处理关联的入库流水', 409)
+    db.execute('UPDATE purchases SET deleted_at=? WHERE id=?', (now(), purchase_id))
+    supplier = exists(db, 'suppliers', purchase['supplier_id'])
+    count = sum(not line['deleted_at'] for line in lines.values())
+    log_activity(db, actor, '删除采购单', purchase_id, purchase['code'], f'{supplier["name"]} · {count} 项物料')
+    return purchase_id
 
 
 def material_level(value):
@@ -742,6 +885,11 @@ def get_state(db):
             file['name'] = owner_file_name(file['name'], record['code'], record['name'], positions[owner])
     state['deleted_parts'] = [p for p in state['parts'] if p['deleted_at']]
     state['parts'] = [p for p in state['parts'] if not p['deleted_at']]
+    state['movements'] = [row for row in state['movements'] if not row['deleted_at']]
+    state['purchases'] = [row for row in state['purchases'] if not row['deleted_at']]
+    purchase_ids = {row['id'] for row in state['purchases']}
+    state['purchase_lines'] = [line for line in state['purchase_lines']
+                               if not line['deleted_at'] and line['purchase_id'] in purchase_ids]
     state['material_categories'] = [*BUILTIN_MATERIAL_CATEGORIES, *(row[0] for row in db.execute(
         'SELECT name FROM material_categories WHERE project_id=? ORDER BY name_key', (db.project_id,)))]
     state['users'] = [dict(row) for row in db.execute(
@@ -775,8 +923,8 @@ def list_projects(db, user):
                 WHERE f.project_id=p.id AND f.owner_type='products' AND f.kind='image'
                 ORDER BY f.rowid DESC LIMIT 1
             ) END AS cover_file_id,
-            (SELECT COUNT(*) FROM purchases AS po WHERE po.project_id=p.id AND EXISTS (
-                SELECT 1 FROM purchase_lines AS l WHERE l.purchase_id=po.id AND l.received<l.qty
+            (SELECT COUNT(*) FROM purchases AS po WHERE po.project_id=p.id AND po.deleted_at IS NULL AND EXISTS (
+                SELECT 1 FROM purchase_lines AS l WHERE l.purchase_id=po.id AND l.deleted_at IS NULL AND l.received<l.qty
             )) AS pending_purchases
         FROM projects AS p LEFT JOIN users AS u ON u.id=p.owner_id
         LEFT JOIN project_covers AS c ON c.project_id=p.id
@@ -866,6 +1014,8 @@ def stage_restore(archive_path, directory):
                     if table == 'projects' and version < 11:
                         optional.add('deleted_at')
                     if table == 'inspection_records' and version < 13:
+                        optional.add('deleted_at')
+                    if table in ('movements', 'purchases', 'purchase_lines') and version < RECORD_DELETION_VERSION:
                         optional.add('deleted_at')
                     if table == 'shipping_ks_orders' and version < shipping.CREATED_AT_VERSION:
                         optional.add('created_at')
@@ -1032,6 +1182,8 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute('BEGIN')
                     record = exists(db, table, id)
                     enter_project(db, record['project_id'], self.user)
+                    if table == 'purchases' and record['deleted_at']:
+                        raise Problem('采购单已删除', 404)
                     return self.send({'project_id': record['project_id']})
             if path == '/api/auth/logout' and method == 'POST':
                 with FILE_LOCK, transaction() as db:
@@ -1819,6 +1971,7 @@ class Handler(BaseHTTPRequestHandler):
         if resource=='movements':
             if method=='POST' and not id: return {'id':record_movement(db,d,self.user)}
             if method=='PUT' and id: return {'id':record_movement(db,d,self.user,movement_id=id)}
+            if method=='DELETE' and id: return {'id':delete_movement(db,id,d.get('expected'),self.user)}
         if resource=='demo' and method=='POST':
             self.require_admin()
             if any(db.execute(f'SELECT 1 FROM {t} WHERE project_id=? LIMIT 1', (db.project_id,)).fetchone()
@@ -1898,37 +2051,21 @@ class Handler(BaseHTTPRequestHandler):
             log_activity(db, self.user, '导入 BOM', version['product_id'], version['name'],
                          f'{count} 条明细 · 新建物料 {created} 项')
             return {'count':count, 'created':created, 'reused':count-created}
-        if resource == 'purchases' and method == 'PUT':
-            purchase = exists(db, 'purchases', id)
-            if set(d) != {'responsible_id'} or not d['responsible_id']:
-                raise Problem('请选择采购负责人')
-            owner = assign_user(db, d['responsible_id'])
-            db.execute('UPDATE purchases SET responsible_id=? WHERE id=?', (owner, id))
-            log_activity(db, self.user, '修改采购负责人', id, purchase['code'], exists(db, 'users', owner)['name'])
-            return {'id': id}
-        if resource=='purchases' and method=='POST':
-            supplier_id = exists(db, 'suppliers', d['supplier_id'])['id']
-            id = uid()
-            if not d.get('lines'): raise Problem('请至少添加一个采购物料')
-            date=required(d.get('date'),'采购日期')
-            try: datetime.strptime(date,'%Y-%m-%d')
-            except ValueError: raise Problem('采购日期格式错误')
-            responsible = assign_user(db, d.get('responsible_id') or self.user['id'])
-            code = next_code(db, 'PO')
-            insert_scoped(db, 'purchases', dict(id=id, code=code, supplier_id=supplier_id, date=date,
-                                                notes=str(d.get('notes','')), created_at=now(), responsible_id=responsible))
-            for line in d['lines']:
-                part = active_part(db, line['part_id'])
-                linked = db.execute(
-                    'SELECT 1 FROM quotes WHERE part_id=? AND supplier_id=?',
-                    (part['id'], supplier_id),
-                ).fetchone()
-                if not linked:
-                    raise Problem(f'所选供应商未关联物料「{part["name"]}」', 409)
-                insert_scoped(db, 'purchase_lines', dict(id=uid(), purchase_id=id, part_id=part['id'],
-                                                         qty=num(line['qty'], True), price=num(line['price']), received=0))
-            log_activity(db, self.user, '新增采购单', id, code, exists(db, 'users', responsible)['name'])
-            return {'id':id}
+        if resource == 'purchases':
+            if method == 'POST' and not id:
+                return {'id': record_purchase(db, d, self.user)}
+            if method == 'DELETE' and id:
+                return {'id': delete_purchase(db, id, d.get('expected'), self.user)}
+            if method == 'PUT' and id:
+                purchase = active_purchase(db, id)
+                if set(d) == {'responsible_id'}:
+                    if not d['responsible_id']:
+                        raise Problem('请选择采购负责人')
+                    owner = assign_user(db, d['responsible_id'])
+                    db.execute('UPDATE purchases SET responsible_id=? WHERE id=?', (owner, id))
+                    log_activity(db, self.user, '修改采购负责人', id, purchase['code'], exists(db, 'users', owner)['name'])
+                    return {'id': id}
+                return {'id': record_purchase(db, d, self.user, purchase)}
         if resource == 'quotes' and method == 'POST':
             part_id = d['part_id']
             supplier_id = d['supplier_id']

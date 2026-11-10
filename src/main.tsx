@@ -64,6 +64,7 @@ import {
   Quote,
   Purchase,
   Movement,
+  PurchaseLine,
   BomLine,
   FileRecord,
   User,
@@ -1673,6 +1674,7 @@ function Workspace({
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("全部产品");
   const [locationFilter, setLocationFilter] = useState("");
+  const [expandedPurchases, setExpandedPurchases] = useState<Set<string>>(new Set());
   const [materialLevel, setMaterialLevel] = useState(1);
   const [hiddenColumns, setHiddenColumns] = useState<Record<string, Column[]>>(
     () => {
@@ -1862,6 +1864,17 @@ function Workspace({
     state.bom_versions.find((item) => item.id === line.version_id)?.product_id,
   ))].map((id) => state.products.find((item) => item.id === id)?.name).filter(Boolean);
   const purchase = state.purchases.find((p) => p.id === detail);
+  function purchaseMaterialLabel(line: PurchaseLine) {
+    const item = findPart(line.part_id);
+    return <div className="purchase-material-cell">
+      <MaterialThumbnail className="purchase-material-photo"
+        imageId={files("parts", line.part_id).find((file) => file.kind === "image")?.id} />
+      <div>
+        <button type="button" className="text-link" onClick={() => go("parts", line.part_id)}>{item?.name}</button>
+        <small className="mono">{item?.code}</small>
+      </div>
+    </div>;
+  }
   const supplier = findSupplier(detail);
   const suppliedMaterials = supplier
     ? state.quotes.filter((q) => q.supplier_id === supplier.id)
@@ -4132,17 +4145,26 @@ function Workspace({
                         const lines = state.purchase_lines.filter(
                           (l) => l.purchase_id === p.id,
                         );
+                        const expanded = expandedPurchases.has(p.id);
                         return (
                           <React.Fragment key={p.id}>
                             <tr className="purchase-group">
                               <td>
-                                <button
-                                  className="text-link mono"
-                                  onClick={() => go("purchases", p.id)}
-                                >
-                                  {p.code}
-                                  <ArrowUpRight size={14} />
-                                </button>
+                                <div className="purchase-order-number">
+                                  <button type="button" className="icon-btn" aria-expanded={expanded}
+                                    aria-label={(expanded ? "收起采购单 " : "展开采购单 ") + p.code}
+                                    onClick={() => setExpandedPurchases((old) => {
+                                      const next = new Set(old);
+                                      if (next.has(p.id)) next.delete(p.id);
+                                      else next.add(p.id);
+                                      return next;
+                                    })}>
+                                    {expanded ? <ChevronDown size={15} /> : <ChevronRight size={15} />}
+                                  </button>
+                                  <button className="text-link mono" onClick={() => go("purchases", p.id)}>
+                                    {p.code}<ArrowUpRight size={14} />
+                                  </button>
+                                </div>
                               </td>
                               <td>{findSupplier(p.supplier_id)?.name}</td>
                               <td colSpan={3} className="muted">
@@ -4157,24 +4179,25 @@ function Workspace({
                                 )}
                               </td>
                               <td>
-                                <Badge>{costStatus(p)}</Badge>
+                                <div className="purchase-summary-actions">
+                                  <Badge>{costStatus(p)}</Badge>
+                                  {!archived && <Button type="button" small
+                                    aria-label={"编辑采购单 " + p.code}
+                                    onClick={() => setModal({ kind: "purchase", item: p })}>
+                                    <Pencil size={13} />编辑
+                                  </Button>}
+                                </div>
                                 <small>
                                   {p.date} · {userName(p.responsible_id)}
                                 </small>
                               </td>
                             </tr>
-                            {lines.map((l) => {
+                            {expanded && lines.map((l) => {
                               const part = findPart(l.part_id);
                               return (
                                 <tr key={l.id}>
                                   <td className="indented">
-                                    <button
-                                      className="text-link"
-                                      onClick={() => go("parts", l.part_id)}
-                                    >
-                                      {part?.name}
-                                    </button>
-                                    <small className="mono">{part?.code}</small>
+                                    {purchaseMaterialLabel(l)}
                                   </td>
                                   <td className="muted">{part?.spec}</td>
                                   <td className="num">
@@ -4254,14 +4277,9 @@ function Workspace({
                     {purchase.notes || "无备注"}
                   </p>
                 </div>
-                <Button
-                  onClick={() =>
-                    setModal({ kind: "purchase-owner", item: purchase })
-                  }
-                >
-                  <Pencil size={15} />
-                  负责人：{userName(purchase.responsible_id)}
-                </Button>
+                {!archived && <Button onClick={() => setModal({ kind: "purchase", item: purchase })}>
+                  <Pencil size={15} />编辑采购单
+                </Button>}
                 <Button
                   onClick={() =>
                     exportCSV(
@@ -4304,13 +4322,7 @@ function Workspace({
                         return (
                           <tr key={l.id}>
                             <td>
-                              <button
-                                className="text-link"
-                                onClick={() => go("parts", l.part_id)}
-                              >
-                                {p?.name}
-                              </button>
-                              <small>{p?.code}</small>
+                              {purchaseMaterialLabel(l)}
                             </td>
                             <td className="num">
                               {amount(l.qty)} {p?.unit}
@@ -4898,36 +4910,26 @@ function Workspace({
                 submit={(d) => modal.item.id
                   ? mutate("movements/" + modal.item.id, "PUT", d, "库存流水已更新")
                   : mutate("movements", "POST", d, "库存已更新，流水已记录")}
-              />
-            </Dialog>
-          )}
-          {modal.kind === "purchase-owner" && (
-            <Dialog title="修改采购负责人" onClose={() => setModal(null)}>
-              <EntityForm
-                initial={{ responsible_id: modal.item.responsible_id }}
-                fields={[
-                  {
-                    name: "responsible_id",
-                    label: "采购负责人",
-                    options: userOptions,
-                    required: true,
-                    wide: true,
-                  },
-                ]}
-                onCancel={() => setModal(null)}
-                submit={(data) =>
-                  mutate("purchases/" + modal.item.id, "PUT", data)
-                }
+                remove={modal.item.id ? () =>
+                  mutate("movements/" + modal.item.id, "DELETE", { expected: modal.item }, "库存流水已删除")
+                  : undefined}
               />
             </Dialog>
           )}
           {modal.kind === "purchase" && (
-            <Dialog title="新建采购单" wide onClose={() => setModal(null)}>
+            <Dialog title={modal.item?.id ? "编辑采购单" : "新建采购单"} wide onClose={() => setModal(null)}>
               <PurchaseForm
                 state={state}
+                initial={modal.item}
                 defaultOwner={currentUser?.id || ""}
                 onCancel={() => setModal(null)}
-                submit={(d) => mutate("purchases", "POST", d, "采购单已创建")}
+                submit={(d) => modal.item?.id
+                  ? mutate("purchases/" + modal.item.id, "PUT", d, "采购单已更新")
+                  : mutate("purchases", "POST", d, "采购单已创建")}
+                remove={modal.item?.id ? async (expected) => {
+                  await mutate("purchases/" + modal.item.id, "DELETE", { expected }, "采购单已删除");
+                  if (detail === modal.item.id) go("purchases");
+                } : undefined}
               />
             </Dialog>
           )}
@@ -5315,16 +5317,62 @@ function BomForm({
     </>
   );
 }
+function useRecordRemoval(remove?: () => Promise<void>) {
+  const [confirming, setConfirming] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
+  return {
+    available: !!remove, confirming, pending, error,
+    toggle(next: boolean) { setError(""); setConfirming(next); },
+    async confirm() {
+      if (!remove || pending) return;
+      setPending(true);
+      setError("");
+      try { await remove(); }
+      catch (e) { setError((e as Error).message); }
+      finally { setPending(false); }
+    },
+  };
+}
+
+function RecordFormActions({ removal, busy, onCancel, saveLabel, deleteLabel, confirmText, canSave = true }: {
+  removal: ReturnType<typeof useRecordRemoval>;
+  busy: boolean;
+  onCancel: () => void;
+  saveLabel: string;
+  deleteLabel: string;
+  confirmText: string;
+  canSave?: boolean;
+}) {
+  return <>
+    {removal.confirming && <p className="confirm-copy">{confirmText}</p>}
+    <div className="dialog-actions">
+      {removal.available && !removal.confirming && <Button type="button" className="record-delete" disabled={busy}
+        onClick={() => removal.toggle(true)}><Trash2 size={15} />{deleteLabel}</Button>}
+      <Button type="button" disabled={busy || removal.pending}
+        onClick={removal.confirming ? () => removal.toggle(false) : onCancel}>取消</Button>
+      {removal.confirming
+        ? <Button type="button" className="record-delete-confirm" disabled={removal.pending}
+          onClick={() => void removal.confirm()}>确认删除</Button>
+        : <Button primary type="submit" disabled={busy || !canSave}>
+          {busy && <Loader2 size={16} className="spin" />}{saveLabel}
+        </Button>}
+    </div>
+  </>;
+}
+
 function MovementForm({
   state,
   initial,
   submit,
   onCancel,
+  remove,
 }: {
   state: State;
   initial: Partial<Movement>;
   submit: (d: any) => Promise<void>;
   onCancel: () => void;
+  remove?: () => Promise<void>;
 }) {
   const [type, setType] = useState(initial.type || "入库");
   const [part, setPart] = useState(initial.part_id || "");
@@ -5334,6 +5382,7 @@ function MovementForm({
   const [product, setProduct] = useState(initial.product_id || "");
   const [handler, setHandler] = useState(initial.handler_id || "");
   const [reason, setReason] = useState(initial.reason || "");
+  const removal = useRecordRemoval(remove);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const p = state.parts.find((p) => p.id === part);
@@ -5366,6 +5415,7 @@ function MovementForm({
     <form
       onSubmit={async (e) => {
         e.preventDefault();
+        if (busy || removal.confirming) return;
         setBusy(true);
         setError("");
         try {
@@ -5520,21 +5570,15 @@ function MovementForm({
           />
         </label>
       </div>
-      {error && (
+      {(removal.error || error) && (
         <div className="form-error">
           <AlertCircle size={16} />
-          {error}
+          {removal.error || error}
         </div>
       )}
-      <div className="dialog-actions">
-        <Button type="button" onClick={onCancel}>
-          取消
-        </Button>
-        <Button primary type="submit" disabled={busy}>
-          {busy ? <Loader2 size={16} className="spin" /> : <Check size={16} />}
-          {initial.id ? "保存修改" : "确认" + type}
-        </Button>
-      </div>
+      <RecordFormActions removal={removal} busy={busy} onCancel={onCancel}
+        saveLabel={initial.id ? "保存修改" : "确认" + type} deleteLabel="删除流水"
+        confirmText={`删除流水 ${initial.code}？库存和采购入库数量将重新计算。`} />
     </form>
   );
 }
@@ -5771,21 +5815,34 @@ type PurchaseDraftLine = {
   qty: string;
   priceOverride?: { supplierId: string; value: string };
 };
+type PurchaseSnapshot = Pick<Purchase, "supplier_id" | "date" | "notes" | "responsible_id"> & {
+  lines: Pick<PurchaseLine, "part_id" | "qty" | "price">[];
+};
 
 function PurchaseForm({
   state,
+  initial,
   defaultOwner,
   submit,
   onCancel,
+  remove,
 }: {
   state: State;
+  initial?: Purchase;
   defaultOwner: string;
   submit: (d: any) => Promise<void>;
   onCancel: () => void;
+  remove?: (expected: PurchaseSnapshot) => Promise<void>;
 }) {
-  const [owner, setOwner] = useState(defaultOwner);
-  const [preferredSupplier, setPreferredSupplier] = useState("");
+  const existingLines = state.purchase_lines.filter((line) => line.purchase_id === initial?.id);
+  const [expected] = useState<PurchaseSnapshot | undefined>(() => initial && ({
+    supplier_id: initial.supplier_id, date: initial.date, notes: initial.notes, responsible_id: initial.responsible_id,
+    lines: existingLines.map(({ part_id, qty, price }) => ({ part_id, qty, price })),
+  }));
+  const [owner, setOwner] = useState(initial?.responsible_id || defaultOwner);
+  const [preferredSupplier, setPreferredSupplier] = useState(initial?.supplier_id || "");
   const [date, setDate] = useState(() => {
+    if (initial) return initial.date;
     const today = new Date();
     return [
       today.getFullYear(),
@@ -5793,12 +5850,21 @@ function PurchaseForm({
       String(today.getDate()).padStart(2, "0"),
     ].join("-");
   });
-  const [notes, setNotes] = useState("");
-  const [lines, setLines] = useState<PurchaseDraftLine[]>([]);
+  const [notes, setNotes] = useState(initial?.notes || "");
+  const [lines, setLines] = useState<PurchaseDraftLine[]>(() => initial
+    ? existingLines.map((line) => ({
+      partId: line.part_id, qty: String(line.qty),
+      priceOverride: { supplierId: initial.supplier_id, value: String(line.price) },
+    }))
+    : []);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const removal = useRecordRemoval(remove && expected ? () => remove(expected) : undefined);
+  const receivedByPart = new Map(existingLines.map((line) => [line.part_id, line.received]));
+  const supplierLocked = existingLines.some((line) => line.received > 0);
+  const owners = [...state.users, ...state.former_users.filter((user) => user.id === initial?.responsible_id)];
   const { partsById, photos, quotesByPart } = React.useMemo(() => {
-    const partsById = new Map(state.parts.map((part) => [part.id, part]));
+    const partsById = new Map([...state.parts, ...state.deleted_parts].map((part) => [part.id, part]));
     const photos = new Map<string, string>();
     for (const file of state.files) {
       if (file.owner_type === "parts" && file.kind === "image" && !photos.has(file.owner_id))
@@ -5810,22 +5876,23 @@ function PurchaseForm({
       quotesByPart.get(quote.part_id)?.set(quote.supplier_id, quote);
     }
     return { partsById, photos, quotesByPart };
-  }, [state.parts, state.files, state.quotes]);
+  }, [state.parts, state.deleted_parts, state.files, state.quotes]);
   const selected = new Set(lines.map((line) => line.partId));
   const suppliersById = new Map(state.suppliers.map((supplier) => [supplier.id, supplier]));
   const firstQuotes = lines.length ? quotesByPart.get(lines[0].partId) : undefined;
-  const supplierOptions = Array.from(firstQuotes?.keys() || []).filter(
+  const commonSuppliers = Array.from(firstQuotes?.keys() || []).filter(
     (id) =>
       suppliersById.has(id) &&
       lines.every((line) => quotesByPart.get(line.partId)?.has(id)),
   );
-  const supplierId = supplierOptions.includes(preferredSupplier)
+  const supplierId = suppliersById.has(preferredSupplier)
     ? preferredSupplier
-    : supplierOptions[0] || "";
+    : commonSuppliers[0] || "";
+  const otherSuppliers = state.suppliers.filter((supplier) => !commonSuppliers.includes(supplier.id));
   const pricedLines = lines.map(({ partId, qty, priceOverride }) => {
     const part = partsById.get(partId);
     const quote = quotesByPart.get(partId)?.get(supplierId);
-    const price = priceOverride?.supplierId === supplierId
+    const price = priceOverride && (!priceOverride.supplierId || priceOverride.supplierId === supplierId)
       ? priceOverride.value
       : quote?.price ?? part?.price ?? 0;
     return { part_id: partId, qty, price };
@@ -5836,20 +5903,21 @@ function PurchaseForm({
       ? current
       : [...current, { partId, qty: "1" }],
   );
-  const removePart = (partId: string) =>
-    setLines((current) => current.filter((line) => line.partId !== partId));
+  const removePart = (partId: string) => {
+    if (!receivedByPart.get(partId)) setLines((current) => current.filter((line) => line.partId !== partId));
+  };
   const updateLine = (partId: string, fields: Partial<PurchaseDraftLine>) =>
     setLines((current) => current.map((line) =>
       line.partId === partId ? { ...line, ...fields } : line,
     ));
-  const missingSupplier = lines.some((line) => !quotesByPart.get(line.partId)?.size);
+  const newLinks = supplierId ? lines.filter((line) => !quotesByPart.get(line.partId)?.has(supplierId)).length : 0;
 
   return (
     <form
       className="purchase-form"
       onSubmit={async (event) => {
         event.preventDefault();
-        if (!supplierId || !pricedLines.length || busy) return;
+        if (!supplierId || !pricedLines.length || busy || removal.confirming) return;
         setError("");
         setBusy(true);
         try {
@@ -5859,6 +5927,7 @@ function PurchaseForm({
             date,
             notes,
             lines: pricedLines,
+            expected,
           });
         } catch (e) {
           setError((e as Error).message);
@@ -5885,6 +5954,7 @@ function PurchaseForm({
           {lines.map((line, index) => {
             const part = partsById.get(line.partId);
             if (!part) return null;
+            const received = receivedByPart.get(part.id) || 0;
             return (
               <div className="purchase-form-line" key={line.partId}>
                 <div className="purchase-selected-material">
@@ -5893,6 +5963,7 @@ function PurchaseForm({
                     <strong>{part.name}</strong>
                     <small>
                       {part.code} · {part.unit}
+                      {received > 0 && " · 已入库 " + amount(received)}
                       {!quotesByPart.get(part.id)?.size && " · 未关联供应商"}
                     </small>
                   </span>
@@ -5901,7 +5972,7 @@ function PurchaseForm({
                   aria-label={part.name + " 数量"}
                   type="number"
                   required
-                  min="0.000001"
+                  min={Math.max(received, 0.000001)}
                   step="any"
                   value={line.qty}
                   onChange={(event) => updateLine(part.id, { qty: event.target.value })}
@@ -5923,6 +5994,7 @@ function PurchaseForm({
                   className="icon-btn"
                   type="button"
                   aria-label={"移除" + part.name}
+                  disabled={received > 0}
                   onClick={() => removePart(part.id)}
                 >
                   <Trash2 size={16} />
@@ -5938,29 +6010,46 @@ function PurchaseForm({
       <div className="form-grid purchase-order-fields">
         <label className="purchase-supplier-field">
           供应商 *
-          <select
+          <ChoiceSelect
+            aria-label="供应商"
+            create={supplierLocked ? undefined : { resource: "suppliers" }}
             required
-            disabled={!supplierOptions.length}
+            disabled={busy || supplierLocked}
             value={supplierId}
-            onChange={(event) => setPreferredSupplier(event.target.value)}
+            onValueChange={(id) => {
+              setPreferredSupplier(id);
+              if (id && !supplierId) {
+                setLines((current) => current.map((line) => line.priceOverride?.supplierId === ""
+                  ? { ...line, priceOverride: { ...line.priceOverride, supplierId: id } }
+                  : line));
+              }
+            }}
           >
-            {!supplierOptions.length && (
-              <option value="">{lines.length ? "无可选供应商" : "请先选择物料"}</option>
+            <option value="">请选择供应商</option>
+            {!!commonSuppliers.length && (
+              <optgroup label="已关联所选物料">
+                {commonSuppliers.map((id) => (
+                  <option key={id} value={id}>{suppliersById.get(id)?.name}</option>
+                ))}
+              </optgroup>
             )}
-            {supplierOptions.map((id) => (
-              <option key={id} value={id}>{suppliersById.get(id)?.name}</option>
-            ))}
-          </select>
-          {!!lines.length && !supplierOptions.length && (
+            {!!otherSuppliers.length && (
+              <optgroup label={commonSuppliers.length ? "其他供应商" : "项目供应商"}>
+                {otherSuppliers.map((supplier) => (
+                  <option key={supplier.id} value={supplier.id}>{supplier.name}</option>
+                ))}
+              </optgroup>
+            )}
+          </ChoiceSelect>
+          {newLinks > 0 && (
             <small className="purchase-supplier-hint" role="status">
-              {missingSupplier
-                ? "请先在物料库为未关联的物料添加供应商。"
-                : "所选物料没有共同供应商，请分开下单。"}
+              保存后将关联 {newLinks} 项物料
             </small>
           )}
+          {supplierLocked && <small className="purchase-supplier-hint">已入库，供应商已锁定</small>}
         </label>
         <PersonSelect
-          users={state.users}
+          users={owners}
           label="采购负责人"
           value={owner}
           onChange={setOwner}
@@ -5979,13 +6068,10 @@ function PurchaseForm({
         采购备注
         <textarea rows={2} value={notes} onChange={(event) => setNotes(event.target.value)} />
       </label>
-      {error && <div className="form-error" role="alert">{error}</div>}
-      <div className="dialog-actions">
-        <Button type="button" onClick={onCancel}>取消</Button>
-        <Button primary type="submit" disabled={busy || !supplierId}>
-          {busy && <Loader2 size={16} className="spin" />}创建采购单
-        </Button>
-      </div>
+      {(removal.error || error) && <div className="form-error" role="alert">{removal.error || error}</div>}
+      <RecordFormActions removal={removal} busy={busy} onCancel={onCancel} canSave={!!supplierId && !!pricedLines.length}
+        saveLabel={initial ? "保存修改" : "创建采购单"} deleteLabel="删除采购单"
+        confirmText={`删除采购单 ${initial?.code}？`} />
     </form>
   );
 }

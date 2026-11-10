@@ -649,6 +649,53 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.state()['movements'][2]['product_id'], product)
         self.assertEqual(self.stock(), 7)
 
+    def test_delete_receipt_reconciles_purchase_and_preserves_audit(self):
+        self.request('purchases', 'POST', {
+            'supplier_id': self.supplier_for(self.part), 'date': '2026-11-06',
+            'lines': [{'part_id': self.part, 'qty': 10, 'price': 2}],
+        })
+        line = self.state()['purchase_lines'][0]['id']
+        receipt = self.move('入库', 4, purchase_line_id=line)['id']
+        self.move('入库', 8)
+        self.move('出库', 5)
+        before = self.state()['movements'][0]
+        path = 'movements/' + receipt
+        self.request(path, 'DELETE', {'expected': {**before, 'qty': 6}}, 409)
+        for _ in range(2):
+            self.request(path, 'DELETE', {'expected': before})
+        self.request(path, 'PUT', {'qty': 6}, 404)
+        state = self.state()
+        self.assertEqual([m['balance'] for m in state['movements']], [8, 3])
+        self.assertEqual(self.stock(), 3)
+        self.assertEqual(state['purchase_lines'][0]['received'], 0)
+        audit = [row for row in self.request('activity')['items'] if row['action'] == '删除库存流水']
+        self.assertEqual([row['subject'] for row in audit], [before['code']])
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            archive = folder / 'backup.zip'
+            archive.write_bytes(self.request('backup', raw=True))
+            restored, _ = app.stage_restore(archive, folder)
+            with app.connect(restored) as db:
+                row = db.execute('SELECT qty,deleted_at FROM movements WHERE id=?', (receipt,)).fetchone()
+                self.assertEqual(row['qty'], 4)
+                self.assertTrue(row['deleted_at'])
+
+    def test_delete_movement_checks_history_and_active_returns(self):
+        first = self.move('入库', 8)['id']
+        out = self.move('出库', 5)['id']
+        returned = self.move('退库', 2, original_id=out)['id']
+        self.move('入库', 8)
+        before = self.state()['movements']
+        self.request('movements/' + first, 'DELETE', {}, 409)
+        self.request('movements/' + out, 'DELETE', {}, 409)
+        self.assertEqual(self.state()['movements'], before)
+        self.request('movements/' + returned, 'DELETE')
+        self.assertEqual([m['balance'] for m in self.state()['movements']], [8, 3, 11])
+        self.request('movements/' + out, 'DELETE')
+        self.request('movements', 'POST', {'type': '退库', 'part_id': self.part, 'qty': 1, 'original_id': out}, 400)
+        self.assertEqual([m['balance'] for m in self.state()['movements']], [8, 16])
+        self.assertEqual(self.stock(), 16)
+
     def test_supplier_links_allow_multiple_records_without_prices(self):
         first, second = self.supplier(), self.supplier()
         other_part = self.request('parts', 'POST', {'name': '另一个物料'})['id']
@@ -770,19 +817,66 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.request('activity', project=False)['items'][0]['action'], '恢复备份')
 
     def test_purchase_creation_rolls_back(self):
-        self.request('purchases','POST',{'supplier_id':self.supplier_for(self.part),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
-        self.assertEqual(self.state()['purchases'],[]);self.assertEqual(self.state()['purchase_lines'],[])
-    def test_purchase_supplier_must_supply_all_selected_parts(self):
-        supplier_id = self.supplier_for(self.part)
+        self.request('purchases','POST',{'supplier_id':self.supplier(),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':2,'price':1},{'part_id':self.part,'qty':2,'price':1}]},409)
+        state = self.state()
+        self.assertEqual(state['purchases'], [])
+        self.assertEqual(state['purchase_lines'], [])
+        self.assertEqual(state['quotes'], [])
+
+    def test_purchase_links_supplier_to_all_parts_without_overwriting_quotes(self):
+        supplier_id = self.supplier()
+        existing_quote = {'part_id': self.part, 'supplier_id': supplier_id, 'price': 5, 'url': 'https://example.test/quote'}
+        self.request('quotes', 'POST', existing_quote)
         other_part = self.request('parts', 'POST', {'name': '采购物料二'})['id']
         order = {'supplier_id': supplier_id, 'date': '2026-11-09',
                  'lines': [{'part_id': part, 'qty': 2, 'price': 1} for part in (self.part, other_part)]}
-        self.request('purchases', 'POST', order, 409)
-        self.assertEqual(self.state()['purchases'], [])
-        self.assertEqual(self.state()['purchase_lines'], [])
-        self.request('quotes', 'POST', {'part_id': other_part, 'supplier_id': supplier_id})
         self.request('purchases', 'POST', order)
-        self.assertEqual(len(self.state()['purchase_lines']), 2)
+        self.request('purchases', 'POST', order)
+        state = self.state()
+        self.assertEqual(len(state['purchase_lines']), 4)
+        self.assertEqual({line['price'] for line in state['purchase_lines']}, {1})
+        self.assertEqual([(q['part_id'], q['supplier_id'], q['price'], q['url']) for q in state['quotes']],
+                         [(self.part, supplier_id, 5, existing_quote['url']), (other_part, supplier_id, None, '')])
+
+    def test_purchase_edit_and_delete_respect_receipts_and_retain_history(self):
+        supplier = self.supplier()
+        other_supplier = self.request('suppliers', 'POST', {'name': '新供应商'})['id']
+        other_part = self.request('parts', 'POST', {'name': '备用采购物料'})['id']
+        payload = {'supplier_id': supplier, 'date': '2026-11-10', 'notes': '原采购单', 'lines': [
+            {'part_id': self.part, 'qty': 6, 'price': 1},
+            {'part_id': other_part, 'qty': 3, 'price': 2},
+        ]}
+        order_id = self.request('purchases', 'POST', payload)['id']
+        path = 'purchases/' + order_id
+        state = self.state()
+        order = state['purchases'][0]
+        line = state['purchase_lines'][0]['id']
+        snapshot = {key: order[key] for key in ('supplier_id', 'date', 'notes', 'responsible_id')}
+        snapshot['lines'] = payload['lines']
+        receipt = self.move('入库', 4, purchase_line_id=line)['id']
+        self.request(path, 'DELETE', {'expected': snapshot}, 409)
+        self.request(path, 'PUT', {**payload, 'supplier_id': other_supplier}, 409)
+        self.request(path, 'PUT', {**payload, 'lines': [payload['lines'][1]]}, 409)
+        self.request(path, 'PUT', {**payload, 'lines': [{**payload['lines'][0], 'qty': 3}]}, 409)
+        updated = {**payload, 'notes': '更新数量和价格', 'lines': [{**payload['lines'][0], 'qty': 5, 'price': 4}]}
+        self.request(path, 'PUT', {**updated, 'expected': snapshot})
+        self.request(path, 'DELETE', {'expected': snapshot}, 409)
+        state = self.state()
+        self.assertEqual((state['purchases'][0]['code'], state['purchases'][0]['created_at']),
+                         (order['code'], order['created_at']))
+        self.assertEqual([(row['id'], row['qty'], row['received']) for row in state['purchase_lines']], [(line, 5, 4)])
+        self.request('movements/' + receipt, 'DELETE')
+        self.request(path, 'PUT', {**updated, 'supplier_id': other_supplier, 'lines': payload['lines']})
+        self.assertIn((other_part, other_supplier), {(row['part_id'], row['supplier_id']) for row in self.state()['quotes']})
+        self.request(path, 'DELETE')
+        self.request(path, 'DELETE')
+        self.request('movements', 'POST', {'type': '入库', 'part_id': self.part, 'qty': 1, 'purchase_line_id': line}, 404)
+        self.assertEqual((self.state()['purchases'], self.state()['purchase_lines'], self.stock()), ([], [], 0))
+        self.assertEqual(sum(row['action'] == '删除采购单' for row in self.request('activity')['items']), 1)
+        with app.connect() as db:
+            self.assertTrue(db.execute('SELECT deleted_at FROM purchases WHERE id=?', (order_id,)).fetchone()[0])
+            self.assertIsNone(db.execute('PRAGMA foreign_key_check').fetchone())
+
     def test_delete_product_with_bom_keeps_shared_material_code_and_stock(self):
         product = self.request('products', 'POST', {'name': '产品A', 'english_code': 'AQUAMIX'})['id']
         other = self.request('products', 'POST', {'name': '产品B'})['id']
