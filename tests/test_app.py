@@ -82,8 +82,24 @@ class IntegrationTests(unittest.TestCase):
         rows = self.request('shipping/records?' + urlencode({'channel': 'ks', 'backer': '88'}))['rows']
         self.assertEqual([r['id'] for r in rows], [ks['id']])
         self.assertEqual([d['serial'] for d in rows[0]['devices']], [serial])
+        self.assertEqual(self.request('shipping/records/' + ks['id']), rows[0])
+        self.request('shipping/records/' + ks['id'], status=404, project=other)
+        self.assertEqual([link['id'] for link in self.request('shipping/orders/' + order['id'])['shipment_links']], [ks['id']])
+        self.request('shipping/orders/' + order['id'], status=404, project=other)
         self.assertEqual(self.request('shipping/orders?status=shipped')['rows'][0]['shipped'], 1)
-        self.assertEqual(len(self.request('shipping/device-records?serial=' + serial)), 2)
+        links = self.request('shipping/device-records?serial=' + serial)
+        self.assertEqual(len(links), 2)
+        self.assertIn(ks['id'], [link['id'] for link in links])
+        self.assertEqual(self.request('inspection/device-inspections?serial=' + serial)['records'], [])
+        for label in ('出厂检测', '复检'):
+            form = self.request('inspection/templates', 'POST', {'name': label, 'serial_mode': 'text',
+                                'fields': [{'key': 'note', 'label': '备注', 'type': 'text'}]})
+            self.request('inspection/records', 'POST', {'template_id': form['id'], 'serial': serial,
+                         'values': {'note': label}, 'revision': 1})
+        inspection = self.request('inspection/device-inspections?serial=' + serial)
+        self.assertEqual({row['form']['name'] for row in inspection['records']}, {'出厂检测', '复检'})
+        self.assertEqual(self.request('inspection/device-inspections?serial=' + serial, project=other),
+                         {'device': None, 'records': []})
         self.request('shipping/records/' + ks['id'], 'PUT', {**first, 'version': 'stale'}, 409)
         self.request('shipping/records/' + ks['id'], 'PUT', {**first, 'version': rows[0]['updated_at'], 'devices': []})
         self.assertEqual(len(self.request('shipping/device-records?serial=' + serial)), 1)

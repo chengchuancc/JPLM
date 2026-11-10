@@ -1015,14 +1015,20 @@ class Handler(BaseHTTPRequestHandler):
 
     def shipping_request(self, project_id, resource, method):
         query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
+        record_path = re.fullmatch(r'records/([a-f0-9]{24})', resource)
+        order_path = re.fullmatch(r'orders/([a-f0-9]{24})', resource)
         if method == 'GET':
             with connect() as db:
                 db.execute('BEGIN')
                 enter_project(db, project_id, self.user)
                 if resource == 'orders':
                     return self.send(shipping.list_orders(db, project_id, query))
+                if order_path:
+                    return self.send(shipping.get_order(db, project_id, order_path[1]))
                 if resource == 'records':
                     return self.send(shipping.list_shipments(db, project_id, query.get('channel'), query))
+                if record_path:
+                    return self.send(shipping.get_shipment(db, project_id, record_path[1]))
                 if resource == 'devices':
                     return self.send(shipping.find_devices(db, project_id, query))
                 if resource == 'device-records':
@@ -1051,18 +1057,18 @@ class Handler(BaseHTTPRequestHandler):
                     log_activity(db, self.user, '导入 KS 订单', '', 'KS 发货信息',
                                  f"新增 {report['added']} 条，更新 {report['updated']} 条")
             return self.send(report)
-        editing = re.fullmatch(r'records/([a-f0-9]{24})', resource)
-        if (resource == 'records' and method == 'POST') or (editing and method == 'PUT'):
+        if (resource == 'records' and method == 'POST') or (record_path and method == 'PUT'):
             data = self.body()
             if not isinstance(data, dict):
                 raise Problem('发货记录格式无效')
             with FILE_LOCK, transaction() as db:
                 self.inspection_writer(db, project_id)
-                result = shipping.save_shipment(db, project_id, editing[1] if editing else uid(),
+                result = shipping.save_shipment(db, project_id, record_path[1] if record_path else uid(),
                                                 data, now(), self.user['id'])
                 touch_project(db)
-                log_activity(db, self.user, '修改发货记录' if editing else '登记发货',
+                log_activity(db, self.user, '修改发货记录' if record_path else '登记发货',
                              result['id'], result['reference'])
+                result = shipping.get_shipment(db, project_id, result['id'])
             return self.send(result)
         raise Problem('接口不存在', 404)
 
@@ -1079,6 +1085,10 @@ class Handler(BaseHTTPRequestHandler):
                 if resource == 'device':
                     serial, _, _ = inspection.parse_serial(query.get('serial'), 'text')
                     return self.send({'device': inspection.get_device(db, project_id, serial)})
+                if resource == 'device-inspections':
+                    serial, _, _ = inspection.parse_serial(query.get('serial'), 'text')
+                    return self.send({'device': inspection.get_device(db, project_id, serial),
+                                      'records': inspection.records_for_device(db, project_id, serial)})
                 if resource not in ('records', 'lookup', 'latest', 'options', 'export', 'import-template'):
                     raise Problem('接口不存在', 404)
                 config = inspection.template(db, project_id, query.get('template'))

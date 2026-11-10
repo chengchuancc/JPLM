@@ -1,4 +1,4 @@
-import React, { useContext, useEffect, useRef, useState } from "react";
+import React, { Suspense, lazy, useContext, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Boxes,
@@ -77,9 +77,9 @@ import {
 } from "./material-table";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
-import { ShippingManagement } from "./shipping";
 import { Dialog } from "./dialog";
 
+const ShippingManagement = lazy(() => import("./shipping"));
 const money = (n: number) =>
   new Intl.NumberFormat("zh-CN", {
     style: "currency",
@@ -1095,7 +1095,7 @@ function App() {
   }
   function navigate(next: WorkspaceRoute, replace = false) {
     if ((currentRoute.current.projectId !== next.projectId ||
-        (currentRoute.current.view === "inspection" && next.view !== "inspection")) && draftOpen.current &&
+        (["inspection", "shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
         !window.confirm("有未保存的内容。离开当前项目？")) return;
     if (location.hash !== workspaceHash(next)) {
       if (replace) history.replaceState(null, "", workspaceHash(next));
@@ -1109,7 +1109,7 @@ function App() {
     const changed = () => {
       const next = readWorkspaceRoute();
       if ((currentRoute.current.projectId !== next.projectId ||
-          (currentRoute.current.view === "inspection" && next.view !== "inspection")) && draftOpen.current &&
+          (["inspection", "shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
           !window.confirm("有未保存的内容。离开当前项目？")) {
         history.replaceState(null, "", workspaceHash(currentRoute.current));
         return;
@@ -2488,8 +2488,10 @@ function Workspace({
             readOnly={archived}
             onDraftChange={(dirty) => { draftOpen.current = dirty; }}
           />}
-          {view === "shipping" && project && <ShippingManagement request={businessApi}
-            admin={currentUser.role === "admin"} readOnly={archived} />}
+          {view === "shipping" && project && <Suspense fallback={<p className="muted">正在加载发货管理…</p>}>
+            <ShippingManagement request={businessApi} admin={currentUser.role === "admin"} readOnly={archived}
+              onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
+          </Suspense>}
           {view === "project-settings" && project && (
             <ProjectSettings project={{ ...project, ...state.project }} user={currentUser}
               onDeleted={() => go("projects")} onSaved={async () => {

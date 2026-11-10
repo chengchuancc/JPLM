@@ -324,6 +324,12 @@ def exact_record(db, project_id, template_id, serial, *, include_deleted=False):
     return decode_record(row) if row else None
 
 
+def records_for_device(db, project_id, serial):
+    return [decode_record(row) for row in db.execute(
+        '''SELECT * FROM inspection_records WHERE project_id=? AND serial=? AND deleted_at IS NULL
+           ORDER BY updated_at DESC,id DESC''', (project_id, serial))]
+
+
 def save_record(db, project_id, config, data, user, stamp, record_id):
     serial, prefix, produced = parse_serial(data.get('serial'), config['serial_mode'])
     old = exact_record(db, project_id, config['id'], serial, include_deleted=True)

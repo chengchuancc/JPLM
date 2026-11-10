@@ -39,6 +39,10 @@ DETAIL_KEYS = (*CONTACT, *ITEMS, *COSTS, 'source', 'carrier', 'notes')
 ORDER_KEYS = (*CONTACT, *ITEMS, 'pb', 'sku', 'country_code', 'address_status', 'notes',
               'pledged', 'amount_due', 'paid', 'balance')
 PAGE_SIZE = 50
+SHIPMENT_SELECT = '''SELECT s.*,o.backer,o.details AS order_details,u.name AS operator
+    FROM shipping_records s
+    LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id
+    LEFT JOIN users u ON u.id=s.operator_id'''
 
 
 class ShippingError(ValueError):
@@ -149,15 +153,24 @@ def list_shipments(db, project, channel, query):
     join = 'FROM shipping_records s LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id'
     total = db.execute(f'SELECT count(*) {join} WHERE {predicate}', params).fetchone()[0]
     page = page_number(query)
-    rows = db.execute(f'''SELECT s.*,o.backer,o.details AS order_details,u.name AS operator {join}
-        LEFT JOIN users u ON u.id=s.operator_id WHERE {predicate}
+    rows = db.execute(f'''{SHIPMENT_SELECT} WHERE {predicate}
         ORDER BY s.shipped_on DESC,s.created_at DESC,s.id DESC LIMIT ? OFFSET ?''',
         (*params, PAGE_SIZE, (page - 1) * PAGE_SIZE)).fetchall()
     devices = shipment_devices(db, project, [row['id'] for row in rows])
-    return {'rows': [{**dict(row), 'details': json.loads(row['details']),
-                      'order_details': json.loads(row['order_details'] or '{}'),
-                      'devices': devices.get(row['id'], [])} for row in rows],
+    return {'rows': [decode_shipment(row, devices.get(row['id'], [])) for row in rows],
             'total': total, 'page': page, 'page_size': PAGE_SIZE}
+
+
+def decode_shipment(row, devices):
+    return {**dict(row), 'details': json.loads(row['details']),
+            'order_details': json.loads(row['order_details'] or '{}'), 'devices': devices}
+
+
+def get_shipment(db, project, shipment_id):
+    row = db.execute(SHIPMENT_SELECT + ' WHERE s.project_id=? AND s.id=?', (project, shipment_id)).fetchone()
+    if not row:
+        raise ShippingError('发货记录不存在', 404)
+    return decode_shipment(row, shipment_devices(db, project, [shipment_id]).get(shipment_id, []))
 
 
 def shipped_condition(alias):
@@ -191,6 +204,19 @@ def list_orders(db, project, query):
     return {'rows': [decode_order(row) for row in rows], 'total': total, 'page': page, 'page_size': PAGE_SIZE}
 
 
+def get_order(db, project, order_id):
+    row = db.execute(f'''SELECT o.*, count(s.id) AS shipments,
+        count(CASE WHEN {shipped_condition('s')} THEN 1 END) AS shipped
+        FROM shipping_ks_orders o LEFT JOIN shipping_records s ON s.project_id=o.project_id AND s.ks_order_id=o.id
+        WHERE o.project_id=? AND o.id=? GROUP BY o.id''', (project, order_id)).fetchone()
+    if not row:
+        raise ShippingError('KS 订单不存在', 404)
+    links = db.execute('''SELECT id,reference,channel,shipped_on,tracking FROM shipping_records
+        WHERE project_id=? AND ks_order_id=? ORDER BY shipped_on DESC,created_at DESC,id DESC''',
+        (project, order_id))
+    return {**decode_order(row), 'shipment_links': [{**dict(link), 'backer': row['backer']} for link in links]}
+
+
 def find_devices(db, project, query):
     term = string(query.get('q'), 100).lower()
     if not term:
@@ -206,7 +232,7 @@ def find_devices(db, project, query):
 
 
 def for_device(db, project, serial):
-    return [dict(row) for row in db.execute('''SELECT s.reference,s.channel,s.shipped_on,s.tracking,o.backer
+    return [dict(row) for row in db.execute('''SELECT s.id,s.reference,s.channel,s.shipped_on,s.tracking,o.backer
         FROM shipping_devices d JOIN shipping_records s ON s.project_id=d.project_id AND s.id=d.shipment_id
         LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id
         WHERE d.project_id=? AND d.serial=? ORDER BY s.shipped_on DESC,s.created_at DESC''', (project, serial))]

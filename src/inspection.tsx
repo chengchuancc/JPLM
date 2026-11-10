@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
 import { ArrowDown, ArrowUp, Camera, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-react";
 import type { IScannerControls } from "@zxing/browser";
-import { Dialog } from "./dialog";
+import { RelatedRecordDialog, formatTime, ResultLabel, sections } from "./record-details";
 import "./inspection.css";
 
 type Value = string | number | string[];
@@ -33,7 +32,7 @@ type Template = {
   fields: InspectionField[];
   revision: number;
 };
-type RecordRow = {
+export type RecordRow = {
   id: string;
   serial: string;
   prefix: string;
@@ -81,10 +80,6 @@ const action = "btn";
 const primary = "btn primary";
 const inspectionPath = "inspection/";
 
-function formatTime(value: string) {
-  const time = new Date(value);
-  return Number.isNaN(time.getTime()) ? value : time.toLocaleString("zh-CN", { hour12: false });
-}
 function parameters(id: string, query: Record<string, string> = {}) {
   return new URLSearchParams({ template: id, ...query }).toString();
 }
@@ -122,12 +117,6 @@ function automaticValues(fields: InspectionField[], values: Values, original?: V
     else result[field.key] = outsideRange(source, Number(value)) ? "NG" : "OK";
   }
   return result;
-}
-
-function ResultLabel({ value }: { value: string }) {
-  const tone = value === "不良" || value === "NG" ? "fail" : value === "合格" || value === "OK" ? "pass" :
-    value === "未完成" ? "incomplete" : "pending";
-  return <span className={"inspection-result " + tone}>{value}</span>;
 }
 
 export function CameraReader({ live, onRead, close }: {
@@ -362,16 +351,6 @@ function FieldInput({ field, value, suggestions, hidden, automatic, onChange }: 
       )}
     </fieldset>
   );
-}
-
-function sections(fields: InspectionField[]) {
-  const groups = new Map<string, InspectionField[]>();
-  for (const field of fields) {
-    const group = field.group || "检测项";
-    if (!groups.has(group)) groups.set(group, []);
-    groups.get(group)!.push(field);
-  }
-  return [...groups];
 }
 
 function InspectionFields({ form, values, original, savedOptions = [], onChange }: {
@@ -715,62 +694,6 @@ function InspectionImport({ template, request, baseUrl, onImported }: {
   );
 }
 
-function InspectionRecordDetails({ record, request, close }: { record: RecordRow; request: Request; close: () => void }) {
-  const [shipments, setShipments] = useState<{
-    reference: string; channel: string; shipped_on: string; tracking: string; backer: string | null;
-  }[]>([]);
-  useEffect(() => {
-    let active = true;
-    request("shipping/device-records?" + new URLSearchParams({ serial: record.serial })).then(
-      (rows) => { if (active) setShipments(rows); }, () => {},
-    );
-    return () => { active = false; };
-  }, [record.serial]);
-  return createPortal(
-    <Dialog title="检测记录明细" wide onClose={close}>
-      <div className="inspection-record-summary">
-        <div><span>S/N</span> <strong className="mono">{record.serial}</strong></div>
-        <ResultLabel value={record.result} />
-      </div>
-      <dl className="inspection-detail-grid inspection-detail-meta">
-        <div><dt>检测表</dt><dd>{record.form.name}</dd></div>
-        <div><dt>生产日期</dt><dd>{record.production_date || "—"}</dd></div>
-        <div><dt>检测员</dt><dd>{record.operator_name || "—"}</dd></div>
-        <div><dt>创建时间</dt><dd>{formatTime(record.created_at)}</dd></div>
-        <div><dt>更新时间</dt><dd>{formatTime(record.updated_at)}</dd></div>
-        {record.source_id && <div><dt>原记录 ID</dt><dd>{record.source_id}</dd></div>}
-        {record.deleted_at && <div><dt>删除时间</dt><dd>{formatTime(record.deleted_at)}</dd></div>}
-      </dl>
-      {!!shipments.length && <section className="inspection-detail-group">
-        <h3>关联发货</h3>
-        <ul className="shipping-device-detail">{shipments.map((item, index) => (
-          <li key={index}><span>{item.channel === "ks" ? "KS" : "其他"} · {item.reference}
-            {item.backer && " · Backer #" + item.backer}</span>
-            <small>{[item.shipped_on, item.tracking].filter(Boolean).join(" · ")}</small></li>
-        ))}</ul>
-      </section>}
-      {sections(record.form.fields).map(([group, fields]) => (
-        <section className="inspection-detail-group" key={group}>
-          <h3>{group}</h3>
-          <dl className="inspection-detail-grid">
-            {fields.map((field) => {
-              const value = record.values[field.key];
-              const text = Array.isArray(value) ? value.join("、") : value;
-              return <div key={field.key} className={field.type === "multi" || field.type === "text" ? "wide-field" : ""}>
-                <dt>{field.label}</dt>
-                <dd>{field.type === "choice" && (text === "OK" || text === "NG")
-                  ? <ResultLabel value={text} />
-                  : text === undefined || text === "" ? "—" : <>{text}{field.unit && " " + field.unit}</>}</dd>
-              </div>;
-            })}
-          </dl>
-        </section>
-      ))}
-    </Dialog>,
-    document.body,
-  );
-}
-
 function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix, onImported, revision }: {
   template: Template;
   request: Request;
@@ -917,7 +840,7 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
         <span>{page} / {totalPages}</span>
         <button type="button" className="btn small" disabled={page >= totalPages || busy} onClick={() => setPage(page + 1)}>下一页</button>
       </div>
-      {openedRecord && <InspectionRecordDetails record={openedRecord} request={request} close={() => setOpenedRecord(null)} />}
+      {openedRecord && <RelatedRecordDialog target={{ kind: "inspection", record: openedRecord }} request={request} close={() => setOpenedRecord(null)} />}
     </section>
   );
 }
