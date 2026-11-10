@@ -138,6 +138,17 @@
 .inspection-record-table th { white-space: nowrap; }
 .inspection-record-table td { min-width: 85px; max-width: 240px; overflow-wrap: anywhere; }
 .inspection-record-table td:first-child { white-space: nowrap; }
+.inspection-record-summary {
+  display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 6px 14px;
+  padding: 9px 12px; background: #f4f7fd; border: 1px solid var(--border); border-radius: 6px;
+}
+.inspection-record-summary strong { margin-left: 6px; font-size: 15px; overflow-wrap: anywhere; }
+.inspection-detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px 16px; margin: 0; }
+.inspection-detail-meta { margin: 12px 0; }
+.inspection-detail-grid dt { color: var(--muted); font-size: 12px; }
+.inspection-detail-grid dd { margin: 2px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.inspection-detail-group { border-top: 1px solid var(--border); padding: 11px 0; }
+.inspection-detail-group h3 { margin: 0 0 7px; font-size: 14px; }
 .inspection-device-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .inspection-device-tools input { width: min(100%, 260px); }
 .inspection-paging { flex-wrap: wrap; }
@@ -145,4 +156,5 @@
 @media (max-width: 600px) {
   .inspection-prefix { flex-wrap: wrap; }
   .inspection-prefix input { max-width: 100%; }
+  .inspection-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

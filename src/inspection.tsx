@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { ArrowDown, ArrowUp, Camera, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-react";
 import type { IScannerControls } from "@zxing/browser";
+import { Dialog } from "./dialog";
 import "./inspection.css";
 
 type Value = string | number | string[];
@@ -41,6 +43,7 @@ type RecordRow = {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  source_id: string;
   values: Values;
   form: Template;
 };
@@ -122,7 +125,7 @@ function automaticValues(fields: InspectionField[], values: Values, original?: V
 }
 
 function ResultLabel({ value }: { value: string }) {
-  const tone = value === "不良" ? "fail" : value === "合格" ? "pass" :
+  const tone = value === "不良" || value === "NG" ? "fail" : value === "合格" || value === "OK" ? "pass" :
     value === "未完成" ? "incomplete" : "pending";
   return <span className={"inspection-result " + tone}>{value}</span>;
 }
@@ -712,14 +715,51 @@ function InspectionImport({ template, request, baseUrl, onImported }: {
   );
 }
 
-function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix, onChoose, onImported, revision }: {
+function InspectionRecordDetails({ record, close }: { record: RecordRow; close: () => void }) {
+  return createPortal(
+    <Dialog title="检测记录明细" wide onClose={close}>
+      <div className="inspection-record-summary">
+        <div><span>S/N</span> <strong className="mono">{record.serial}</strong></div>
+        <ResultLabel value={record.result} />
+      </div>
+      <dl className="inspection-detail-grid inspection-detail-meta">
+        <div><dt>检测表</dt><dd>{record.form.name}</dd></div>
+        <div><dt>生产日期</dt><dd>{record.production_date || "—"}</dd></div>
+        <div><dt>检测员</dt><dd>{record.operator_name || "—"}</dd></div>
+        <div><dt>创建时间</dt><dd>{formatTime(record.created_at)}</dd></div>
+        <div><dt>更新时间</dt><dd>{formatTime(record.updated_at)}</dd></div>
+        {record.source_id && <div><dt>原记录 ID</dt><dd>{record.source_id}</dd></div>}
+        {record.deleted_at && <div><dt>删除时间</dt><dd>{formatTime(record.deleted_at)}</dd></div>}
+      </dl>
+      {sections(record.form.fields).map(([group, fields]) => (
+        <section className="inspection-detail-group" key={group}>
+          <h3>{group}</h3>
+          <dl className="inspection-detail-grid">
+            {fields.map((field) => {
+              const value = record.values[field.key];
+              const text = Array.isArray(value) ? value.join("、") : value;
+              return <div key={field.key} className={field.type === "multi" || field.type === "text" ? "wide-field" : ""}>
+                <dt>{field.label}</dt>
+                <dd>{field.type === "choice" && (text === "OK" || text === "NG")
+                  ? <ResultLabel value={text} />
+                  : text === undefined || text === "" ? "—" : <>{text}{field.unit && " " + field.unit}</>}</dd>
+              </div>;
+            })}
+          </dl>
+        </section>
+      ))}
+    </Dialog>,
+    document.body,
+  );
+}
+
+function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix, onImported, revision }: {
   template: Template;
   request: Request;
   baseUrl: string;
   readOnly: boolean;
   admin: boolean;
   prefix: string;
-  onChoose: (row: RecordRow) => void;
   onImported: () => void;
   revision: number;
 }) {
@@ -734,6 +774,7 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(true);
   const [pending, setPending] = useState("");
+  const [openedRecord, setOpenedRecord] = useState<RecordRow | null>(null);
   const query = parameters(template.id, {
     ...filters, per_page: String(perPage), sort: sort.key, direction: sort.direction,
     deleted: deleted ? "1" : "", page: String(page),
@@ -830,8 +871,8 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
           </tr></thead>
           <tbody>{data?.records.map((record) => (
             <tr key={record.id}>
-              <td>{deleted ? <span className="mono">{record.serial}</span> :
-                <button type="button" className="text-link mono" onClick={() => onChoose(record)}>{record.serial}</button>}</td>
+              <td><button type="button" className="text-link mono" aria-haspopup="dialog"
+                onClick={() => setOpenedRecord(record)}>{record.serial}</button></td>
               <td className="mono">{record.prefix}</td><td>{record.production_date || "—"}</td>
               <td><ResultLabel value={record.result} /></td>
               <td>{record.operator_name || "—"}</td>
@@ -858,6 +899,7 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
         <span>{page} / {totalPages}</span>
         <button type="button" className="btn small" disabled={page >= totalPages || busy} onClick={() => setPage(page + 1)}>下一页</button>
       </div>
+      {openedRecord && <InspectionRecordDetails record={openedRecord} close={() => setOpenedRecord(null)} />}
     </section>
   );
 }
@@ -1243,7 +1285,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
       {template && tab === "history" && <InspectionHistory key={template.id + ":" + historyPrefix}
         template={template} request={request} baseUrl={baseUrl} readOnly={readOnly} admin={admin}
         onImported={() => setRevision((value) => value + 1)}
-        prefix={historyPrefix} revision={revision} onChoose={(row) => { if (discard()) chooseRecord(row); }} />}
+        prefix={historyPrefix} revision={revision} />}
       {tab === "entry" && (
         <>
           <form className="panel inspection-sn" onSubmit={(event) => { event.preventDefault(); void lookup(); }}>
