@@ -145,6 +145,7 @@ export type Activity = {
   created_at: string;
 };
 export type State = {
+  material_categories: string[];
   users: UserOption[];
   former_users: UserOption[];
   project?: Omit<ProjectDetails, "members">;
@@ -163,6 +164,7 @@ export type State = {
   quotes: Quote[];
 };
 export const emptyState: State = {
+  material_categories: ["结构物料", "电子物料"],
   users: [],
   former_users: [],
   material_links: [],

@@ -47,7 +47,6 @@ const numeric = new Set<Column>([
   "stock",
   "min_stock",
 ]);
-export const materialCategories = ["结构物料", "电子物料"];
 
 export function ColumnVisibility({
   columns,
@@ -138,6 +137,7 @@ export function MaterialTable({
   hiddenColumns,
   rows,
   category,
+  categoryOptions,
   setCategory,
   empty,
 }: {
@@ -146,6 +146,7 @@ export function MaterialTable({
   hiddenColumns: Column[];
   rows: Row[];
   category: string;
+  categoryOptions: string[];
   setCategory: (value: string) => void;
   empty: ReactNode;
 }) {
@@ -338,7 +339,7 @@ export function MaterialTable({
                         onChange={(e) => setCategory(e.target.value)}
                       >
                         <option value="">类别</option>
-                        {materialCategories.map((item) => (
+                        {categoryOptions.map((item) => (
                           <option key={item}>{item}</option>
                         ))}
                       </select>

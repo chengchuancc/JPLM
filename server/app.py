@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """捷程未来PLM：仅依赖 Python 3.10+ 标准库。"""
 import argparse, hashlib, hmac, io, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil, tempfile, zipfile
+import unicodedata
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from email.parser import BytesParser
@@ -14,7 +15,7 @@ import inspection
 import shipping
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
-    SCOPED_TABLES, COVER_TABLE, migrate_projects,
+    SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, migrate_material_categories, migrate_projects,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -110,6 +111,8 @@ def init_db(directory=None, bootstrap=None):
     with connect(directory) as db:
         if version < PROJECT_VERSION:
             migrate_projects(db, now())
+        if version < MATERIAL_CATEGORIES_VERSION:
+            migrate_material_categories(db)
         db.execute('BEGIN IMMEDIATE')
         db.execute(COVER_TABLE)
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(projects)')}:
@@ -483,7 +486,27 @@ def product_prefix(db,product_id):
     letters=''.join(c for c in product['english_code'] if c in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ')
     return letters[:2] if len(letters)>=2 else 'CM'
 
-def material_prefix(category,level,prefix='CM'): return prefix+('1' if category=='结构物料' else '2')+str(level)
+BUILTIN_MATERIAL_CATEGORIES = ('结构物料', '电子物料')
+MATERIAL_CATEGORY_DIGITS = dict(zip(BUILTIN_MATERIAL_CATEGORIES, ('1', '2')))
+
+
+def material_category(db, value, level):
+    if value is None or isinstance(value, str) and not value.strip():
+        return BUILTIN_MATERIAL_CATEGORIES[level - 1]
+    if not isinstance(value, str) or len(value.strip()) > 64 or re.search(r'[\x00-\x1f\x7f-\x9f]', value.strip()):
+        raise Problem('请输入 1 至 64 个字符的物料类别')
+    name = value.strip()
+    key = unicodedata.normalize('NFKC', name).casefold()
+    if key in MATERIAL_CATEGORY_DIGITS:
+        return key
+    db.execute('INSERT OR IGNORE INTO material_categories(project_id,name_key,name) VALUES(?,?,?)',
+               (db.project_id, key, name))
+    return db.execute('SELECT name FROM material_categories WHERE project_id=? AND name_key=?',
+                      (db.project_id, key)).fetchone()[0]
+
+
+def material_prefix(category, level, prefix='CM'):
+    return prefix + MATERIAL_CATEGORY_DIGITS.get(category, '3') + str(level)
 
 def next_material_serial(db):
     key='sequence_material_global'
@@ -561,6 +584,8 @@ def get_state(db):
             file['name'] = owner_file_name(file['name'], record['code'], record['name'], positions[owner])
     state['deleted_parts'] = [p for p in state['parts'] if p['deleted_at']]
     state['parts'] = [p for p in state['parts'] if not p['deleted_at']]
+    state['material_categories'] = [*BUILTIN_MATERIAL_CATEGORIES, *(row[0] for row in db.execute(
+        'SELECT name FROM material_categories WHERE project_id=? ORDER BY name_key', (db.project_id,)))]
     state['users'] = [dict(row) for row in db.execute(
         """SELECT id,name FROM users WHERE role='admin' OR id IN (
                SELECT user_id FROM project_members WHERE project_id=?
@@ -654,13 +679,15 @@ def stage_restore(archive_path, directory):
             project_tables = ('projects', 'project_members') if version >= PROJECT_VERSION else ()
             if version >= 10:
                 project_tables += ('project_covers',)
+            category_tables = ('material_categories',) if version >= MATERIAL_CATEGORIES_VERSION else ()
             inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
             shipping_tables = (shipping.TABLES if version >= shipping.HANDLING_PROJECTS_VERSION else
                                shipping.PRODUCT_TABLES if version >= shipping.PRODUCTS_VERSION else
                                shipping.SOURCE_TABLES if version >= shipping.SOURCES_VERSION else
                                shipping.CARRIER_TABLES if version >= shipping.CREATED_AT_VERSION else
                                shipping.LEGACY_TABLES if version >= shipping.VERSION else ())
-            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables, *shipping_tables}
+            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *category_tables,
+                                             *inspection_tables, *shipping_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
             if not required_tables <= source_tables:
@@ -669,7 +696,7 @@ def stage_restore(archive_path, directory):
             with connect(staged) as db:
                 db.execute('BEGIN')
                 db.execute('PRAGMA defer_foreign_keys=ON')
-                for table in ('users', *project_tables, *TABLES, *inspection_tables, *shipping_tables,
+                for table in ('users', *project_tables, *category_tables, *TABLES, *inspection_tables, *shipping_tables,
                               'settings', 'import_runs', 'activity'):
                     if table not in source_tables or (version == 6 and table in ('users', 'activity')):
                         continue
@@ -1768,8 +1795,7 @@ class Handler(BaseHTTPRequestHandler):
                 if values['status'] not in ('研发中','已定版','已归档'): raise Problem('产品状态不正确')
             elif resource=='parts':
                 level=material_level(d.get('material_level',1))
-                category=d.get('category') or ('电子物料' if level==2 else '结构物料')
-                if category not in ('结构物料','电子物料'): raise Problem('物料类别不正确')
+                category=material_category(db, d.get('category'), level)
                 if old and old['material_level']!=level and db.execute('SELECT 1 FROM material_links WHERE parent_id=? OR child_id=?',(id,id)).fetchone(): raise Problem('请先解除一级、二级物料关联，再更改级别')
                 numbering_product_id=d.get('numbering_product_id') or None
                 if not old and 'numbering_product_id' not in d and level==2 and parent_ids:
@@ -1780,8 +1806,9 @@ class Handler(BaseHTTPRequestHandler):
                 serial=old['material_serial'] if old else next_material_serial(db)
                 code=old['code'] if old else material_code(db,category,level,numbering_product_id,serial)
                 if old and (old['category']!=category or old['material_level']!=level or old['numbering_product_id']!=numbering_product_id):
-                    insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
                     code=material_code(db,category,level,numbering_product_id,serial)
+                    if code != old['code']:
+                        insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
                 values.update(code=code,material_serial=serial,numbering_product_id=numbering_product_id,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location','')),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
             else: values.update({k:str(d.get(k,'')) for k in ('contact','phone','email','address','notes')})
             if resource in RESPONSIBILITIES:

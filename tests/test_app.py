@@ -21,7 +21,7 @@ class IntegrationTests(unittest.TestCase):
             for table in reversed(app.shipping.TABLES): db.execute('DELETE FROM '+table)
             for table in reversed(app.inspection.TABLES): db.execute('DELETE FROM '+table)
             for t in reversed(app.TABLES): db.execute('DELETE FROM '+t)
-            for table in ('sessions', 'activity', 'import_runs', 'project_covers', 'project_members', 'projects', 'users', 'settings'):
+            for table in ('sessions', 'activity', 'import_runs', 'material_categories', 'project_covers', 'project_members', 'projects', 'users', 'settings'):
                 db.execute('DELETE FROM ' + table)
         app.Handler.attempts.clear();self.cookie=''
         self.request('auth/setup','POST',{'password':'test-password-1234'})
@@ -52,6 +52,31 @@ class IntegrationTests(unittest.TestCase):
     def test_stock_lifecycle_and_history(self):
         self.move('入库',10);out=self.move('出库',4)['id'];self.move('退库',2,original_id=out);self.move('报废',1,reason='损坏')
         self.assertEqual(self.stock(),7);self.assertEqual([m['balance'] for m in self.state()['movements']],[10,6,8,7])
+
+    def test_custom_material_categories_are_reused_and_preserve_material_serial(self):
+        category = '包装耗材'
+        created = self.request('parts', 'POST', {'name': '缓冲垫', 'category': ' ' + category + ' '})['id']
+        original = next(p for p in self.state()['parts'] if p['id'] == created)
+        self.assertEqual((original['category'], original['code'][:4]), (category, 'CM31'))
+        self.request('material-cells/' + created, 'PUT', {'category': '塑料辅料'})
+        changed = next(p for p in self.state()['parts'] if p['id'] == created)
+        self.assertEqual(changed['code'], original['code'])
+        self.assertIn(category, self.state()['material_categories'])
+        self.request('material-cells/' + created, 'PUT', {'category': '电子物料'})
+        state = self.state()
+        changed = next(p for p in state['parts'] if p['id'] == created)
+        self.assertEqual(changed['code'], 'CM21' + original['code'][-4:])
+        self.assertIn(original['code'], [row['code'] for row in state['material_code_aliases']])
+        other = self.request('projects', 'POST', {'name': '另一个项目'})['id']
+        self.assertNotIn(category, self.request('state', project=other)['material_categories'])
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            backup = directory / 'backup.zip'
+            backup.write_bytes(self.request('backup', raw=True))
+            staged, _ = app.stage_restore(backup, directory)
+            with app.connect(staged) as db:
+                self.assertIn(category, [row[0] for row in db.execute(
+                    'SELECT name FROM material_categories WHERE project_id=?', (self.project_id,))])
 
     def test_shipping_import_and_ledgers_keep_project_and_device_links(self):
         from urllib.parse import urlencode

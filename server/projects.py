@@ -1,7 +1,8 @@
 """SQLite project ownership and the v8 to v9 migration."""
 
 PROJECT_VERSION = 9
-VERSION = 19
+MATERIAL_CATEGORIES_VERSION = 20
+VERSION = MATERIAL_CATEGORIES_VERSION
 LEGACY_PROJECT_ID = 'legacy'
 BUSINESS_TABLES = (
     'products', 'parts', 'suppliers', 'quotes', 'bom_versions', 'bom_lines',
@@ -49,6 +50,41 @@ CREATE TABLE IF NOT EXISTS project_covers (
     updated_at TEXT NOT NULL
 )
 """
+
+MATERIAL_CATEGORY_TABLE = """CREATE TABLE IF NOT EXISTS material_categories (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    name_key TEXT NOT NULL, name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 64),
+    PRIMARY KEY (project_id,name_key)
+)"""
+
+
+def migrate_material_categories(db):
+    old_check = "CHECK(category IN ('结构物料','电子物料'))"
+    db.execute('PRAGMA foreign_keys=OFF')
+    db.execute('PRAGMA legacy_alter_table=ON')
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='parts'").fetchone()[0]
+        if old_check in sql:
+            statements = [row[0] for row in db.execute("""SELECT sql FROM sqlite_master
+                WHERE tbl_name='parts' AND type IN ('index','trigger') AND sql IS NOT NULL""")]
+            schema = sql[sql.index('('):].replace(old_check, 'CHECK(length(trim(category)) BETWEEN 1 AND 64)', 1)
+            db.execute('CREATE TABLE parts_category_upgrade ' + schema)
+            db.execute('INSERT INTO parts_category_upgrade SELECT * FROM parts ORDER BY rowid')
+            db.execute('DROP TABLE parts')
+            db.execute('ALTER TABLE parts_category_upgrade RENAME TO parts')
+            for statement in statements:
+                db.execute(statement)
+        db.execute(MATERIAL_CATEGORY_TABLE)
+        if db.execute('PRAGMA foreign_key_check').fetchone():
+            raise RuntimeError('物料类别升级后的关联校验未通过')
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.execute('PRAGMA legacy_alter_table=OFF')
+        db.execute('PRAGMA foreign_keys=ON')
 
 
 def _scoped_schema(table, legacy_sql):

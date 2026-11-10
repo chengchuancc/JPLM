@@ -72,9 +72,9 @@ import {
 import {
   MaterialTable,
   ColumnVisibility,
-  materialCategories,
   type Column,
 } from "./material-table";
+import { MaterialCategory } from "./material-category";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
 import { Dialog } from "./dialog";
@@ -157,6 +157,7 @@ type Field = {
   autoComplete?: string;
   required?: boolean;
   options?: { value: string; label: string }[];
+  categoryOptions?: string[];
   placeholder?: string;
   wide?: boolean;
   min?: number;
@@ -416,7 +417,9 @@ function EntityForm({
             <label className={f.wide ? "wide-field" : ""}>
               {f.label}
               {f.required && <span className="required"> *</span>}
-              {f.type === "textarea" ? (
+              {f.categoryOptions ? <MaterialCategory label={f.label} value={values[f.name] ?? ""}
+                options={f.categoryOptions} disabled={busy} onChange={(value) =>
+                  setValues((previous: any) => ({ ...previous, [f.name]: value }))} /> : f.type === "textarea" ? (
                 <textarea
                   rows={3}
                   value={values[f.name] ?? ""}
@@ -1615,6 +1618,7 @@ function Workspace({
   const [categories, setCategories] = useState<Record<string, string>>({});
   const categoryProps = (key: string) => ({
     category: categories[key] || "",
+    categoryOptions: state.material_categories,
     setCategory: (value: string) =>
       setCategories((old) => ({ ...old, [key]: value })),
   });
@@ -1942,6 +1946,7 @@ function Workspace({
         value={p[field]}
         type={field === "price" || field === "min_stock" ? "number" : "text"}
         options={options}
+        categoryOptions={field === "category" ? state.material_categories : undefined}
         save={(value) => savePart(p.id, field, value)}
       />
     );
@@ -1969,12 +1974,7 @@ function Workspace({
       external_code: materialCell(p, "external_code", "外部料号"),
       brand: materialCell(p, "brand", "品牌"),
       unit: materialCell(p, "unit", "单位"),
-      category: materialCell(
-        p,
-        "category",
-        "类别",
-        materialCategories.map((value) => ({ value, label: value })),
-      ),
+      category: materialCell(p, "category", "类别"),
       price: materialCell(p, "price", "单价"),
       stock: amount(p.stock),
       custodian: userName(p.custodian_id),
@@ -2166,7 +2166,7 @@ function Workspace({
     {
       name: "category",
       label: "类别",
-      options: ["结构物料", "电子物料"].map((x) => ({ value: x, label: x })),
+      categoryOptions: state.material_categories,
     },
     {
       name: "numbering_product_id",
@@ -3562,49 +3562,66 @@ function Workspace({
                       <dd>{part.notes || "暂无备注"}</dd>
                     </dl>
                   </section>
-                  <section className="panel">
-                    <div className="panel-heading">
-                      <h3>供应商与报价</h3>
-                      <Button
-                        small
-                        onClick={() =>
-                          setModal({
-                            kind: "quote",
-                            item: { part_id: part.id },
-                          })
-                        }
-                      >
-                        <Plus size={14} />
-                        关联供应商
-                      </Button>
-                    </div>
-                    {state.quotes
-                      .filter((q) => q.part_id === part.id)
-                      .map((q) => (
-                        <div className="quote-row" key={q.id}>
-                          <div>
-                            <strong>
-                              <button
-                                className="text-link"
-                                onClick={() => go("suppliers", q.supplier_id)}
-                              >
-                                {findSupplier(q.supplier_id)?.name}
-                              </button>
-                            </strong>
-                            {q.price !== null && (
-                              <span>
-                                {money(q.price)} / {part.unit}
-                              </span>
-                            )}
-                            {purchaseLink(q.url)}
+                  <div className="material-detail-aside">
+                    <section className="panel">
+                      <div className="panel-heading">
+                        <h3>物料图片</h3>
+                        <Button small onClick={() => setTab("files")}><ImageIcon size={14} />图片与附件</Button>
+                      </div>
+                      <div className="material-detail-gallery">
+                        {files("parts", part.id).filter((file) => file.kind === "image").map((file) => (
+                          <button type="button" key={file.id} aria-label={"预览 " + file.name}
+                            onClick={() => setModal({ kind: "preview", item: file })}>
+                            <img src={fileUrl(file.id)} alt={file.name} loading="lazy" />
+                          </button>
+                        ))}
+                      </div>
+                      {!files("parts", part.id).some((file) => file.kind === "image") && <p className="muted">暂无图片</p>}
+                    </section>
+                    <section className="panel">
+                      <div className="panel-heading">
+                        <h3>供应商与报价</h3>
+                        <Button
+                          small
+                          onClick={() =>
+                            setModal({
+                              kind: "quote",
+                              item: { part_id: part.id },
+                            })
+                          }
+                        >
+                          <Plus size={14} />
+                          关联供应商
+                        </Button>
+                      </div>
+                      {state.quotes
+                        .filter((q) => q.part_id === part.id)
+                        .map((q) => (
+                          <div className="quote-row" key={q.id}>
+                            <div>
+                              <strong>
+                                <button
+                                  className="text-link"
+                                  onClick={() => go("suppliers", q.supplier_id)}
+                                >
+                                  {findSupplier(q.supplier_id)?.name}
+                                </button>
+                              </strong>
+                              {q.price !== null && (
+                                <span>
+                                  {money(q.price)} / {part.unit}
+                                </span>
+                              )}
+                              {purchaseLink(q.url)}
+                            </div>
+                            {supplierLinkActions(q)}
                           </div>
-                          {supplierLinkActions(q)}
-                        </div>
-                      ))}
-                    {!state.quotes.some((q) => q.part_id === part.id) && (
-                      <Empty title="暂无关联供应商" />
-                    )}
-                  </section>
+                        ))}
+                      {!state.quotes.some((q) => q.part_id === part.id) && (
+                        <Empty title="暂无关联供应商" />
+                      )}
+                    </section>
+                  </div>
                 </div>
               )}
               {tab === "files" && fileManager("parts", part.id)}
@@ -4585,11 +4602,11 @@ function Workspace({
                   } : undefined}
                   onCancel={() => setModal(null)}
                   images={
-                    modal.kind === "product"
+                    modal.kind === "product" || modal.kind === "part"
                       ? {
                           upload: async (files) => {
                             const form = new FormData();
-                            form.append("owner_type", "products");
+                            form.append("owner_type", modal.kind === "part" ? "parts" : "products");
                             form.append("owner_id", modal.item.id);
                             files.forEach((file) => form.append("file", file));
                             await businessApi("files", "POST", form);
@@ -4603,15 +4620,10 @@ function Workspace({
                       : undefined
                   }
                   submit={async (data) => {
-                    if (modal.kind === "product") {
-                      await businessApi("products/" + data.id, "PUT", data);
+                    if (modal.kind === "product" || modal.kind === "part") {
+                      await businessApi((modal.kind === "part" ? "parts/" : "products/") + data.id, "PUT", data);
                     } else {
-                      await mutate(
-                        (modal.kind === "part" ? "parts/" : "suppliers/") +
-                          data.id,
-                        "PUT",
-                        data,
-                      );
+                      await mutate("suppliers/" + data.id, "PUT", data);
                     }
                   }}
                 />
@@ -5520,7 +5532,7 @@ function PurchaseMaterialPicker({
           onChange={(event) => updateFilter(setCategory, event.target.value)}
         >
           <option value="">全部类别</option>
-          {materialCategories.map((item) => <option key={item}>{item}</option>)}
+          {state.material_categories.map((item) => <option key={item}>{item}</option>)}
         </select>
         <select
           aria-label="物料级别"
@@ -6319,6 +6331,7 @@ function InlineCell({
   min = 0,
   required = false,
   options,
+  categoryOptions,
 }: {
   label: string;
   value: string | number;
@@ -6327,6 +6340,7 @@ function InlineCell({
   min?: number;
   required?: boolean;
   options?: { value: string; label: string }[];
+  categoryOptions?: string[];
 }) {
   const { archived } = useContext(ProjectContext);
   const [editing, setEditing] = useState(false);
@@ -6395,7 +6409,9 @@ function InlineCell({
     );
   return (
     <div className={"inline-editor" + (options ? " select-editor" : "")}>
-      {options ? (
+      {categoryOptions ? <MaterialCategory label={label} value={draft} options={categoryOptions} disabled={busy}
+        autoOpen onDismiss={() => { if (!committing.current) setEditing(false); }}
+        onChange={(value) => { setDraft(value); void commit(value); }} /> : options ? (
         <select
           autoFocus
           aria-label={label}
@@ -6710,7 +6726,9 @@ function QuickCreateForm({
             .map((f) => (
               <label key={f.name} className={f.wide ? "wide-field" : ""}>
                 {f.label}
-                {f.options ? (
+                {f.categoryOptions ? <MaterialCategory label={f.label} value={values[f.name] ?? ""}
+                  options={f.categoryOptions} disabled={busy || !!created.current} onChange={(value) =>
+                    setValues((previous: any) => ({ ...previous, [f.name]: value }))} /> : f.options ? (
                   <ChoiceSelect
                     create={f.create}
                     disabled={busy || !!created.current}
