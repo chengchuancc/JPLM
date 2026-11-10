@@ -17,6 +17,9 @@
 * {
   box-sizing: border-box;
 }
+img {
+  object-fit: contain;
+}
 body {
   margin: 0;
 }
@@ -737,7 +740,6 @@ main {
 .thumb img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
 }
 .thumb.electronic {
   background: #eff3f2;
@@ -1753,7 +1755,6 @@ td .text-link:hover {
 .file-image img {
   width: 100%;
   height: 100%;
-  object-fit: contain;
 }
 .file-image.attachment {
   flex-direction: column;
@@ -1810,7 +1811,6 @@ td .text-link:hover {
 .image-preview img {
   max-width: 100%;
   max-height: 65dvh;
-  object-fit: contain;
 }
 .qr-label {
   display: flex;
@@ -3182,7 +3182,6 @@ td .text-link:hover {
 .material-photo img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
 }
 .material-photo > span {
   position: absolute;
@@ -3231,7 +3230,6 @@ td .text-link:hover {
 .quick-previews img {
   height: 100%;
   width: 100%;
-  object-fit: cover;
 }
 .quick-previews button {
   position: absolute;
@@ -3964,8 +3962,6 @@ button.material-photo {
 .user-avatar > img {
   width: 100%;
   height: 100%;
-  object-fit: cover;
-  border-radius: inherit;
 }
 .profile-identity {
   display: flex;
@@ -4003,7 +3999,6 @@ button.material-photo {
   flex: 0 0 auto;
   border: 1px solid var(--border);
   border-radius: 6px;
-  object-fit: contain;
   background: #fff;
 }
 .brand-wordmark {
@@ -4091,8 +4086,7 @@ button.material-photo {
   inset: 0 0 0 auto;
   width: min(70%, 770px);
   height: 100%;
-  object-fit: cover;
-  object-position: center;
+  object-position: right center;
   mask-image: linear-gradient(to right, transparent, #000 38%);
 }
 .project-hero-content {
@@ -4174,7 +4168,6 @@ button.material-photo {
   display: block;
   width: 100%;
   height: 100%;
-  object-fit: cover;
 }
 .project-card-grid > li:nth-child(even) .project-cover:not(.has-photo) {
   background: #dbe8f6;
