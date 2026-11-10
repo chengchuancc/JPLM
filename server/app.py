@@ -655,7 +655,8 @@ def stage_restore(archive_path, directory):
             if version >= 10:
                 project_tables += ('project_covers',)
             inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
-            shipping_tables = (shipping.TABLES if version >= shipping.SOURCES_VERSION else
+            shipping_tables = (shipping.TABLES if version >= shipping.PRODUCTS_VERSION else
+                               shipping.SOURCE_TABLES if version >= shipping.SOURCES_VERSION else
                                shipping.CARRIER_TABLES if version >= shipping.CREATED_AT_VERSION else
                                shipping.LEGACY_TABLES if version >= shipping.VERSION else ())
             required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables, *shipping_tables}
@@ -684,6 +685,8 @@ def stage_restore(archive_path, directory):
                         optional.add('created_at')
                     if table == 'shipping_records' and version < shipping.RECORD_RELATIONS_VERSION:
                         optional.update(('parent_id', 'deleted_at'))
+                    if table == 'shipping_records' and version < shipping.PRODUCTS_VERSION:
+                        optional.add('items_configured')
                     if not set(target_columns) - optional <= source_columns:
                         raise Problem('备份数据结构不完整')
                     columns = ','.join(name for name in target_columns if name in source_columns)
@@ -695,8 +698,14 @@ def stage_restore(archive_path, directory):
                     shipping.fill_created_at(db)
                 if shipping.VERSION <= version < shipping.SOURCES_VERSION:
                     shipping.repair_imported_times(db)
+                if shipping.VERSION <= version < shipping.PRODUCTS_VERSION:
+                    shipping.backfill_products(db)
                 if shipping_tables and not shipping.valid_parent_links(db):
                     raise Problem('备份中的发货父子关系无效')
+                if version >= shipping.PRODUCTS_VERSION and db.execute("""SELECT 1 FROM shipping_items i
+                    JOIN shipping_records s ON s.project_id=i.project_id AND s.id=i.shipment_id
+                    WHERE s.channel<>'other' OR s.items_configured<>1 LIMIT 1""").fetchone():
+                    raise Problem('备份中的发货商品关联无效')
                 db.execute("DELETE FROM settings WHERE key='password'")
                 if version >= 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                     raise Problem('备份中没有管理员账户')
@@ -817,6 +826,8 @@ class Handler(BaseHTTPRequestHandler):
                 if self.user['must_change'] and path not in ('/api/auth/logout', '/api/account/password'):
                     raise Problem('请先修改初始密码', 403)
             segments = path.strip('/').split('/')
+            if path.startswith('/api/global-shipping/'):
+                return self.global_shipping_request(path.removeprefix('/api/global-shipping/'), method)
             if segments[:2] == ['api', 'projects']:
                 if len(segments) >= 4:
                     return self.project_request(segments[2], '/api/' + '/'.join(segments[3:]), method)
@@ -1026,6 +1037,48 @@ class Handler(BaseHTTPRequestHandler):
                 remove_upload(fid)
         self.send(result)
 
+    def global_shipping_request(self, resource, method):
+        if method == 'GET' and resource in ('orders', 'products'):
+            query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
+            with connect() as db:
+                db.execute('BEGIN')
+                if resource == 'products':
+                    return self.send(shipping.product_catalog(db, self.user))
+                return self.send(shipping.list_global_orders(db, self.user, query))
+        item_path = re.fullmatch(r'packages/([a-zA-Z0-9_-]+)/([a-f0-9]{24})/items', resource)
+        if (resource == 'packages' and method == 'POST') or (item_path and method == 'PUT'):
+            data = self.body()
+            if not isinstance(data, dict):
+                raise Problem('发货记录格式无效')
+            project = item_path[1] if item_path else shipping.string(data.get('project_id'), 100)
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project)
+                allowed = shipping.accessible_projects(db, self.user)
+                writable = {key for key, p in allowed.items() if not p['archived_at']}
+                stamp = now()
+                if item_path:
+                    row = shipping.get_shipment(db, project, item_path[2], allowed)
+                    if row['channel'] != 'other' or row['deleted_at']:
+                        raise Problem('发货记录不存在或已删除', 404)
+                    if data.get('version') != row['updated_at']:
+                        raise Problem('发货记录已更新，请刷新后重试', 409)
+                    shipping.save_shipment_items(db, row, data.get('shipment_items'), writable)
+                    db.execute('UPDATE shipping_records SET updated_at=?,operator_id=? WHERE project_id=? AND id=?',
+                               (stamp, self.user['id'], project, row['id']))
+                    record_id, reference = row['id'], row['reference']
+                else:
+                    record_id = uid()
+                    payload = {**data, 'channel': 'other', 'ks_order_id': None,
+                               'shipment_items': data.get('shipment_items', [])}
+                    result = shipping.save_shipment(db, project, record_id, payload, stamp, self.user['id'],
+                                                    writable=writable, cross_project=True)
+                    reference = result['reference']
+                touch_project(db)
+                log_activity(db, self.user, '修改发货商品' if item_path else '登记发货', record_id, reference)
+                result = shipping.get_shipment(db, project, record_id, allowed)
+            return self.send(result)
+        raise Problem('接口不存在', 404)
+
     def shipping_request(self, project_id, resource, method):
         query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
         record_path = re.fullmatch(r'records/([a-f0-9]{24})', resource)
@@ -1041,11 +1094,16 @@ class Handler(BaseHTTPRequestHandler):
                 if order_path:
                     return self.send(shipping.get_order(db, project_id, order_path[1]))
                 if resource == 'records':
-                    return self.send(shipping.list_shipments(db, project_id, query.get('channel'), query))
+                    allowed = shipping.accessible_projects(db, self.user)
+                    return self.send(shipping.list_shipments(db, project_id, query.get('channel'), query, allowed))
                 if record_path:
-                    return self.send(shipping.get_shipment(db, project_id, record_path[1]))
+                    return self.send(shipping.get_shipment(db, project_id, record_path[1],
+                                                           shipping.accessible_projects(db, self.user)))
                 if children_path:
-                    return self.send(shipping.list_children(db, project_id, children_path[1]))
+                    return self.send(shipping.list_children(db, project_id, children_path[1],
+                                                           shipping.accessible_projects(db, self.user)))
+                if resource == 'products':
+                    return self.send(shipping.product_catalog(db, self.user, project_id))
                 if resource == 'devices':
                     return self.send(shipping.find_devices(db, project_id, query))
                 if resource == 'carriers':
@@ -1121,7 +1179,7 @@ class Handler(BaseHTTPRequestHandler):
                 touch_project(db)
                 log_activity(db, self.user, '修改发货记录' if record_path else '登记发货',
                              result['id'], result['reference'])
-                result = shipping.get_shipment(db, project_id, result['id'])
+                result = shipping.get_shipment(db, project_id, result['id'], shipping.accessible_projects(db, self.user))
             return self.send(result)
         raise Problem('接口不存在', 404)
 

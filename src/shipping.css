@@ -158,6 +158,36 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-record-fields .shipping-details dd { margin: 0; }
 .shipping-detail-back { margin-bottom: 8px; }
 .shipping-detail-empty { margin-top: 12px; }
+.shipping-item-tags { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 4px; min-width: 0; }
+.shipping-relation-cell > .shipping-item-tags { flex: 0 1 auto; flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+.shipping-item-editor { display: grid; gap: 8px; }
+.shipping-item-edit-row, .shipping-item-picker {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(85px, 1fr) auto; align-items: center; gap: 6px;
+}
+.shipping-item-edit-row { grid-template-columns: minmax(0, 1fr) 85px auto; }
+.shipping-item-edit-row small { display: block; color: var(--muted); }
+.shipping-item-edit-row button { min-width: 30px; }
+.shipping-item-picker select { min-width: 0; }
+.global-shipping-filters select { height: 32px; min-height: 32px; padding: 0 8px; font-size: 12px; }
+.global-shipping-table table { min-width: 690px; }
+.global-shipping-table :is(th, td):nth-child(2) { left: auto; box-shadow: none; }
+.global-shipping-table td:nth-child(2) { position: static; }
+.global-order-toggle { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; }
+.global-order-toggle strong { overflow: hidden; text-overflow: ellipsis; }
+.global-order-toggle small { color: var(--muted); flex-shrink: 0; }
+.global-shipping-table .global-order-packages { padding: 8px 12px; background: #f6f8fc; white-space: normal; }
+.global-package {
+  display: grid; grid-template-columns: minmax(160px, 1fr) minmax(180px, 2fr) auto; gap: 8px; align-items: center;
+  border-bottom: 1px solid var(--border); padding: 7px 0;
+}
+.global-package-meta, .global-shipping-paging { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+.global-package-meta > strong { flex-basis: 100%; }
+.global-order-packages > .btn { margin-top: 6px; }
+.global-shipping-paging { justify-content: flex-end; }
+.global-shipping-paging > span { margin-right: auto; }
+.global-shipping-form { display: grid; gap: 10px; }
+.global-shipping-fields { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; }
+.global-shipping-fields > :is(label, div) { display: grid; align-content: start; gap: 3px; min-width: 0; }
 @media (min-width: 761px) {
   .shipping-table .shipping-row-action { position: sticky; right: 0; box-shadow: -2px 0 2px #23385912; }
   .shipping-table th.shipping-row-action { z-index: 4; }

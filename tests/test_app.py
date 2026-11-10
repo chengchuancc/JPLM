@@ -185,6 +185,53 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.request('shipping/orders?status=shipped')['total'], 1)
         self.assertEqual(self.request('shipping/records?channel=ks&status=shipped')['total'], 1)
 
+    def test_global_shipping_groups_order_and_limits_shared_project_data(self):
+        other = self.request('projects', 'POST', {'name': '配件项目'})['id']
+        first = self.request('products', 'POST', {'name': '新主机'})['id']
+        second = self.request('products', 'POST', {'name': '新配件'}, project=other)['id']
+        line = lambda project, product, count: {'project_id': project, 'product_id': product, 'quantity': count}
+        original = self.request('global-shipping/packages', 'POST', {
+            'project_id': self.project_id, 'reference': '#ORDER-88', 'tracking': 'TRACK-88',
+            'details': {'name': '机密收件人', 'address': '机密地址'},
+            'shipment_items': [line(self.project_id, first, 1), line(other, second, 2)],
+        }, project=False)
+        self.request('shipping/records', 'POST', {
+            'channel': 'other', 'reference': 'order-88', 'shipment_items': [line(other, second, 1)],
+        }, project=other)
+        self.request('shipping/orders/paste', 'POST', {'clipboard': 'Backer Number\t主机\n88\t1'})
+        ks = self.request('shipping/orders?q=88')['rows'][0]
+        self.request('shipping/records', 'POST', {'channel': 'ks', 'ks_order_id': ks['id']})
+        global_list = 'global-shipping/orders'
+        row = self.request(global_list + '?status=partial', project=False)['rows'][0]
+        self.assertEqual((row['order_key'], row['package_count'], row['shipped_count']), ('order:order-88', 2, 1))
+        self.assertEqual(self.request(global_list, project=False)['total'], 1)
+        self.assertEqual(self.request(global_list + '?q=TRACK-88&project=' + other, project=False)['rows'][0]['package_count'], 2)
+        self.request('shipping/records/' + original['id'], 'PUT', {
+            'channel': 'other', 'reference': '#ORDER-88', 'tracking': 'TRACK-88', 'details': original['details'],
+            'version': original['updated_at'], 'shipment_items': [line(self.project_id, first, 3)],
+        })
+        record = self.request('shipping/records/' + original['id'])
+        self.assertEqual({p['name']: p['quantity'] for p in record['shipment_items']}, {'新主机': 3, '新配件': 2})
+        self.request('shipping/records', 'POST', {'channel': 'other', 'reference': '#OTHER',
+                                                 'shipment_items': [line(other, second, 1)]}, 403)
+        self.request('shipping/records', 'POST', {'channel': 'other', 'reference': '#BAD',
+                                                 'shipment_items': [line(self.project_id, 'unknown', 1)]}, 404)
+        account = {'name': '配件成员', 'email': 'shipping-member@example.test', 'password': 'member'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('projects/' + other, 'PUT', {'members': [member]})
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+        packages = self.request(global_list, project=False)['rows'][0]['packages']
+        visible = next(pack for pack in packages if pack['id'] == original['id'])
+        self.assertFalse(visible['can_open'])
+        self.assertEqual([p['name'] for p in visible['shipment_items']], ['新配件'])
+        self.assertNotIn('details', visible)
+        mirror = self.request('shipping/records?channel=other&record=' + original['id'], project=other)['rows'][0]
+        self.assertTrue(mirror['shared'])
+        self.assertNotIn('address', mirror['details'])
+        self.assertEqual(mirror['shipment_items'][0]['product_id'], second)
+        self.request('shipping/records/' + original['id'], status=404)
+
     def test_shipping_clipboard_paste_and_creation_order(self):
         paste = 'shipping/orders/paste'
         result = self.request(paste, 'POST', {

@@ -216,6 +216,7 @@ def apply(db, project, payload):
         added[channel] += 1
 
     added_parents = apply_parent_links(db, project, parent_links(payload['records']))
+    shipping.backfill_products(db, project)
     total = Counter()
     for record, shipment_id in zip(payload['records'], shipment_ids):
         row = db.execute('SELECT * FROM shipping_records WHERE project_id=? AND id=?',

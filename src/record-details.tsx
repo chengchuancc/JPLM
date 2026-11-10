@@ -6,6 +6,7 @@ import type { RecordRow } from "./inspection";
 import { contactFields, otherContactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList, isShipped, shipmentLabel,
   type Request, type Order, type Shipment } from "./shipping-data";
 import "./shipping.css";
+import { ShipmentItems } from "./shipping-items";
 
 export function formatTime(value: string) {
   const time = new Date(value);
@@ -180,8 +181,8 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
         details={row.channel === "ks" ? row.order_details : row.details} showEmpty />
     </section>
     {row.channel === "other" &&
-      <section className="shipping-detail-section"><h3>发货数量</h3>
-        <DetailsList fields={items} details={row.details} showEmpty />
+      <section className="shipping-detail-section"><h3>发货商品</h3>
+        <ShipmentItems items={row.shipment_items} showProject links />
       </section>}
     {row.ks_order_id && <section className="shipping-detail-section"><h3>KS 订单数量</h3>
       <DetailsList fields={[["sku", "SKU"], ...items]} details={row.order_details} showEmpty />

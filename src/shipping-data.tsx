@@ -4,12 +4,16 @@ export type Details = Record<string, string | number>;
 export type Order = { id: string; backer: string; details: Details; shipped: number; shipments: number;
   created_at: string; updated_at: string };
 export type Device = { serial: string; registered?: boolean; result?: string; shipments?: string };
+export type ProductChoice = { id: string; name: string; code: string; english_code?: string; project_id: string; project_name: string };
+export type ShipmentItem = { project_id: string; product_id: string | null; name: string; code?: string;
+  project_name?: string; quantity: number; available?: boolean; legacy_key?: string };
 export type Shipment = {
   id: string; channel: Channel; reference: string; ks_order_id: string | null; backer: string | null;
   shipped_on: string; tracking: string; details: Details; order_details: Details; operator: string | null;
   created_at: string; updated_at: string; devices: Device[]; source_id: string | null;
   parent_id: string | null; parent_reference: string | null; parent_tracking: string | null;
   child_count: number; deleted_at: string | null;
+  project_id?: string; shared?: boolean; items_configured: number; shipment_items: ShipmentItem[];
 };
 export const shipmentLabel = (row: Pick<Shipment, "reference" | "tracking">) =>
   row.reference || row.tracking || "发货记录";
@@ -77,7 +81,7 @@ export function DetailsList({ fields, details, showEmpty }: { fields: string[][]
     </div>)}</dl>;
 }
 
-export function Tracking({ shipment }: { shipment: Shipment }) {
+export function Tracking({ shipment }: { shipment: Pick<Shipment, "channel" | "tracking" | "details"> }) {
   if (!shipment.tracking) return <>—</>;
   const address = "https://t.17track.net/en#nums=" + encodeURIComponent(shipment.tracking);
   return <a className="text-link mono" href={address} target="_blank" rel="noreferrer">{shipment.tracking}</a>;

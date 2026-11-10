@@ -80,6 +80,7 @@ import { ProductionInspection } from "./inspection";
 import { Dialog } from "./dialog";
 
 const ShippingManagement = lazy(() => import("./shipping"));
+const GlobalShipping = lazy(() => import("./global-shipping"));
 const money = (n: number) =>
   new Intl.NumberFormat("zh-CN", {
     style: "currency",
@@ -1050,6 +1051,7 @@ const projectHome: WorkspaceRoute = { projectId: "", view: "projects", detail: "
 function readWorkspaceRoute(): WorkspaceRoute {
   const [top, id, view, detail] = location.hash.slice(1).split("/");
   if (top === "settings") return { ...projectHome, view: "settings" };
+  if (top === "global-shipping") return { ...projectHome, view: "global-shipping" };
   if (top === "projects" && id) {
     const valid = navs.some((nav) => nav.id === view) || view === "project-settings";
     return { projectId: id, view: valid ? view : "products", detail: valid ? detail || "" : "" };
@@ -1095,7 +1097,7 @@ function App() {
   }
   function navigate(next: WorkspaceRoute, replace = false) {
     if ((currentRoute.current.projectId !== next.projectId ||
-        (["inspection", "shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
+        (["inspection", "shipping", "global-shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
         !window.confirm("有未保存的内容。离开当前项目？")) return;
     if (location.hash !== workspaceHash(next)) {
       if (replace) history.replaceState(null, "", workspaceHash(next));
@@ -1109,7 +1111,7 @@ function App() {
     const changed = () => {
       const next = readWorkspaceRoute();
       if ((currentRoute.current.projectId !== next.projectId ||
-          (["inspection", "shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
+          (["inspection", "shipping", "global-shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
           !window.confirm("有未保存的内容。离开当前项目？")) {
         history.replaceState(null, "", workspaceHash(currentRoute.current));
         return;
@@ -1703,7 +1705,7 @@ function Workspace({
   function go(nextView: string, id = "") {
     if (!mounted.current) return;
     const next = {
-      projectId: nextView === "settings" || nextView === "projects" ? "" : projectId,
+      projectId: ["settings", "projects", "global-shipping"].includes(nextView) ? "" : projectId,
       view: nextView,
       detail: id,
     };
@@ -2119,7 +2121,7 @@ function Workspace({
   }
   const low = state.parts.filter((p) => p.stock < p.min_stock);
   const title = navs.find((n) => n.id === view)?.name ||
-    ({ projects: "项目列表", settings: "系统设置", "project-settings": "项目设置" }[view] || "工作空间");
+    ({ projects: "项目列表", "global-shipping": "全局发货", settings: "系统设置", "project-settings": "项目设置" }[view] || "工作空间");
   const partOptions = state.parts.map((p) => ({
     value: p.id,
     label: p.code + " · " + p.name + " / 库存 " + amount(p.stock),
@@ -2350,6 +2352,9 @@ function Workspace({
           <button className={view === "projects" ? "active" : ""} onClick={() => go("projects")}>
             <Layers size={19} strokeWidth={1.7} /><span>项目列表</span>
           </button>
+          <button className={view === "global-shipping" ? "active" : ""} onClick={() => go("global-shipping")}>
+            <Truck size={19} strokeWidth={1.7} /><span>全局发货</span>
+          </button>
           {project && navs.map((n) => (
             <button
               key={n.id}
@@ -2489,7 +2494,12 @@ function Workspace({
             onDraftChange={(dirty) => { draftOpen.current = dirty; }}
           />}
           {view === "shipping" && project && <Suspense fallback={<p className="muted">正在加载发货管理…</p>}>
-            <ShippingManagement request={businessApi} admin={currentUser.role === "admin"} readOnly={archived}
+            <ShippingManagement key={detail} request={businessApi} admin={currentUser.role === "admin"} readOnly={archived}
+              initialRecord={detail}
+              onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
+          </Suspense>}
+          {view === "global-shipping" && <Suspense fallback={<p className="muted">正在加载全局发货…</p>}>
+            <GlobalShipping request={api} projectRequest={(id) => (path, method, data) => projectRequest(id, path, method, data)}
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}
           {view === "project-settings" && project && (
