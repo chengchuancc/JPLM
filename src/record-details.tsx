@@ -3,7 +3,7 @@ import { createPortal } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 import { Dialog } from "./dialog";
 import type { RecordRow } from "./inspection";
-import { contactFields, costs, items, orderFields, Status, Tracking, DetailsList,
+import { contactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList,
   type Request, type Order, type Shipment } from "./shipping-data";
 import "./shipping.css";
 
@@ -143,16 +143,18 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
       <div><span>{title}</span> <strong className="mono">{row.reference || "—"}</strong></div>
       <Status sent={!!(row.shipped_on || row.tracking)} />
     </div>
+    <div className="shipping-record-fields">
     <section className="shipping-detail-section">
       <h3>发货与物流</h3>
       <dl className="shipping-details">
-        <div><dt>渠道</dt><dd>{row.channel === "ks" ? "Kickstarter" : row.details.source || "—"}</dd></div>
+        <div><dt>来源</dt><dd><SourceTag value={row.channel === "ks" ? "Kickstarter" : row.details.source} /></dd></div>
+        <div><dt>添加时间</dt><dd>{formatTime(row.created_at)}</dd></div>
         {row.ks_order_id && <div><dt>KS 订单</dt><dd><button type="button" className="text-link"
           onClick={() => open({ kind: "order", id: row.ks_order_id!, backer: row.backer || undefined })}>
           Backer #{row.backer}</button></dd></div>}
         <div><dt>发货日期</dt><dd>{row.shipped_on || "—"}</dd></div>
         <div><dt>运单号</dt><dd><Tracking shipment={row} /></dd></div>
-        <div><dt>货代 / 承运商</dt><dd>{row.details.carrier || "—"}</dd></div>
+        <div><dt>货代 / 承运商</dt><dd><CarrierTags value={row.details.carrier} /></dd></div>
         <div><dt>经办人</dt><dd>{row.operator || "—"}</dd></div>
       </dl>
       <DetailsList fields={costs} details={row.details} showEmpty />
@@ -176,10 +178,10 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
       </ul>
     </section>
     <section className="shipping-detail-section"><h3>备注与时间</h3>
-      <DetailsList fields={[["notes", "备注"], ["created_at", "创建时间"], ["updated_at", "更新时间"], ["source_id", "来源记录 ID"]]}
-        details={{ ...row.details, created_at: formatTime(row.created_at), updated_at: formatTime(row.updated_at),
-          source_id: row.source_id || "" }} />
+      <DetailsList fields={[["notes", "备注"], ["updated_at", "更新时间"], ["source_id", "来源记录 ID"]]}
+        details={{ ...row.details, updated_at: formatTime(row.updated_at), source_id: row.source_id || "" }} showEmpty />
     </section>
+    </div>
   </>;
 }
 
@@ -188,7 +190,12 @@ function OrderDetails({ id, request, open }: { id: string; request: Request; ope
   if (!row) return <Loading error={error} />;
   return <>
     <div className="shipping-tools"><Status sent={row.shipped > 0} /><span>发货记录 {row.shipments} 条</span></div>
-    <DetailsList fields={orderFields} details={row.details} showEmpty />
+    <div className="shipping-record-fields">
+      <section className="shipping-detail-section"><h3>订单资料</h3>
+        <DetailsList fields={[["created_at", "添加时间"], ...orderFields]} showEmpty
+          details={{ ...row.details, created_at: formatTime(row.created_at) }} />
+      </section>
+    </div>
     {!!row.shipment_links.length && <section className="shipping-detail-section"><h3>关联发货</h3>
       <ShipmentLinks rows={row.shipment_links} open={open} />
     </section>}

@@ -1,11 +1,13 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from "react";
 import { createPortal } from "react-dom";
 import { Camera, Pencil, Plus, Search, Upload } from "lucide-react";
 import { Dialog } from "./dialog";
+import { FieldVisibility } from "./material-table";
 import { CameraReader } from "./inspection";
-import { RelatedRecordDialog, type RelatedTarget } from "./record-details";
+import { RelatedRecordDialog, formatTime, type RelatedTarget } from "./record-details";
 import { type Request, type Channel, type Order, type Device, type Shipment, type Page,
-  path, contactFields, items, costs, sources, isOrder, Status, Tracking } from "./shipping-data";
+  path, contactFields, orderFields, items, costs, sources, isOrder, CarrierTags, SourceTag, Status, Tracking } from "./shipping-data";
+import { CarrierPicker } from "./shipping-carrier";
 
 type ImportReport = { added: number; updated: number; unchanged: number; duplicate: number; invalid: number;
   errors: { row: number; error: string }[] };
@@ -127,7 +129,7 @@ function OrderPicker({ request, close, select }: { request: Request; close: () =
       setBusy(true);
       setMessage("");
       try {
-        const result: Page = await request(path + "orders?" + new URLSearchParams({ q: term.trim() }));
+        const result: Page = await request(path + "orders?" + new URLSearchParams({ q: term.trim(), lookup: "1" }));
         setRows(result.rows.filter(isOrder));
         if (!result.total) setMessage("没有找到匹配的 KS 订单");
       } catch (error) { setMessage((error as Error).message); }
@@ -146,27 +148,32 @@ function OrderPicker({ request, close, select }: { request: Request; close: () =
   </Dialog>;
 }
 
-type Column = { key: string; label: string; width: number; type?: "date" | "number" | "quantity" };
+type Column = { key: string; label: string; width: number; fixed?: boolean; type?: "date" | "number" | "quantity" };
 const fieldColumns = (fields: string[][], width: number, type?: Column["type"]): Column[] =>
   fields.map(([key, label]) => ({ key, label, width, type }));
+const createdColumn: Column = { key: "created_at", label: "添加时间 ↓", width: 151 };
 const orderColumns: Column[] = [
-  { key: "backer", label: "Backer 编号", width: 130 },
-  ...fieldColumns(contactFields.filter(([key]) => ["name", "country"].includes(key)), 125),
-  { key: "address_status", label: "地址确认", width: 105 },
+  { key: "backer", label: "Backer 编号", width: 130, fixed: true },
+  createdColumn,
+  ...fieldColumns(orderFields.filter(([key]) => !items.some(([item]) => item === key)), 145),
+  ...fieldColumns(items, 88, "quantity"),
   { key: "status", label: "发货状态", width: 96 },
   { key: "shipments", label: "发货记录", width: 100 },
-  ...fieldColumns(contactFields.filter(([key]) => !["name", "country"].includes(key)), 155),
-  ...fieldColumns([["pb", "PB 编号"], ["sku", "SKU"]], 140),
 ];
+const orderWritable = (key: string) => key === "backer" || orderFields.some(([field]) => field === key);
+const orderMovement: Record<string, [number, number]> = {
+  ArrowUp: [-1, 0], ArrowDown: [1, 0], ArrowLeft: [0, -1], ArrowRight: [0, 1],
+};
 function shipmentColumns(channel: Channel): Column[] {
   return [
-    { key: "reference", label: channel === "ks" ? "发货编号" : "订单号", width: 170 },
+    { key: "reference", label: channel === "ks" ? "发货编号" : "订单号", width: 170, fixed: true },
+    createdColumn,
     { key: channel === "ks" ? "backer" : "source", label: channel === "ks" ? "Backer 编号" : "来源", width: 120 },
     { key: "devices", label: "发货设备 S/N", width: 244 },
     { key: "shipped_on", label: "发货日期", width: 135, type: "date" },
     { key: "tracking", label: "运单号", width: 175 },
     { key: "status", label: "发货状态", width: 94 },
-    { key: "carrier", label: "货代 / 承运商", width: 130 },
+    { key: "carrier", label: "货代 / 承运商", width: 190 },
     ...fieldColumns(contactFields.filter(([key]) => ["name", "country"].includes(key)), 125),
     ...fieldColumns(items, 88, "quantity"),
     ...fieldColumns(costs, 100, "number"),
@@ -185,10 +192,11 @@ function emptyShipment(channel: Channel, order?: Order): Shipment {
 }
 
 type Update = (changes: Partial<Shipment>) => void;
-function ShipmentCell({ row, column, edit, saving, open, pick }: {
+function ShipmentCell({ row, column, edit, saving, open, pick, request }: {
   row: Shipment; column: Column; edit?: Update; open: (target: RelatedTarget) => void;
   saving: boolean;
   pick: (field: "order" | "devices") => void;
+  request: Request;
 }) {
   const key = column.key;
   if (key === "devices") {
@@ -212,15 +220,20 @@ function ShipmentCell({ row, column, edit, saving, open, pick }: {
     {!row.ks_order_id && !edit && <span className="muted">—</span>}
   </div>;
   if (key === "status") return <Status sent={!!(row.shipped_on || row.tracking)} />;
+  if (key === "created_at") return <span>{row.created_at ? formatTime(row.created_at) : "—"}</span>;
+  if (key === "carrier") return edit ? <CarrierPicker request={request} value={row.details.carrier} disabled={saving}
+    onChange={(value) => edit({ details: { ...row.details, carrier: value } })} /> : <CarrierTags value={row.details.carrier} />;
   const field = key === "reference" || key === "shipped_on" || key === "tracking" ? key : undefined;
   const value = field ? row[field] : row.details[key] ?? row.order_details[key];
   const fromOrder = row.channel === "ks" && contactFields.some(([contact]) => key === contact);
   if (edit && !fromOrder) {
     const set = (input: string) => edit(field ? { [field]: input } : { details: { ...row.details, [key]: input } });
+    if (key === "notes") return <textarea aria-label={column.label} rows={2} maxLength={3000} disabled={saving}
+      value={row.details.notes ?? ""} onChange={(event) => set(event.target.value)} />;
     return <input aria-label={column.label} disabled={saving} type={column.type === "quantity" ? "number" : column.type || "text"}
       min={column.type === "number" || column.type === "quantity" ? 0 : undefined}
       step={column.type === "quantity" ? 1 : column.type === "number" ? "any" : undefined}
-      maxLength={key === "notes" ? 3000 : undefined} list={key === "source" ? "shipping-sources" : undefined}
+      list={key === "source" ? "shipping-sources" : undefined}
       value={field ? row[field] : row.details[key] ?? ""}
       placeholder={key === "reference" && row.channel === "ks" ? "自动编号" : undefined}
       onChange={(event) => set(event.target.value)} />;
@@ -228,6 +241,7 @@ function ShipmentCell({ row, column, edit, saving, open, pick }: {
   if (key === "reference") return <button type="button" className="text-link mono shipping-reference"
     onClick={() => open({ kind: "shipment", id: row.id, reference: row.reference })}>{row.reference || "查看记录"}</button>;
   if (key === "tracking") return <Tracking shipment={row} />;
+  if (key === "source") return <SourceTag value={row.details.source} />;
   const displayed = fromOrder ? value : field ? value : row.details[key];
   return <span title={String(displayed ?? "")}>{displayed === "" ? "—" : displayed ?? "—"}</span>;
 }
@@ -242,7 +256,6 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   const [status, setStatus] = useState("");
   const [page, setPage] = useState(1);
   const [data, setData] = useState<Page>();
-  const [recent, setRecent] = useState<Shipment>();
   const [busy, setBusy] = useState(true);
   const [saving, setSaving] = useState(false);
   const [loadError, setLoadError] = useState("");
@@ -254,13 +267,23 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   const [picker, setPicker] = useState<"order" | "devices">();
   const [importing, setImporting] = useState(false);
   const [notice, setNotice] = useState("");
+  const [hiddenFields, setHiddenFields] = useState<Record<string, string[]>>(() => {
+    try { return JSON.parse(localStorage.getItem("plm-shipping-fields") || "{}") || {}; }
+    catch { return {}; }
+  });
+  const [cursor, setCursor] = useState<{ id: string; key: string }>();
+  const [orderEdit, setOrderEdit] = useState<{ row: Order; key: string; value: string }>();
+  const orderSaving = useRef(false);
   const grid = useRef<HTMLDivElement>(null);
   const tail = useRef<HTMLDivElement>(null);
-  const columns = orders ? orderColumns : shipmentColumns(channel);
+  const view = orders ? "orders" : channel;
+  const availableColumns = orders ? orderColumns : shipmentColumns(channel);
+  const hidden = Array.isArray(hiddenFields[view]) ? hiddenFields[view] : [];
+  const columns = availableColumns.filter((column) => column.fixed || !hidden.includes(column.key));
+  const canPaste = orders && admin && !readOnly;
   const tableWidth = columns.reduce((total, column) => total + column.width, readOnly ? 45 : 149);
   const more = !!data && page * data.page_size < data.total;
-  const rows = recent && !orders
-    ? [recent, ...(data?.rows || []).filter((row) => row.id !== recent.id)] : data?.rows || [];
+  const rows = data?.rows || [];
 
   useEffect(() => {
     let active = true;
@@ -296,19 +319,20 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   }, [busy, more, loadError, page]);
 
   useEffect(() => {
-    onDraftChange(!!edit);
-    if (!edit) return;
+    onDraftChange(!!edit || !!orderEdit);
+    if (!edit && !orderEdit) return;
     const warn = (event: BeforeUnloadEvent) => { event.preventDefault(); event.returnValue = ""; };
     window.addEventListener("beforeunload", warn);
     return () => {
       window.removeEventListener("beforeunload", warn);
       onDraftChange(false);
     };
-  }, [!!edit]);
+  }, [!!edit, !!orderEdit]);
 
   function abandon() {
-    if (saving || (edit && !window.confirm("放弃未保存的发货记录？"))) return false;
+    if (saving || ((edit || orderEdit) && !window.confirm("放弃未保存的记录？"))) return false;
     setEdit(undefined);
+    setOrderEdit(undefined);
     setSaveError("");
     return true;
   }
@@ -317,6 +341,7 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     setData(undefined);
     setBusy(true);
     setPage(1);
+    setCursor(undefined);
     setRefresh((value) => value + 1);
   }
   function select(next: Channel, showOrders = false) {
@@ -327,7 +352,6 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     setTerm("");
     setStatus("");
     setNotice("");
-    setRecent(undefined);
     resetList();
   }
   function begin(row: Shipment) {
@@ -342,7 +366,6 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     setSearch("");
     setTerm("");
     setStatus("");
-    setRecent(undefined);
     resetList();
     begin(emptyShipment("ks", order));
   }
@@ -360,12 +383,10 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
       setEdit(undefined);
       if (edit.id) {
         const old = rows.find((row): row is Shipment => !isOrder(row) && row.id === saved.id);
-        if (recent?.id === saved.id) setRecent(saved);
-        if (search || old?.shipped_on !== saved.shipped_on ||
+        if (search ||
           (status && !!(old?.shipped_on || old?.tracking) !== !!(saved.shipped_on || saved.tracking))) resetList();
         else setData((previous) => previous && { ...previous, rows: previous.rows.map((row) => row.id === saved.id ? saved : row) });
       } else {
-        setRecent(saved);
         setStatus("");
         setSearch("");
         setTerm("");
@@ -376,6 +397,119 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     finally { setSaving(false); }
   }
 
+  async function pasteOrders(event: ClipboardEvent<HTMLDivElement>) {
+    if (!canPaste || event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+    const clipboard = event.clipboardData.getData("text/plain");
+    if (!clipboard) return;
+    event.preventDefault();
+    if (saving || orderEdit) return;
+    const fields = columns.filter((column) => orderWritable(column.key)).map((column) => column.key);
+    const startColumn = cursor ? fields.indexOf(cursor.key) : 0;
+    const startRow = cursor?.id ? rows.findIndex((row) => row.id === cursor.id) : -1;
+    if (cursor?.id && startRow < 0) return;
+    const targets = startRow < 0 ? [] : rows.slice(startRow, startRow + 1000).filter(isOrder).map((row) => ({
+      id: row.id, version: row.updated_at, backer: row.backer,
+    }));
+    setSaving(true);
+    setSaveError("");
+    setNotice("");
+    try {
+      const result: ImportReport = await request(path + "orders/paste", "POST", {
+        clipboard, columns: startColumn < 0 ? [] : fields.slice(startColumn), targets,
+      });
+      if (result.added) {
+        setTerm("");
+        setSearch("");
+        setStatus("");
+      }
+      if (result.added || result.updated) resetList();
+      setNotice(`已粘贴 · 新增 ${result.added} 条 · 更新 ${result.updated} 条 · 跳过 ${result.unchanged + result.duplicate} 条`);
+    } catch (error) { setSaveError((error as Error).message); }
+    finally { setSaving(false); }
+  }
+
+  function selectCell(id: string, key: string) {
+    if (!canPaste || !orderWritable(key) || saving) return;
+    setCursor({ id, key });
+    grid.current?.focus({ preventScroll: true });
+  }
+  function editOrderCell(row: Order, key: string) {
+    if (!canPaste || saving || orderEdit || key === "backer" || !orderWritable(key)) return;
+    setSaveError("");
+    setCursor({ id: row.id, key });
+    setOrderEdit({ row, key, value: String(row.details[key] ?? "") });
+  }
+  async function saveOrderCell() {
+    if (!orderEdit || orderSaving.current) return;
+    const { row, key, value } = orderEdit;
+    if (value === String(row.details[key] ?? "")) { setOrderEdit(undefined); return; }
+    orderSaving.current = true;
+    setSaving(true);
+    setSaveError("");
+    try {
+      const saved: Order = await request(path + "orders/" + row.id, "PUT", {
+        version: row.updated_at, details: { [key]: value },
+      });
+      setOrderEdit(undefined);
+      setData((previous) => previous && { ...previous, rows: previous.rows.map((item) => item.id === saved.id ? saved : item) });
+    } catch (error) { setSaveError((error as Error).message); }
+    finally {
+      setSaving(false);
+      orderSaving.current = false;
+    }
+  }
+  function orderKeys(event: KeyboardEvent<HTMLDivElement>) {
+    if (!canPaste || event.target !== grid.current || saving) return;
+    const fields = columns.filter((column) => orderWritable(column.key));
+    const ids = ["", ...rows.map((row) => row.id)];
+    if (event.key === "Enter" && cursor?.id) {
+      const row = rows.find((item) => item.id === cursor.id);
+      if (row && isOrder(row)) editOrderCell(row, cursor.key);
+      return;
+    }
+    const move = orderMovement[event.key];
+    if (!move) return;
+    event.preventDefault();
+    const row = Math.max(0, ids.indexOf(cursor?.id || ""));
+    const col = Math.max(0, fields.findIndex((field) => field.key === cursor?.key));
+    const id = ids[Math.max(0, Math.min(ids.length - 1, row + move[0]))];
+    const key = fields[Math.max(0, Math.min(fields.length - 1, col + move[1]))].key;
+    setCursor({ id, key });
+    const cell = grid.current?.querySelector(`[data-order-row="${id}"][data-order-field="${key}"]`);
+    cell?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }
+
+  function orderCell(row: Order, column: Column) {
+    const { key, label } = column;
+    if (orderEdit?.row.id === row.id && orderEdit.key === key) {
+      const props = {
+        autoFocus: true, "aria-label": label, value: orderEdit.value, disabled: saving,
+        onChange: (event: { target: { value: string } }) => setOrderEdit({ ...orderEdit, value: event.target.value }),
+        onBlur: () => void saveOrderCell(),
+        onKeyDown: (event: KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+          if (event.key === "Escape" && !saving) {
+            setOrderEdit(undefined);
+            setSaveError("");
+            requestAnimationFrame(() => grid.current?.focus({ preventScroll: true }));
+          }
+          if (event.key === "Enter" && !event.nativeEvent.isComposing && (key !== "notes" || event.metaKey || event.ctrlKey)) {
+            event.preventDefault();
+            void saveOrderCell();
+          }
+        },
+      };
+      return key === "notes" ? <textarea {...props} rows={2} maxLength={3000} /> :
+        <input {...props} type={column.type === "quantity" ? "number" : "text"} />;
+    }
+    const target: RelatedTarget = { kind: "order", id: row.id, backer: row.backer };
+    if (key === "backer") return <button type="button" className="text-link mono" onClick={() => setDetail(target)}>#{row.backer}</button>;
+    if (key === "created_at") return <span>{formatTime(row.created_at)}</span>;
+    if (key === "status") return <Status sent={row.shipped > 0} />;
+    if (key === "shipments") return row.shipments > 0 ? <button type="button" className="shipping-chip"
+      onClick={() => setDetail(target)}>{row.shipments} 条</button> : "—";
+    return <span title={String(row.details[key] ?? "")}>{row.details[key] ?? "—"}</span>;
+  }
+
   const shipmentRow = (item: Shipment, index: number | string) => {
     const editing = edit && edit.id === item.id;
     const row = editing ? edit : item;
@@ -384,14 +518,15 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
         aria-label={"编辑第 " + index + " 行"} title="编辑" disabled={saving} onClick={() => begin(row)}><Pencil size={12} /></button>}
         {index}</td>
       {columns.map((column) => <td key={column.key} onDoubleClick={(event) => {
-        if (!editing && !["reference", "backer", "devices", "status", "tracking"].includes(column.key) &&
+        if (!editing && !["reference", "backer", "devices", "status", "tracking", "created_at"].includes(column.key) &&
           !(channel === "ks" && contactFields.some(([key]) => key === column.key))) {
           const cell = event.currentTarget;
           begin(row);
-          requestAnimationFrame(() => cell.querySelector("input")?.focus());
+          requestAnimationFrame(() => cell.querySelector<HTMLElement>("input,textarea,button")?.focus());
         }
       }}>
-        <ShipmentCell row={row} column={column} edit={editing ? update : undefined} saving={saving} open={setDetail} pick={setPicker} />
+        <ShipmentCell row={row} column={column} edit={editing ? update : undefined} saving={saving}
+          open={setDetail} pick={setPicker} request={request} />
       </td>)}
       {!readOnly && <td className="shipping-row-action">{editing ? <>
         <button type="button" className="btn small primary" onClick={() => void save()} disabled={saving}>保存</button>
@@ -402,24 +537,32 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
   return <section className="shipping-management">
     <div className="page-heading"><h1>发货管理</h1></div>
     <div className="tabs page-tabs" aria-label="发货渠道">
-      <button type="button" className={channel === "ks" ? "selected" : ""} onClick={() => select("ks")}>KS 发货管理</button>
       <button type="button" className={channel === "other" ? "selected" : ""} onClick={() => select("other")}>其他发货管理</button>
+      <button type="button" className={channel === "ks" ? "selected" : ""} onClick={() => select("ks")}>KS 发货管理</button>
     </div>
     <div className="shipping-toolbar">
       <form className="shipping-tools" onSubmit={(event) => {
         event.preventDefault();
-        if (abandon()) { setSearch(term.trim()); setRecent(undefined); resetList(); }
+        if (abandon()) { setSearch(term.trim()); resetList(); }
       }}>
         <input aria-label="搜索发货" placeholder={orders ? "Backer 编号、收件人或邮箱" : "订单号、运单号或设备 S/N"}
           value={term} onChange={(event) => setTerm(event.target.value)} />
         <select aria-label="发货状态" value={status} onChange={(event) => {
-          if (abandon()) { setStatus(event.target.value); setRecent(undefined); resetList(); }
+          if (abandon()) { setStatus(event.target.value); resetList(); }
         }}>
           <option value="">全部状态</option><option value="shipped">已发货</option><option value="pending">待发货</option>
         </select>
         <button type="submit" className="btn"><Search size={15} />搜索</button>
       </form>
       <div className="shipping-tools">
+        <FieldVisibility columns={availableColumns} hidden={hidden} onChange={(next) => {
+          if (orderEdit && next.includes(orderEdit.key) && !abandon()) return;
+          const updated = { ...hiddenFields, [view]: next };
+          setHiddenFields(updated);
+          if (cursor && next.includes(cursor.key)) setCursor(undefined);
+          try { localStorage.setItem("plm-shipping-fields", JSON.stringify(updated)); }
+          catch { /* The current view still reflects the selection. */ }
+        }} />
         {channel === "ks" && <button className="btn" type="button" onClick={() => select("ks", !orders)}>
           {orders ? "返回 KS 发货台账" : "KS 发货信息"}
         </button>}
@@ -436,7 +579,10 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
     <datalist id="shipping-sources">{sources.map((source) => <option key={source} value={source} />)}</datalist>
     {notice && <p className="shipping-notice" role="status">{notice}</p>}
     {saveError && <p className="form-error" role="alert">{saveError}</p>}
-    <div className="table-wrap shipping-table" ref={grid} aria-busy={busy} aria-label={orders ? "KS 发货信息" : "发货台账"} tabIndex={0}>
+    {canPaste && <p className="shipping-paste-hint muted">复制飞书或 Excel 单元格，选中起始位置后粘贴。新增可粘贴带表头的数据。</p>}
+    <div className="table-wrap shipping-table" ref={grid} aria-busy={busy || saving}
+      aria-label={orders ? "KS 发货信息" : "发货台账"} tabIndex={0} onPaste={(event) => void pasteOrders(event)}
+      onKeyDown={orderKeys}>
       <table style={{ width: tableWidth }}>
         <colgroup><col style={{ width: 45 }} />{columns.map((column) => <col key={column.key} style={{ width: column.width }} />)}
           {!readOnly && <col style={{ width: 104 }} />}</colgroup>
@@ -446,15 +592,25 @@ export default function ShippingManagement({ request, admin, readOnly, onDraftCh
         </tr></thead>
         <tbody>
           {!orders && edit?.id === "" && shipmentRow(edit, "＋")}
+          {canPaste && <tr className="shipping-paste-row">
+            <td className="shipping-row-index">＋</td>
+            {columns.map(({ key }) => <td key={key} data-order-row="" data-order-field={key}
+              className={cursor?.id === "" && cursor.key === key ? "shipping-cell-selected" : ""}
+              onClick={() => selectCell("", key)}>
+              {key === "backer" && <button type="button" className="text-link"
+                onClick={() => selectCell("", "backer")}>粘贴新记录</button>}
+            </td>)}
+            <td className="shipping-row-action"></td>
+          </tr>}
           {rows.map((row, index) => {
             if (!isOrder(row)) return shipmentRow(row, index + 1);
-            const target: RelatedTarget = { kind: "order", id: row.id, backer: row.backer };
             return <tr key={row.id}><td className="shipping-row-index">{index + 1}</td>
-              {columns.map(({ key }) => <td key={key}>{key === "backer" ? <button type="button" className="text-link mono"
-                onClick={() => setDetail(target)}>#{row.backer}</button> : key === "status" ? <Status sent={row.shipped > 0} /> :
-                key === "shipments" ? row.shipments > 0 ? <button type="button" className="shipping-chip"
-                  onClick={() => setDetail(target)}>{row.shipments} 条</button> : "—" :
-                <span title={String(row.details[key] ?? "")}>{row.details[key] ?? "—"}</span>}</td>)}
+              {columns.map((column) => <td key={column.key} data-order-row={row.id} data-order-field={column.key}
+                className={cursor?.id === row.id && cursor.key === column.key ? "shipping-cell-selected" : ""}
+                onClick={(event) => {
+                  if (!orderEdit && event.target instanceof Element && !event.target.closest("button")) selectCell(row.id, column.key);
+                }}
+                onDoubleClick={() => editOrderCell(row, column.key)}>{orderCell(row, column)}</td>)}
               {!readOnly && <td className="shipping-row-action"><button className="btn small" type="button"
                 onClick={() => beginFromOrder(row)}>登记发货</button></td>}
             </tr>;

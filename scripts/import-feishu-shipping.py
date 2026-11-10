@@ -116,6 +116,7 @@ def extract(path):
         if answer in ("OK", "I'm on it!", '0'):
             details['address_status'] = '未确认' if answer == '0' else '已确认'
         orders.append(dict(backer=backer, details=shipping.clean_details(details, shipping.ORDER_KEYS),
+                           created_at=orders_table.stamp(rid, 'createdTime'),
                            updated_at=orders_table.stamp(rid, 'modifiedTime')))
     records = []
     links = Counter()
@@ -165,7 +166,8 @@ def apply(db, project, payload):
             order_ids[backer] = current['id']
         else:
             order_id = app.uid()
-            shipping.save_order(db, project, order_id, backer, order['details'], order['updated_at'])
+            shipping.save_order(db, project, order_id, backer, order['details'], order['updated_at'],
+                                created_at=order.get('created_at'))
             order_ids[backer] = order_id
             added_orders += 1
     added = Counter()

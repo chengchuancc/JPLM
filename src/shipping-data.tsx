@@ -1,7 +1,8 @@
 export type Request = (path: string, method?: string, data?: unknown) => Promise<any>;
 export type Channel = "ks" | "other";
 export type Details = Record<string, string | number>;
-export type Order = { id: string; backer: string; details: Details; shipped: number; shipments: number };
+export type Order = { id: string; backer: string; details: Details; shipped: number; shipments: number;
+  created_at: string; updated_at: string };
 export type Device = { serial: string; registered?: boolean; result?: string; shipments?: string };
 export type Shipment = {
   id: string; channel: Channel; reference: string; ks_order_id: string | null; backer: string | null;
@@ -22,6 +23,36 @@ export const orderFields = [...contactFields, ["country_code", "国家代码"], 
   ["balance", "欠款"], ["notes", "备注"], ...items];
 export const sources = ["Shopify", "Amazon", "Indiegogo", "AliExpress", "经销商", "KOL", "其他"];
 export const isOrder = (row: Order | Shipment): row is Order => "shipments" in row;
+
+export function SourceTag({ value }: { value: string | number | undefined }) {
+  const label = String(value ?? "").trim();
+  if (!label) return <>—</>;
+  const source = label.toLowerCase();
+  const tone = source.includes("amazon") || source.includes("亚马逊") ? "amber" :
+    source.includes("shopify") || source.includes("独立站") ? "green" :
+    source.includes("kickstarter") || source === "ks" ? "violet" :
+    source.includes("aliexpress") || source.includes("速卖通") ? "rose" :
+    source.includes("indiegogo") ? "blue" :
+    source.includes("经销") || source.includes("dealer") ? "teal" : "slate";
+  return <span className={"shipping-source " + tone} title={label}>{label}</span>;
+}
+
+export const carrierNames = (value: string | number | undefined) =>
+  [...new Set(String(value ?? "").split("、").map((name) => name.trim()).filter(Boolean))];
+
+export function CarrierTag({ name }: { name: string }) {
+  const colors = ["blue", "rose", "teal", "amber", "violet", "green"];
+  let hash = 0;
+  for (const char of name.toLowerCase()) hash = (Math.imul(hash, 31) + char.codePointAt(0)!) >>> 0;
+  return <span className={"shipping-source " + colors[hash % colors.length]} title={name}>{name}</span>;
+}
+
+export function CarrierTags({ value }: { value: string | number | undefined }) {
+  const names = carrierNames(value);
+  return names.length ? <span className="shipping-carrier-tags">
+    {names.map((name) => <CarrierTag name={name} key={name} />)}
+  </span> : <>—</>;
+}
 
 export function Status({ sent }: { sent: boolean }) {
   return <span className={"shipping-status" + (sent ? " sent" : "")}>{sent ? "已发货" : "待发货"}</span>;

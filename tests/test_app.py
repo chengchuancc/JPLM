@@ -114,6 +114,46 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(app.shipping.list_orders(db, self.project_id, {})['total'], 1)
                 self.assertEqual(len(app.shipping.for_device(db, self.project_id, serial)), 1)
 
+    def test_shipping_clipboard_paste_and_creation_order(self):
+        paste = 'shipping/orders/paste'
+        result = self.request(paste, 'POST', {
+            'clipboard': 'Backer Number\tPostal Code\tNotes\n90\t00123\t"Line 1\nLine 2"\n80\t00000\tSecond',
+        })
+        self.assertEqual(result['added'], 2)
+        self.assertEqual(self.request(paste, 'POST', {'clipboard': '90\t99999', 'columns': ['backer', 'postcode']})['added'], 0)
+        self.request(paste, 'POST', {'clipboard': '70\tThird', 'columns': ['backer', 'name']})
+        orders = self.request('shipping/orders')['rows']
+        self.assertEqual([order['backer'] for order in orders], ['70', '90', '80'])
+        first, second = orders[1:]
+        self.assertEqual(first['details'], {'postcode': '00123', 'notes': 'Line 1\nLine 2'})
+        target = lambda order: {'id': order['id'], 'backer': order['backer'], 'version': order['updated_at']}
+        self.request(paste, 'POST', {'clipboard': '09100\n99999', 'columns': ['postcode'],
+                                     'targets': [target(first), {**target(second), 'version': 'stale'}]}, 409)
+        self.assertEqual(self.request('shipping/orders/' + first['id'])['details']['postcode'], '00123')
+        self.request(paste, 'POST', {'clipboard': '09100\tChanged', 'columns': ['postcode', 'notes'],
+                                     'targets': [target(first)]})
+        updated = self.request('shipping/orders/' + first['id'])
+        self.assertEqual(updated['created_at'], first['created_at'])
+        self.assertEqual(updated['details'], {'postcode': '09100', 'notes': 'Changed'})
+        cleared = self.request('shipping/orders/' + first['id'], 'PUT', {'version': updated['updated_at'],
+                                                                       'details': {'notes': ''}})
+        self.assertNotIn('notes', cleared['details'])
+        for reference, shipped_on in (('older', '2030-12-31'), ('newer', '')):
+            self.request('shipping/records', 'POST', {'channel': 'other', 'reference': reference, 'shipped_on': shipped_on})
+        rows = self.request('shipping/records?channel=other')['rows']
+        self.assertEqual([row['reference'] for row in rows], ['newer', 'older'])
+        newest = rows[0]
+        changed = self.request('shipping/records/' + newest['id'], 'PUT', {
+            'channel': 'other', 'reference': newest['reference'], 'version': newest['updated_at'],
+            'details': {'carrier': 'DHL、顺丰'},
+        })
+        self.assertEqual(changed['details']['carrier'], 'DHL、顺丰')
+        self.request('shipping/records/' + newest['id'], 'PUT', {
+            'channel': 'other', 'reference': newest['reference'], 'version': changed['updated_at'],
+            'details': {'carrier': '顺丰'},
+        })
+        self.assertEqual(self.request('shipping/carriers'), ['DHL', '顺丰'])
+
     def test_inspection_templates_rules_and_project_permissions(self):
         config = {'name': '压力测试', 'serial_mode': 'dated', 'fields': [
             {'key': 'pressure', 'label': '压力', 'group': '性能', 'type': 'number', 'unit': 'kPa',

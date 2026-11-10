@@ -26,11 +26,15 @@
   display: inline-block; max-width: 100%; overflow: hidden; text-overflow: ellipsis; vertical-align: middle;
 }
 .shipping-table tbody tr.shipping-row-editing td { background: #edf3ff; }
-.shipping-table td input {
+.shipping-table td input, .shipping-table td textarea {
   width: 100%; min-width: 0; min-height: 27px; margin: 0; padding: 2px 4px;
   font-size: 12px; border-radius: 3px;
 }
-.shipping-table td input:focus { box-shadow: inset 0 0 0 1px var(--accent); }
+.shipping-table td textarea { display: block; resize: vertical; min-height: 42px; }
+.shipping-table td input:focus, .shipping-table td textarea:focus { box-shadow: inset 0 0 0 1px var(--accent); }
+.shipping-table .shipping-paste-row td { background: #f5f8fe; }
+.shipping-table td.shipping-cell-selected { box-shadow: inset 0 0 0 2px var(--accent); background: #eef4ff; }
+.shipping-paste-hint { margin: 0 0 8px; font-size: 12px; }
 .shipping-table .shipping-row-action { text-align: center; }
 .shipping-table .shipping-row-action button { min-height: 24px; padding: 2px 6px; }
 .shipping-table .shipping-row-action button + button { margin-left: 3px; }
@@ -55,6 +59,32 @@
   font-size: 12px; font-weight: 600; white-space: nowrap;
 }
 .shipping-status.sent { color: #145838; background: #e0f3e7; }
+.shipping-source { display: inline-block; padding: 2px 7px; border-radius: 4px; font-weight: 600; white-space: nowrap; }
+.shipping-source.amber { background: #fff1cd; color: #704609; }
+.shipping-source.green { background: #e0f4e7; color: #1b603f; }
+.shipping-source.violet { background: #eee5ff; color: #5d3596; }
+.shipping-source.rose { background: #ffe9eb; color: #923549; }
+.shipping-source.blue { background: #e3efff; color: #24569a; }
+.shipping-source.teal { background: #dcf4f0; color: #18665d; }
+.shipping-source.slate { background: #eaf0f6; color: #485b75; }
+.shipping-carrier-tags { display: inline-flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
+.shipping-table .shipping-carrier-tags { flex-wrap: nowrap; white-space: nowrap; }
+.shipping-carrier-trigger {
+  display: flex; align-items: center; justify-content: space-between; gap: 4px;
+  width: 100%; min-height: 28px; padding: 2px 5px; border: 1px solid var(--border);
+  border-radius: 4px; background: #fff; text-align: left;
+}
+.shipping-carrier-trigger > span { overflow: hidden; }
+.shipping-carrier-trigger svg { flex-shrink: 0; }
+.shipping-carrier-menu {
+  position: fixed; z-index: 110; display: grid; gap: 5px;
+  padding: 7px; border: 1px solid var(--border); border-radius: 6px; background: #fff;
+  box-shadow: 0 8px 24px #23385925;
+}
+.shipping-carrier-options { overflow-y: auto; max-height: min(160px, 24dvh); }
+.shipping-carrier-options label { display: flex; align-items: center; gap: 6px; padding: 4px; cursor: pointer; }
+.shipping-carrier-options label:hover { background: #f3f7ff; }
+.shipping-carrier-options input { width: 15px; height: 15px; min-height: 0; flex: 0 0 auto; }
 .shipping-device-picker h3 { margin-bottom: 7px; }
 .shipping-details { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px 14px; margin: 9px 0; }
 .shipping-details dt { color: var(--muted); font-size: 12px; }
@@ -72,6 +102,12 @@
 .shipping-import-report { margin-top: 10px; }
 .shipping-detail-section { border-top: 1px solid var(--border); padding: 10px 0; margin-top: 8px; }
 .shipping-detail-section h3 { font-size: 14px; }
+.shipping-record-fields .shipping-details { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 16px; }
+.shipping-record-fields .shipping-details > div {
+  display: grid; grid-template-columns: minmax(80px, 108px) minmax(0, 1fr); align-items: baseline; gap: 8px;
+  padding: 6px 4px; border-bottom: 1px solid #edf0f5;
+}
+.shipping-record-fields .shipping-details dd { margin: 0; }
 .shipping-detail-back { margin-bottom: 8px; }
 .shipping-detail-empty { margin-top: 12px; }
 @media (min-width: 761px) {
@@ -84,6 +120,8 @@
 }
 @media (max-width: 620px) {
   .shipping-details { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .shipping-record-fields .shipping-details { grid-template-columns: minmax(0, 1fr); }
+  .shipping-toolbar .column-visibility-menu { left: 0; right: auto; }
   .shipping-toolbar form { width: 100%; }
   .shipping-toolbar form input { flex: 1 1 100%; }
 }

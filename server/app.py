@@ -115,8 +115,9 @@ def init_db(directory=None, bootstrap=None):
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(projects)')}:
             db.execute('ALTER TABLE projects ADD COLUMN deleted_at TEXT '
                        'CHECK(deleted_at IS NULL OR archived_at IS NOT NULL)')
-        for statement in (*inspection.SCHEMA, *shipping.SCHEMA):
+        for statement in inspection.SCHEMA:
             db.execute(statement)
+        shipping.initialize(db, version)
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(inspection_records)')}:
             db.execute('ALTER TABLE inspection_records ADD COLUMN deleted_at TEXT')
         if version == 12:
@@ -654,7 +655,8 @@ def stage_restore(archive_path, directory):
             if version >= 10:
                 project_tables += ('project_covers',)
             inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
-            shipping_tables = shipping.TABLES if version >= shipping.VERSION else ()
+            shipping_tables = (shipping.TABLES if version >= shipping.CREATED_AT_VERSION else
+                               shipping.LEGACY_TABLES if version >= shipping.VERSION else ())
             required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *inspection_tables, *shipping_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
@@ -677,6 +679,8 @@ def stage_restore(archive_path, directory):
                         optional.add('deleted_at')
                     if table == 'inspection_records' and version < 13:
                         optional.add('deleted_at')
+                    if table == 'shipping_ks_orders' and version < shipping.CREATED_AT_VERSION:
+                        optional.add('created_at')
                     if not set(target_columns) - optional <= source_columns:
                         raise Problem('备份数据结构不完整')
                     columns = ','.join(name for name in target_columns if name in source_columns)
@@ -684,6 +688,8 @@ def stage_restore(archive_path, directory):
                     db.executemany(f'INSERT INTO {table}({columns}) VALUES({",".join("?" for _ in columns.split(","))})', records)
                 if version == 12:
                     inspection.backfill_from_records(db)
+                if shipping.VERSION <= version < shipping.CREATED_AT_VERSION:
+                    shipping.fill_created_at(db)
                 db.execute("DELETE FROM settings WHERE key='password'")
                 if version >= 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                     raise Problem('备份中没有管理员账户')
@@ -1031,6 +1037,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(shipping.get_shipment(db, project_id, record_path[1]))
                 if resource == 'devices':
                     return self.send(shipping.find_devices(db, project_id, query))
+                if resource == 'carriers':
+                    return self.send(shipping.list_carriers(db, project_id))
                 if resource == 'device-records':
                     serial = shipping.string(query.get('serial'), 100)
                     return self.send(shipping.for_device(db, project_id, serial))
@@ -1057,6 +1065,25 @@ class Handler(BaseHTTPRequestHandler):
                     log_activity(db, self.user, '导入 KS 订单', '', 'KS 发货信息',
                                  f"新增 {report['added']} 条，更新 {report['updated']} 条")
             return self.send(report)
+        if (resource == 'orders/paste' and method == 'POST') or (order_path and method == 'PUT'):
+            self.require_admin()
+            data = self.body()
+            if not isinstance(data, dict):
+                raise Problem('KS 订单数据格式无效')
+            with FILE_LOCK, transaction() as db:
+                self.inspection_writer(db, project_id)
+                self.require_admin()
+                if order_path:
+                    result = shipping.edit_order(db, project_id, order_path[1], data.get('version'), data.get('details'), now())
+                    log_activity(db, self.user, '编辑 KS 订单', result['id'], 'Backer #' + result['backer'])
+                else:
+                    result = shipping.paste_orders(db, project_id, data, now(), uid)
+                    if result['added'] or result['updated']:
+                        log_activity(db, self.user, '粘贴 KS 订单', '', 'KS 发货信息',
+                                     f"新增 {result['added']} 条，更新 {result['updated']} 条")
+                if order_path or result['added'] or result['updated']:
+                    touch_project(db)
+            return self.send(result)
         if (resource == 'records' and method == 'POST') or (record_path and method == 'PUT'):
             data = self.body()
             if not isinstance(data, dict):

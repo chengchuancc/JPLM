@@ -58,6 +58,18 @@ export function ColumnVisibility({
   hidden: Column[];
   onChange: (hidden: Column[]) => void;
 }) {
+  return <FieldVisibility
+    columns={(["code", ...columns, "actions"] as Column[]).map((key) => ({
+      key, label: fields[key][0], fixed: key === "code" || key === "actions",
+    }))}
+    hidden={hidden} onChange={onChange} />;
+}
+
+export function FieldVisibility<Key extends string>({ columns, hidden, onChange }: {
+  columns: { key: Key; label: string; fixed?: boolean }[];
+  hidden: Key[];
+  onChange: (hidden: Key[]) => void;
+}) {
   const menu = useRef<HTMLDetailsElement>(null);
   useEffect(() => {
     const dismiss = (event: PointerEvent) => {
@@ -94,8 +106,7 @@ export function ColumnVisibility({
           </button>
         </div>
         <div className="column-visibility-list">
-          {(["code", ...columns, "actions"] as Column[]).map((id) => {
-            const fixed = id === "code" || id === "actions";
+          {columns.map(({ key: id, label, fixed }) => {
             return (
               <label key={id}>
                 <input
@@ -110,7 +121,7 @@ export function ColumnVisibility({
                     )
                   }
                 />
-                {fields[id][0]}
+                {label}
                 {fixed && <span>固定</span>}
               </label>
             );
