@@ -596,6 +596,59 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(self.stock(),4);self.move('入库',6,purchase_line_id=line)
         self.assertEqual(self.state()['purchase_lines'][0]['received'],10)
         self.assertEqual(self.stock(),10)
+    def test_movement_edit_reconciles_receipts_and_rejects_negative_history(self):
+        self.request('purchases', 'POST', {
+            'supplier_id': self.supplier_for(self.part), 'date': '2026-11-06',
+            'lines': [{'part_id': self.part, 'qty': 15, 'price': 2}],
+        })
+        line = self.state()['purchase_lines'][0]['id']
+        receipt = self.move('入库', 10, purchase_line_id=line)['id']
+        self.move('出库', 9)
+        self.move('入库', 8)
+        before = self.state()
+        path = 'movements/' + receipt
+        self.request(path, 'PUT', {'qty': 8}, 409)
+        self.request(path, 'PUT', {'qty': 16}, 400)
+        self.assertEqual(self.state(), before)
+        self.request(path, 'PUT', {'qty': 12, 'reason': '核对后修正', 'expected': before['movements'][0]})
+        self.request(path, 'PUT', {'qty': 11, 'expected': before['movements'][0]}, 409)
+        state = self.state()
+        self.assertEqual([m['balance'] for m in state['movements']], [12, 3, 11])
+        self.assertEqual(state['purchase_lines'][0]['received'], 12)
+        self.assertEqual(self.stock(), 11)
+        self.assertEqual(state['movements'][0]['code'], before['movements'][0]['code'])
+        self.assertEqual(state['movements'][0]['created_at'], before['movements'][0]['created_at'])
+        self.assertEqual(self.request('activity')['items'][0]['action'], '修改库存流水')
+        self.request(path, 'PUT', {'purchase_line_id': None})
+        self.assertEqual(self.state()['purchase_lines'][0]['received'], 0)
+        self.assertEqual(self.stock(), 11)
+
+    def test_movement_edit_can_change_material_and_type(self):
+        other = self.request('parts', 'POST', {'name': '另一个库存物料'})['id']
+        self.move('入库', 6)
+        self.move('入库', 3, part_id=other)
+        correction = self.move('入库', 4)['id']
+        self.move('出库', 2)
+        self.move('入库', 7, part_id=other)
+        self.request('movements/' + correction, 'PUT', {'part_id': other, 'type': '出库', 'qty': 1})
+        state = self.state()
+        self.assertEqual([m['balance'] for m in state['movements']], [6, 3, 2, 4, 9])
+        self.assertEqual({p['id']: p['stock'] for p in state['parts']}, {self.part: 4, other: 9})
+
+    def test_movement_edit_validates_linked_returns(self):
+        product = self.product()
+        self.move('入库', 8)
+        out = self.move('出库', 3)['id']
+        returned = self.move('退库', 2, original_id=out)['id']
+        later = self.move('出库', 1)['id']
+        self.request('movements/' + out, 'PUT', {'qty': 1}, 409)
+        self.request('movements/' + out, 'PUT', {'type': '报废', 'reason': '错误修改'}, 409)
+        self.request('movements/' + returned, 'PUT', {'original_id': later}, 400)
+        self.request('movements/' + returned, 'PUT', {'qty': 3})
+        self.request('movements/' + out, 'PUT', {'product_id': product})
+        self.assertEqual(self.state()['movements'][2]['product_id'], product)
+        self.assertEqual(self.stock(), 7)
+
     def test_supplier_links_allow_multiple_records_without_prices(self):
         first, second = self.supplier(), self.supplier()
         other_part = self.request('parts', 'POST', {'name': '另一个物料'})['id']

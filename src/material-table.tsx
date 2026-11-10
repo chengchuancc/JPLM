@@ -18,7 +18,7 @@ const fields = {
   stock: ["库存", 82],
   custodian: ["物料管理员", 126],
   min_stock: ["最低库存", 96],
-  location: ["库位", 100],
+  location: ["仓库位置", 112],
   reference: ["位号", 108],
   notes: ["备注", 168],
   level: ["级别", 112],

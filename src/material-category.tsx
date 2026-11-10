@@ -14,8 +14,9 @@ export function MaterialCategory({ options, ...props }: PickerProps) {
   return <TableOptionPicker {...props} choices={choices} allowNew />;
 }
 
-export function TableOptionPicker({ label, value, choices, disabled, autoOpen, onChange, onDismiss, allowNew }:
-  Omit<PickerProps, "options"> & { choices: Choice[]; allowNew?: boolean }) {
+export function TableOptionPicker({ label, value, choices, disabled, autoOpen, onChange, onDismiss, allowNew,
+  searchLabel = "搜索或新增物料类别", searchPlaceholder = "搜索或新增类别" }:
+  Omit<PickerProps, "options"> & { choices: Choice[]; allowNew?: boolean; searchLabel?: string; searchPlaceholder?: string }) {
   const [position, setPosition] = useState<CSSProperties>();
   const [query, setQuery] = useState("");
   const trigger = useRef<HTMLButtonElement>(null);
@@ -83,7 +84,7 @@ export function TableOptionPicker({ label, value, choices, disabled, autoOpen, o
         if (buttons[next]) { event.preventDefault(); buttons[next].focus(); }
       }
     }}>
-      {allowNew && <input ref={input} aria-label="搜索或新增物料类别" placeholder="搜索或新增类别" maxLength={64}
+      {allowNew && <input ref={input} aria-label={searchLabel} placeholder={searchPlaceholder} maxLength={64}
         value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => {
           if (event.key === "Enter" && !event.nativeEvent.isComposing) {
             event.preventDefault(); if (term) select(exact?.value || term);

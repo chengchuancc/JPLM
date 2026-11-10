@@ -1672,6 +1672,7 @@ function Workspace({
   }, []);
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("全部产品");
+  const [locationFilter, setLocationFilter] = useState("");
   const [materialLevel, setMaterialLevel] = useState(1);
   const [hiddenColumns, setHiddenColumns] = useState<Record<string, Column[]>>(
     () => {
@@ -1767,7 +1768,7 @@ function Workspace({
     const t = setTimeout(() => setToast(""), 4000);
     return () => clearTimeout(t);
   }, [toast]);
-  const readOnlyModal = modal && ["scan", "qr", "preview", "material-files", "deleted-parts"].includes(modal.kind);
+  const readOnlyModal = modal && ["scan", "qr", "preview", "material-files", "deleted-parts", "inventory-part"].includes(modal.kind);
   useEffect(() => {
     const hasDraft = !!projectId && (!!choice || (!!modal && !readOnlyModal));
     draftOpen.current = hasDraft;
@@ -1855,6 +1856,7 @@ function Workspace({
   const productHasMovements =
     !!product && state.movements.some((row) => row.product_id === product.id);
   const part = findPart(detail);
+  const inventoryPart = modal?.kind === "inventory-part" ? findPart(modal.item.id) : undefined;
   const partBomLines = part ? state.bom_lines.filter((line) => line.part_id === part.id) : [];
   const partBomProducts = [...new Set(partBomLines.map((line) =>
     state.bom_versions.find((item) => item.id === line.version_id)?.product_id,
@@ -1910,10 +1912,15 @@ function Workspace({
       ))}
     </div>
   );
+  const warehouseLocations = [...new Set(state.parts.map((p) => p.location).filter(Boolean))]
+    .sort((a, b) => a.localeCompare(b, "zh-CN", { numeric: true }));
+  const locationChoices = warehouseLocations.map((value) => ({ value, label: value }));
+  const inventoryLocation = warehouseLocations.includes(locationFilter) ? locationFilter : "";
   const visibleParts = state.parts.filter(
     (p) =>
       p.material_level === materialLevel &&
       matchesCategory(view, p) &&
+      (view !== "inventory" || !inventoryLocation || p.location === inventoryLocation) &&
       (materialLevel !== 2 ||
         !parentFilter ||
         (parentFilter === "unlinked"
@@ -1956,6 +1963,9 @@ function Workspace({
   function openMaterial(id: string, section = "info") {
     go("parts", id);
     setTab(section);
+  }
+  function openInventoryPart(id: string) {
+    setModal({ kind: "inventory-part", item: { id } });
   }
   function parentsCell(p: Part) {
     return (
@@ -2025,16 +2035,17 @@ function Workspace({
         label={p.name + " " + label}
         value={p[field]}
         type={field === "price" || field === "min_stock" ? "number" : "text"}
-        options={options}
+        options={field === "location" ? [{ value: "", label: "未设置" }, ...locationChoices] : options}
         categoryOptions={field === "category" ? state.material_categories : undefined}
+        createOptionLabel={field === "location" ? "搜索或新增库位" : undefined}
         save={(value) => savePart(p.id, field, value)}
       />
     );
   }
-  function baseMaterialCells(p: Part) {
+  function baseMaterialCells(p: Part, open = openMaterial) {
     return {
       code: (
-        <button className="text-link mono" onClick={() => openMaterial(p.id)}>
+        <button className="text-link mono" onClick={() => open(p.id)}>
           {p.code}
         </button>
       ),
@@ -2043,7 +2054,7 @@ function Workspace({
         <button
           className="text-link material-name"
           title={p.name}
-          onClick={() => openMaterial(p.id)}
+          onClick={() => open(p.id)}
         >
           {p.name}
           {p.deleted_at && "（已删除）"}
@@ -2098,7 +2109,7 @@ function Workspace({
       </a>
     ) : null;
   }
-  function inventoryRowActions(p: Part) {
+  function inventoryRowActions(p: Part, labeled = false) {
     return [
       { label: "入库", icon: ArrowDownToLine },
       { label: "出库", icon: ArrowUpFromLine },
@@ -2107,10 +2118,14 @@ function Workspace({
     ].map(({ label, icon: Icon }) => (
       <button
         key={label}
+        type="button"
+        className={labeled ? "btn small" : undefined}
         title={label}
+        aria-label={label}
         onClick={() => startInventory(label, p)}
       >
         <Icon size={15} />
+        {labeled && label}
       </button>
     ));
   }
@@ -2267,7 +2282,7 @@ function Workspace({
     { name: "unit", label: "单位" },
     { name: "price", label: "单价", type: "number" },
     { name: "min_stock", label: "最低库存", type: "number" },
-    { name: "location", label: "库位" },
+    { name: "location", label: "仓库位置" },
     { name: "notes", label: "备注", type: "textarea", wide: true },
   ];
   const supplierFields: Field[] = [
@@ -2305,6 +2320,7 @@ function Workspace({
               <th>经办人</th>
               <th>用途 / 原因</th>
               <th>时间</th>
+              {!archived && <th>操作</th>}
             </tr>
           </thead>
           <tbody>
@@ -2328,7 +2344,10 @@ function Workspace({
                     <td>
                       <button
                         className="text-link"
-                        onClick={() => go("parts", m.part_id)}
+                        onClick={() => {
+                          if (view === "inventory") openInventoryPart(m.part_id);
+                          else go("parts", m.part_id);
+                        }}
                       >
                         {p?.name}
                       </button>
@@ -2343,7 +2362,10 @@ function Workspace({
                       {po ? (
                         <button
                           className="text-link"
-                          onClick={() => go("purchases", po.id)}
+                          onClick={() => {
+                            setModal(null);
+                            go("purchases", po.id);
+                          }}
                         >
                           {po.code}
                         </button>
@@ -2363,6 +2385,12 @@ function Workspace({
                     <td>{userName(m.handler_id)}</td>
                     <td>{m.reason || "—"}</td>
                     <td className="muted nowrap">{datetime(m.created_at)}</td>
+                    {!archived && <td>{p && !p.deleted_at && (
+                      <Button type="button" small aria-label={"编辑流水 " + m.code}
+                        onClick={() => setModal({ kind: "movement", item: m })}>
+                        <Pencil size={13} />编辑
+                      </Button>
+                    )}</td>}
                   </tr>
                 );
               })}
@@ -3185,16 +3213,17 @@ function Workspace({
                     {displayFields(view, libraryColumns)}
                   </div>
                   {view === "inventory" && (
-                    <select
-                      className="stock-filter"
-                      aria-label="库存筛选"
-                      value={filter}
-                      onChange={(e) => setFilter(e.target.value)}
-                    >
-                      {["全部", "低库存", "无库存"].map((t) => (
-                        <option key={t}>{t}</option>
-                      ))}
-                    </select>
+                    <>
+                      <select className="stock-filter" aria-label="库存筛选" value={filter}
+                        onChange={(e) => setFilter(e.target.value)}>
+                        {["全部", "低库存", "无库存"].map((t) => <option key={t}>{t}</option>)}
+                      </select>
+                      <select className="stock-filter" aria-label="筛选仓库位置" value={inventoryLocation}
+                        onChange={(e) => setLocationFilter(e.target.value)}>
+                        <option value="">全部库位</option>
+                        {warehouseLocations.map((location) => <option key={location}>{location}</option>)}
+                      </select>
+                    </>
                   )}
                   <Button small onClick={() => setModal({ kind: "scan" })}>
                     <ScanLine size={16} />
@@ -3211,7 +3240,7 @@ function Workspace({
                           单位: p.unit,
                           库存: p.stock,
                           单价: p.price,
-                          库位: p.location,
+                          仓库位置: p.location,
                         })),
                         "物料库存",
                       )
@@ -3230,9 +3259,9 @@ function Workspace({
                 rows={visibleParts.map((material) => ({
                   id: material.id,
                   cells: {
-                    ...baseMaterialCells(material),
+                    ...baseMaterialCells(material, view === "inventory" ? openInventoryPart : openMaterial),
                     min_stock: materialCell(material, "min_stock", "最低库存"),
-                    location: materialCell(material, "location", "库位"),
+                    location: materialCell(material, "location", "仓库位置"),
                     notes: materialCell(material, "notes", "备注"),
                     level: materialCell(material, "material_level", "级别", [
                       { value: "1", label: "一级物料" },
@@ -4839,15 +4868,36 @@ function Workspace({
               />
             </Dialog>
           )}
+          {inventoryPart && (
+            <Dialog title="库存详情" onClose={() => setModal(null)} wide>
+              <div className="stock-hint">
+                <MaterialThumbnail imageId={files("parts", inventoryPart.id).find((file) => file.kind === "image")?.id}
+                  alt={inventoryPart.name + "物料图片"} className="stock-material-photo" />
+                <div className="stock-material-info">
+                  <strong>{inventoryPart.name}</strong>
+                  <small className="mono">{inventoryPart.code}</small>
+                </div>
+              </div>
+              <dl className="info-list inventory-detail-info">
+                <dt>当前库存</dt><dd>{amount(inventoryPart.stock)} {inventoryPart.unit}</dd>
+                <dt>规格 / 封装</dt><dd>{inventoryPart.spec || "—"}</dd>
+                <dt>最低库存</dt><dd>{amount(inventoryPart.min_stock)} {inventoryPart.unit}</dd>
+                <dt>仓库位置</dt><dd>{materialCell(inventoryPart, "location", "仓库位置")}</dd>
+              </dl>
+              {!archived && <div className="inventory-detail-actions">{inventoryRowActions(inventoryPart, true)}</div>}
+              <h3>库存流水</h3>
+              {movementTable(state.movements.filter((row) => row.part_id === inventoryPart.id).slice(-10))}
+            </Dialog>
+          )}
           {modal.kind === "movement" && (
-            <Dialog title="库存操作" onClose={() => setModal(null)}>
+            <Dialog title={modal.item.id ? "编辑库存流水" : "库存操作"} onClose={() => setModal(null)}>
               <MovementForm
                 state={state}
                 initial={modal.item}
                 onCancel={() => setModal(null)}
-                submit={(d) =>
-                  mutate("movements", "POST", d, "库存已更新，流水已记录")
-                }
+                submit={(d) => modal.item.id
+                  ? mutate("movements/" + modal.item.id, "PUT", d, "库存流水已更新")
+                  : mutate("movements", "POST", d, "库存已更新，流水已记录")}
               />
             </Dialog>
           )}
@@ -5272,7 +5322,7 @@ function MovementForm({
   onCancel,
 }: {
   state: State;
-  initial: any;
+  initial: Partial<Movement>;
   submit: (d: any) => Promise<void>;
   onCancel: () => void;
 }) {
@@ -5283,11 +5333,16 @@ function MovementForm({
   const [qty, setQty] = useState(String(initial.qty || ""));
   const [product, setProduct] = useState(initial.product_id || "");
   const [handler, setHandler] = useState(initial.handler_id || "");
-  const [reason, setReason] = useState("");
+  const [reason, setReason] = useState(initial.reason || "");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const p = state.parts.find((p) => p.id === part);
-  const originals = state.movements
+  const image = p && state.files.find((file) =>
+    file.owner_type === "parts" && file.owner_id === p.id && file.kind === "image",
+  );
+  const position = state.movements.findIndex((movement) => movement.id === initial.id);
+  const priorMovements = position < 0 ? state.movements : state.movements.slice(0, position);
+  const originals = priorMovements
     .filter((m) => m.type === "出库" && m.part_id === part)
     .map((m) => ({
       ...m,
@@ -5295,15 +5350,18 @@ function MovementForm({
         Math.round(
           (m.qty -
             state.movements
-              .filter((r) => r.original_id === m.id)
+              .filter((r) => r.original_id === m.id && r.id !== initial.id)
               .reduce((s, r) => s + r.qty, 0)) *
             1e6,
         ) / 1e6,
     }))
     .filter((m) => m.remaining > 0);
-  const sources = state.purchase_lines.filter(
-    (l) => l.part_id === part && l.received < l.qty,
-  );
+  const sources = state.purchase_lines.filter((line) => line.part_id === part).map((line) => ({
+    ...line,
+    remaining: Math.round((line.qty - line.received +
+      (line.id === initial.purchase_line_id && initial.id ? initial.qty || 0 : 0)) * 1e6) / 1e6,
+  })).filter((line) => line.remaining > 0);
+  const handlers = [...state.users, ...state.former_users.filter((user) => user.id === initial.handler_id)];
   return (
     <form
       onSubmit={async (e) => {
@@ -5312,6 +5370,7 @@ function MovementForm({
         setError("");
         try {
           await submit({
+            ...(initial.id ? { expected: initial } : {}),
             type,
             part_id: part,
             qty,
@@ -5347,7 +5406,7 @@ function MovementForm({
       </div>
       <div className="form-grid">
         <PersonSelect
-          users={state.users}
+          users={handlers}
           label="经办人"
           value={handler}
           onChange={setHandler}
@@ -5367,11 +5426,12 @@ function MovementForm({
         />
         {p && (
           <div className="stock-hint wide-field">
-            当前库存{" "}
-            <strong>
-              {amount(p.stock)} {p.unit}
-            </strong>
-            <span>{p.spec}</span>
+            <MaterialThumbnail imageId={image?.id} alt={p.name + "物料图片"} className="stock-material-photo" />
+            <div className="stock-material-info">
+              当前库存 <strong>{amount(p.stock)} {p.unit}</strong>
+              {p.spec && <small>{p.spec}</small>}
+              {p.location && <small>仓库位置 {p.location}</small>}
+            </div>
           </div>
         )}
         <label>
@@ -5411,14 +5471,14 @@ function MovementForm({
               onChange={(e) => {
                 setSource(e.target.value);
                 const l = sources.find((l) => l.id === e.target.value);
-                if (l) setQty(String(Math.max(0, l.qty - l.received)));
+                if (l) setQty(String(l.remaining));
               }}
             >
               <option value="">独立入库</option>
               {sources.map((l) => (
                 <option key={l.id} value={l.id}>
                   {state.purchases.find((p) => p.id === l.purchase_id)?.code} ·
-                  待入 {amount(l.qty - l.received)}
+                  {initial.id ? "可入" : "待入"} {amount(l.remaining)}
                 </option>
               ))}
             </select>
@@ -5472,7 +5532,7 @@ function MovementForm({
         </Button>
         <Button primary type="submit" disabled={busy}>
           {busy ? <Loader2 size={16} className="spin" /> : <Check size={16} />}
-          确认{type}
+          {initial.id ? "保存修改" : "确认" + type}
         </Button>
       </div>
     </form>
@@ -5526,13 +5586,14 @@ function SearchPart({
 }
 const PURCHASE_MATERIAL_PAGE_SIZE = 40;
 
-function PurchaseMaterialPhoto({ imageId }: { imageId?: string }) {
+function MaterialThumbnail({ imageId, alt = "", className }: { imageId?: string; alt?: string; className: string }) {
+  const [failedImage, setFailedImage] = useState<string>();
   return (
-    <span className="thumb purchase-material-photo" aria-hidden="true">
-      {imageId ? (
-        <img src={fileUrl(imageId)} alt="" loading="lazy" />
+    <span className={"thumb " + className}>
+      {imageId && imageId !== failedImage ? (
+        <img src={fileUrl(imageId)} alt={alt} loading="lazy" onError={() => setFailedImage(imageId)} />
       ) : (
-        <Package size={17} strokeWidth={1.4} />
+        <Package size={17} strokeWidth={1.4} aria-hidden="true" />
       )}
     </span>
   );
@@ -5669,7 +5730,7 @@ function PurchaseMaterialPicker({
               key={part.id}
               onClick={() => onToggle(part.id)}
             >
-              <PurchaseMaterialPhoto imageId={photos.get(part.id)} />
+              <MaterialThumbnail imageId={photos.get(part.id)} className="purchase-material-photo" />
               <span className="purchase-material-name">
                 <strong>{part.name}</strong>
                 <small>{[part.code, part.spec, part.external_code].filter(Boolean).join(" · ")}</small>
@@ -5827,7 +5888,7 @@ function PurchaseForm({
             return (
               <div className="purchase-form-line" key={line.partId}>
                 <div className="purchase-selected-material">
-                  <PurchaseMaterialPhoto imageId={photos.get(part.id)} />
+                  <MaterialThumbnail imageId={photos.get(part.id)} className="purchase-material-photo" />
                   <span className="purchase-material-name">
                     <strong>{part.name}</strong>
                     <small>
@@ -6442,6 +6503,7 @@ function InlineCell({
   required = false,
   options,
   categoryOptions,
+  createOptionLabel,
 }: {
   label: string;
   value: string | number;
@@ -6451,6 +6513,7 @@ function InlineCell({
   required?: boolean;
   options?: { value: string; label: string }[];
   categoryOptions?: string[];
+  createOptionLabel?: string;
 }) {
   const { archived } = useContext(ProjectContext);
   const [editing, setEditing] = useState(false);
@@ -6522,6 +6585,7 @@ function InlineCell({
         autoOpen onDismiss={() => { if (!committing.current) setEditing(false); }}
         onChange={(value) => { setDraft(value); void commit(value); }} /> : options ? (
         <TableOptionPicker label={label} value={draft} choices={options} disabled={busy} autoOpen
+          allowNew={!!createOptionLabel} searchLabel={createOptionLabel} searchPlaceholder={createOptionLabel}
           onDismiss={() => { if (!committing.current) setEditing(false); }}
           onChange={(value) => { setDraft(value); void commit(value); }} />
       ) : (

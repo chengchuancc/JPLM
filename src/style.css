@@ -1465,10 +1465,11 @@ td .text-link:hover {
 .stock-hint strong {
   color: #607452;
 }
-.stock-hint span {
-  margin-left: auto;
-  font-size: 10px;
-}
+.stock-material-photo { width: 52px; height: 52px; padding: 3px; }
+.stock-material-info { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.stock-material-info small { display: block; font-size: 10px; }
+.inventory-detail-info { margin-top: 12px; gap: 8px 10px; align-items: center; }
+.inventory-detail-actions { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
 .operation-switch {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -2660,11 +2661,6 @@ td .text-link:hover {
   .stock-hint {
     font-size: 10px;
     flex-wrap: wrap;
-  }
-  .stock-hint span {
-    font-size: 9px;
-    flex-basis: 100%;
-    margin: 0;
   }
   .purchase-line-header,
   .purchase-form-line {

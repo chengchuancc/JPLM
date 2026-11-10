@@ -460,7 +460,58 @@ def log_activity(db, actor, action, subject_id, subject, detail=''):
         db.execute('INSERT INTO activity(actor_id,actor_name,action,subject_id,subject,detail,created_at,project_id) VALUES(?,?,?,?,?,?,?,?)',
                    (actor['id'], actor['name'], action, subject_id, subject, detail, now(), db.project_id))
 
-def record_movement(db, data, actor=None):
+MOVEMENT_FIELDS = ('type', 'part_id', 'qty', 'product_id', 'purchase_line_id', 'original_id', 'reason', 'handler_id')
+
+
+def movement_delta(kind, qty):
+    return qty if kind in ('入库', '退库') else -qty
+
+
+def adjust_stock(db, part, delta, after=None):
+    balance = round(part['stock'] + delta, 6)
+    if balance < 0:
+        raise Problem('库存不足，无法完成此操作')
+    if delta:
+        if after is not None:
+            # 按登记顺序修正后续结存，保留编辑位置之前的历史。
+            params = (db.project_id, part['id'], after)
+            lowest = db.execute("""SELECT code,balance FROM movements WHERE project_id=? AND part_id=?
+                AND rowid>? ORDER BY balance LIMIT 1""", params).fetchone()
+            if lowest and round(lowest['balance'] + delta, 6) < 0:
+                raise Problem(f'修改后流水 {lowest["code"]} 的库存结存会为负数', 409)
+            db.execute("""UPDATE movements SET balance=ROUND(balance+?,6)
+                WHERE project_id=? AND part_id=? AND rowid>?""", (delta, *params))
+        db.execute('UPDATE parts SET stock=?,updated_at=? WHERE id=?', (balance, now(), part['id']))
+    return balance
+
+
+def movement_description(db, row, part):
+    text = f'{row["type"]} {part["code"]} {part["name"]} · {row["qty"]:g} {part["unit"]}'
+    if row['product_id']:
+        text += ' · 产品 ' + exists(db, 'products', row['product_id'])['name']
+    if row['purchase_line_id']:
+        line = exists(db, 'purchase_lines', row['purchase_line_id'])
+        text += ' · 采购单 ' + exists(db, 'purchases', line['purchase_id'])['code']
+    if row['original_id']:
+        text += ' · 原出库 ' + exists(db, 'movements', row['original_id'])['code']
+    if row['handler_id']:
+        text += ' · 经办人 ' + exists(db, 'users', row['handler_id'])['name']
+    if row['reason']:
+        text += ' · 用途 / 原因 ' + row['reason']
+    return text
+
+
+def record_movement(db, data, actor=None, *, movement_id=None):
+    old = exists(db, 'movements', movement_id) if movement_id else None
+    position = None
+    if old:
+        expected = data.get('expected')
+        if expected is not None and (not isinstance(expected, dict) or any(
+                key not in expected or expected[key] != old[key] for key in MOVEMENT_FIELDS)):
+            raise Problem('该流水已被修改，请刷新后重试', 409)
+        position = db.execute('SELECT rowid FROM movements WHERE id=?', (movement_id,)).fetchone()[0]
+        data = {**old, **data}
+
     kind = data.get('type')
     if kind not in ('入库','出库','退库','报废'): raise Problem('无效的库存操作')
     part = active_part(db, data.get('part_id'))
@@ -469,36 +520,89 @@ def record_movement(db, data, actor=None):
     original_id = data.get('original_id') or None
     product_id = data.get('product_id') or None
     if product_id: exists(db, 'products', product_id)
+
     if purchase_line:
         if kind != '入库': raise Problem('仅入库可以关联采购明细')
         line = exists(db, 'purchase_lines', purchase_line)
         if line['part_id'] != part['id']: raise Problem('采购物料与入库物料不一致')
-        if qty > round(line['qty'] - line['received'],6): raise Problem('入库数量超过待入库数量')
-        db.execute('UPDATE purchase_lines SET received=ROUND(received+?,6) WHERE id=?',(qty,purchase_line))
+    purchase_changes = {}
+    if old and old['purchase_line_id']:
+        purchase_changes[old['purchase_line_id']] = -old['qty']
+    if purchase_line:
+        purchase_changes[purchase_line] = purchase_changes.get(purchase_line, 0) + qty
+    for line_id, change in purchase_changes.items():
+        line = exists(db, 'purchase_lines', line_id)
+        received = round(line['received'] + change, 6)
+        if received > line['qty']: raise Problem('入库数量超过待入库数量')
+        if received < 0: raise Problem('采购明细的已入库数量不足，无法修改')
+        if change:
+            db.execute('UPDATE purchase_lines SET received=? WHERE id=?', (received, line_id))
+
     if original_id:
         if kind != '退库': raise Problem('只有退库可以关联原出库记录')
         original = exists(db, 'movements', original_id)
         if original['type'] != '出库' or original['part_id'] != part['id']: raise Problem('请选择该物料的原出库记录')
-        returned = db.execute("SELECT COALESCE(SUM(qty),0) FROM movements WHERE original_id=?",(original_id,)).fetchone()[0]
+        if old and db.execute('SELECT rowid FROM movements WHERE id=?', (original_id,)).fetchone()[0] >= position:
+            raise Problem('原出库记录必须早于退库记录')
+        returned = db.execute("""SELECT COALESCE(SUM(qty),0) FROM movements
+            WHERE original_id=? AND id<>?""", (original_id, movement_id or '')).fetchone()[0]
         if qty > round(original['qty'] - returned,6): raise Problem('退库数量超过原出库尚未退回的数量')
         product_id = original['product_id']
     if kind == '退库' and not original_id: raise Problem('退库需关联原出库记录')
-    reason = str(data.get('reason','')).strip()
+    if old and old['type'] == '出库':
+        returned = round(db.execute('SELECT COALESCE(SUM(qty),0) FROM movements WHERE original_id=?',
+                                    (movement_id,)).fetchone()[0], 6)
+        if returned and (kind != '出库' or old['part_id'] != part['id'] or qty < returned):
+            raise Problem(f'该流水已退库 {returned:g}，请先修正关联的退库记录', 409)
+        if returned and product_id != old['product_id']:
+            db.execute('UPDATE movements SET product_id=? WHERE original_id=?', (product_id, movement_id))
+
+    reason = str(data.get('reason') or '').strip()
     if kind == '报废' and not reason: raise Problem('请填写报废原因')
-    delta = qty if kind in ('入库','退库') else -qty
-    balance = round(part['stock'] + delta,6)
-    if balance < 0: raise Problem('库存不足，无法完成此操作')
+    handler_id = data.get('handler_id') or None
+    if old:
+        handler = old['handler_id'] if old['handler_id'] == handler_id else assign_user(db, handler_id)
+    else:
+        handler = assign_user(db, handler_id or (actor['id'] if actor else None))
+    delta = movement_delta(kind, qty)
+    values = dict(type=kind, part_id=part['id'], qty=qty, product_id=product_id, purchase_line_id=purchase_line,
+                  original_id=original_id, reason=reason, handler_id=handler)
+    if old:
+        if all(old[key] == value for key, value in values.items()):
+            return movement_id
+        old_part = part if old['part_id'] == part['id'] else active_part(db, old['part_id'])
+        old_delta = movement_delta(old['type'], old['qty'])
+        if old_part['id'] == part['id']:
+            balance = round(old['balance'] + delta - old_delta, 6)
+            adjust_stock(db, part, round(delta - old_delta, 6), position)
+        else:
+            # 用新物料下一条流水反推当时库存，兼容有期初库存的旧数据。
+            following = db.execute("""SELECT type,qty,balance FROM movements
+                WHERE project_id=? AND part_id=? AND rowid>? ORDER BY rowid LIMIT 1""",
+                (db.project_id, part['id'], position)).fetchone()
+            opening = following['balance'] - movement_delta(following['type'], following['qty']) if following else part['stock']
+            balance = round(opening + delta, 6)
+            adjust_stock(db, old_part, -old_delta, position)
+            adjust_stock(db, part, delta, position)
+        if balance < 0:
+            raise Problem('修改后该流水的库存结存会为负数', 409)
+        values['balance'] = balance
+        db.execute('UPDATE movements SET ' + ','.join(key+'=?' for key in values) + ' WHERE id=?',
+                   (*values.values(), movement_id))
+        before = movement_description(db, old, old_part)
+        after = movement_description(db, values, part)
+        log_activity(db, actor, '修改库存流水', part['id'], old['code'], before + ' → ' + after)
+        return movement_id
+
+    balance = adjust_stock(db, part, delta)
     mid = uid()
-    db.execute('UPDATE parts SET stock=?,updated_at=? WHERE id=?',(balance,now(),part['id']))
-    handler = assign_user(db, data.get('handler_id') or (actor['id'] if actor else None))
     code = next_code(db, 'ST')
-    insert_scoped(db, 'movements', dict(id=mid, code=code, type=kind, part_id=part['id'], qty=qty,
-                                      balance=balance, product_id=product_id, purchase_line_id=purchase_line,
-                                      original_id=original_id, reason=reason, created_at=now(), handler_id=handler))
+    insert_scoped(db, 'movements', dict(id=mid, code=code, balance=balance, created_at=now(), **values))
     handler_name = exists(db, 'users', handler)['name'] if handler else ''
     log_activity(db, actor, kind, part['id'], f"{part['code']} {part['name']}",
                  f'{code} · {qty:g} {part["unit"]} · 结余 {balance:g} · 经办人 {handler_name}')
     return mid
+
 
 def material_level(value):
     if str(value) not in ('1','2'): raise Problem('物料级别只能是一级或二级')
@@ -1712,7 +1816,9 @@ class Handler(BaseHTTPRequestHandler):
             set_material_children(db,id,d.get('child_ids'));return {'ok':True}
         if resource=='material-parents' and method=='PUT':
             set_material_parents(db,id,d.get('parent_ids'));return {'ok':True}
-        if resource=='movements' and method=='POST': return {'id':record_movement(db,d,self.user)}
+        if resource=='movements':
+            if method=='POST' and not id: return {'id':record_movement(db,d,self.user)}
+            if method=='PUT' and id: return {'id':record_movement(db,d,self.user,movement_id=id)}
         if resource=='demo' and method=='POST':
             self.require_admin()
             if any(db.execute(f'SELECT 1 FROM {t} WHERE project_id=? LIMIT 1', (db.project_id,)).fetchone()
@@ -1900,7 +2006,7 @@ class Handler(BaseHTTPRequestHandler):
                 code=old['code'] if same_classification else material_code(category,level,serial)
                 if old and code!=old['code']:
                     insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
-                values.update(code=code,material_serial=serial,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location','')),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
+                values.update(code=code,material_serial=serial,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location') or '').strip(),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
             else: values.update({k:str(d.get(k,'')) for k in ('contact','phone','email','address','notes')})
             if resource in RESPONSIBILITIES:
                 column = RESPONSIBILITIES[resource]
