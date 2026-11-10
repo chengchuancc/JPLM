@@ -1051,7 +1051,7 @@ const projectHome: WorkspaceRoute = { projectId: "", view: "projects", detail: "
 function readWorkspaceRoute(): WorkspaceRoute {
   const [top, id, view, detail] = location.hash.slice(1).split("/");
   if (top === "settings") return { ...projectHome, view: "settings" };
-  if (top === "global-shipping") return { ...projectHome, view: "global-shipping" };
+  if (top === "global-shipping") return { ...projectHome, view: "global-shipping", detail: /^[a-f0-9]{24}$/.test(id || "") ? id : "" };
   if (top === "projects" && id) {
     const valid = navs.some((nav) => nav.id === view) || view === "project-settings";
     return { projectId: id, view: valid ? view : "products", detail: valid ? detail || "" : "" };
@@ -1132,7 +1132,7 @@ function App() {
     };
   }, []);
   useEffect(() => {
-    if (route.projectId || !route.detail || !auth?.authenticated || auth.user?.must_change) return;
+    if (route.projectId || route.view === "global-shipping" || !route.detail || !auth?.authenticated || auth.user?.must_change) return;
     let active = true;
     api("resolve/" + route.view + "/" + encodeURIComponent(route.detail)).then(
       (record) => { if (active) navigate({ ...route, projectId: record.project_id }, true); },
@@ -1156,7 +1156,7 @@ function App() {
         </div>
       </div>
     );
-  if (!route.projectId && route.detail)
+  if (!route.projectId && route.detail && route.view !== "global-shipping")
     return <div className="loading-page"><BrandMark /><span>正在打开记录…</span></div>;
   const project = projects.find((item) => item.id === route.projectId);
   if (route.projectId && !project)
@@ -2428,7 +2428,7 @@ function Workspace({
               <ChevronRight size={14} />
             </>}
             <button onClick={() => go(view)}>{title}</button>
-            {detail && (
+            {detail && view !== "shipping" && view !== "global-shipping" && (
               <>
                 <ChevronRight size={14} />
                 <span className="current">
@@ -2503,7 +2503,8 @@ function Workspace({
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}
           {view === "global-shipping" && <Suspense fallback={<p className="muted">正在加载全局发货…</p>}>
-            <GlobalShipping request={api} projectRequest={(id) => (path, method, data) => projectRequest(id, path, method, data)}
+            <GlobalShipping key={detail} initialRecord={detail} request={api}
+              projectRequest={(id) => (path, method, data) => projectRequest(id, path, method, data)}
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}
           {view === "project-settings" && project && (

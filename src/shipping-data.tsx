@@ -17,7 +17,8 @@ export type Shipment = {
 };
 export const shipmentLabel = (row: Pick<Shipment, "reference" | "tracking">) =>
   row.reference || row.tracking || "发货记录";
-export type Page = { rows: (Order | Shipment)[]; total: number; page: number; page_size: number };
+export type Page = { rows: (Order | Shipment)[]; total: number; page: number; page_size: number;
+  location?: { id: string; ancestors: string[] } | null };
 export const path = "shipping/";
 export const contactFields = [
   ["name", "收件人"], ["phone", "电话"], ["email", "邮箱"], ["country", "国家 / 地区"],
@@ -83,6 +84,10 @@ export function DetailsList({ fields, details, showEmpty }: { fields: string[][]
 
 export function Tracking({ shipment }: { shipment: Pick<Shipment, "channel" | "tracking" | "details"> }) {
   if (!shipment.tracking) return <>—</>;
-  const address = "https://t.17track.net/en#nums=" + encodeURIComponent(shipment.tracking);
-  return <a className="text-link mono" href={address} target="_blank" rel="noreferrer">{shipment.tracking}</a>;
+  let address = "https://t.17track.net/en#nums=" + encodeURIComponent(shipment.tracking);
+  if (/^https?:\/\//i.test(shipment.tracking)) {
+    try { address = new URL(shipment.tracking).href; } catch { /* Use the tracking-number lookup. */ }
+  }
+  return <a className="text-link mono" href={address} title={shipment.tracking}
+    target="_blank" rel="noreferrer">{shipment.tracking}</a>;
 }

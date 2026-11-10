@@ -3,6 +3,7 @@ import csv
 import io
 import json
 import math
+import secrets
 from datetime import date, datetime, timezone
 
 from electronic_import import ElectronicBomError, normalized, read_csv, read_xlsx
@@ -202,14 +203,35 @@ def accessible_projects(db, user):
         )) ORDER BY name,id""", (user['role']=='admin', user['id']))}
 
 
+def check_order_reference(db, reference, projects, previous=''):
+    reference = string(reference, 150).lstrip('#').strip().lower()
+    if not reference or reference == previous.lstrip('#').strip().lower() or not projects:
+        return
+    marks = ','.join('?' for _ in projects)
+    if db.execute(f"""SELECT 1 FROM shipping_records s JOIN projects j ON j.id=s.project_id
+        WHERE s.channel='other' AND s.deleted_at IS NULL AND j.deleted_at IS NULL AND s.parent_id IS NULL
+          AND lower(trim(ltrim(trim(s.reference),'#')))=?
+          AND (s.project_id IN ({marks}) OR EXISTS (SELECT 1 FROM shipping_items i
+            WHERE i.project_id=s.project_id AND i.shipment_id=s.id AND i.product_project_id IN ({marks})))
+        LIMIT 1""", (reference, *projects, *projects)).fetchone():
+        raise ShippingError('订单号已存在，请编辑该订单或登记补发子订单', 409)
+
+
 def shipment_items(db, project, shipment, allowed=None):
-    return [dict(p) for p in db.execute("""SELECT i.product_project_id AS project_id,i.product_id,
+    result = []
+    for p in db.execute("""SELECT i.product_project_id AS project_id,i.product_id,
         coalesce(p.name,i.product_name) AS name,coalesce(p.code,i.product_code) AS code,
         j.name AS project_name,i.quantity,p.id IS NOT NULL AND j.deleted_at IS NULL AS available
         FROM shipping_items i JOIN projects j ON j.id=i.product_project_id
         LEFT JOIN products p ON p.project_id=i.product_project_id AND p.id=i.product_id
-        WHERE i.project_id=? AND i.shipment_id=? ORDER BY j.name,name,code""", (project, shipment))
-        if allowed is None or p['project_id'] in allowed]
+        WHERE i.project_id=? AND i.shipment_id=? ORDER BY j.name,name,code""", (project, shipment)):
+        if allowed is not None and p['project_id'] not in allowed:
+            continue
+        item = dict(p)
+        if item['product_id'].startswith('unknown:'):
+            item.update(legacy_key=item['product_id'], product_id=None)
+        result.append(item)
+    return result
 
 
 def save_shipment_items(db, row, items, writable, *, editable_project=None):
@@ -223,6 +245,18 @@ def save_shipment_items(db, row, items, writable, *, editable_project=None):
         if not isinstance(item, dict):
             raise ShippingError('发货商品格式无效')
         target, product = string(item.get('project_id'), 100), string(item.get('product_id'), 100)
+        unknown_name = ''
+        if not product:
+            unknown_name = string(item.get('name'), 150)
+            if not unknown_name:
+                raise ShippingError('请填写未关联商品的名称')
+            previous_key = string(item.get('legacy_key'), 100)
+            if previous_key.startswith('unknown:') and (target, previous_key) in previous:
+                product = previous_key
+            else:
+                product = 'unknown:' + secrets.token_hex(12)
+        elif product.startswith('unknown:'):
+            raise ShippingError('未关联商品格式无效')
         key = (target, product)
         quantity = item.get('quantity')
         if type(quantity) is not int or not 1 <= quantity <= 1000000000 or key in seen:
@@ -231,14 +265,17 @@ def save_shipment_items(db, row, items, writable, *, editable_project=None):
             raise ShippingError('请在全局发货中修改跨项目商品', 403)
         if target not in writable:
             raise ShippingError('无权修改该项目的发货商品', 403)
-        p = db.execute('SELECT name,code FROM products WHERE project_id=? AND id=?', key).fetchone()
-        if not p:
-            p = previous.get(key)
-            if not p:
-                raise ShippingError('产品不存在，请刷新后重试', 404)
-            name, code = p['product_name'], p['product_code']
+        if unknown_name:
+            name, code = unknown_name, ''
         else:
-            name, code = p
+            p = db.execute('SELECT name,code FROM products WHERE project_id=? AND id=?', key).fetchone()
+            if not p:
+                p = previous.get(key)
+                if not p:
+                    raise ShippingError('产品不存在，请刷新后重试', 404)
+                name, code = p['product_name'], p['product_code']
+            else:
+                name, code = p
         db.execute("""INSERT INTO shipping_items VALUES(?,?,?,?,?,?,?)
             ON CONFLICT(project_id,shipment_id,product_project_id,product_id)
             DO UPDATE SET quantity=excluded.quantity,product_name=excluded.product_name,product_code=excluded.product_code""",
@@ -260,7 +297,7 @@ def list_global_orders(db, user, query):
     page = page_number(query)
     if project and project not in allowed:
         raise ShippingError('项目不存在或无权访问', 404)
-    params = (user['role']=='admin', user['id'], project, project, project, term, term, term, term)
+    params = (user['role']=='admin', user['id'], project, project, project, term, term, term, term, term)
     cte = f"""WITH RECURSIVE allowed AS (
         SELECT id FROM projects j WHERE j.deleted_at IS NULL AND (? OR EXISTS (
             SELECT 1 FROM project_members m WHERE m.project_id=j.id AND m.user_id=?
@@ -268,11 +305,11 @@ def list_global_orders(db, user, query):
     ), tree(project_id,id,reference,root_id) AS (
         SELECT project_id,id,reference,id FROM shipping_records WHERE channel='other' AND parent_id IS NULL
         UNION ALL
-        SELECT s.project_id,s.id,CASE WHEN trim(t.reference)<>'' THEN t.reference ELSE s.reference END,t.root_id
+        SELECT s.project_id,s.id,t.reference,t.root_id
         FROM shipping_records s JOIN tree t ON t.project_id=s.project_id AND t.id=s.parent_id
         WHERE s.channel='other'
     ), packages AS (
-        SELECT s.project_id,s.id,s.reference,s.tracking,s.shipped_on,s.updated_at,s.created_at,s.items_configured,
+        SELECT s.project_id,s.id,s.reference,s.parent_id,s.tracking,s.shipped_on,s.updated_at,s.created_at,s.items_configured,
             t.reference AS order_number, {shipped_condition('s')} AS shipped,
             json_extract(s.details,'$.source') AS source,json_extract(s.details,'$.carrier') AS carrier,
             CASE WHEN s.project_id IN (SELECT id FROM allowed) THEN s.details END AS full_details,
@@ -281,7 +318,9 @@ def list_global_orders(db, user, query):
                  ELSE 'order:'||lower(trim(ltrim(trim(t.reference),'#'))) END AS order_key,
             (?='' OR s.project_id=? OR EXISTS (SELECT 1 FROM shipping_items i
                 WHERE i.project_id=s.project_id AND i.shipment_id=s.id AND i.product_project_id=?)) AS project_match,
-            (?='' OR instr(lower(t.reference),?)>0 OR instr(lower(s.tracking),?)>0 OR EXISTS (
+            (?='' OR instr(lower(t.reference||' '||s.reference),?)>0 OR instr(lower(s.tracking),?)>0
+                OR (s.project_id IN (SELECT id FROM allowed) AND instr(lower(coalesce(json_extract(s.details,'$.name'),'')),?)>0)
+                OR EXISTS (
                 SELECT 1 FROM shipping_items i JOIN allowed a ON a.id=i.product_project_id
                 LEFT JOIN products p ON p.project_id=i.product_project_id AND p.id=i.product_id
                 WHERE i.project_id=s.project_id AND i.shipment_id=s.id
@@ -298,9 +337,21 @@ def list_global_orders(db, user, query):
             count(*) AS package_count,sum(shipped) AS shipped_count
         FROM packages GROUP BY order_key HAVING max(project_match)=1 AND max(term_match)=1
     )"""
-    status_filter = {'shipped': 'shipped_count=package_count', 'partial': 'shipped_count>0 AND shipped_count<package_count',
-                     'pending': 'shipped_count=0'}.get(status, '1')
+    status_filter = {'shipped': 'shipped_count>0', 'partial': 'shipped_count>0 AND shipped_count<package_count',
+                     'pending': 'shipped_count<package_count'}.get(status, '1')
     total = db.execute(f'{cte} SELECT count(*) FROM orders WHERE {status_filter}', params).fetchone()[0]
+    location = None
+    record = string(query.get('locate'), 100)
+    if record:
+        match = db.execute(f'''{cte} SELECT o.order_key,o.created_at FROM orders o JOIN packages p
+            ON p.order_key=o.order_key WHERE p.id=? LIMIT 1''', (*params, record)).fetchone()
+        if not match:
+            raise ShippingError('订单不存在或无权访问', 404)
+        before = db.execute(f'''{cte} SELECT count(*) FROM orders WHERE
+            created_at>? OR (created_at=? AND order_key<?)''',
+            (*params, match['created_at'], match['created_at'], match['order_key'])).fetchone()[0]
+        page = before // PAGE_SIZE + 1
+        location = {'id': record, 'order_key': match['order_key']}
     orders = [dict(row) for row in db.execute(f'''{cte} SELECT * FROM orders WHERE {status_filter}
         ORDER BY created_at DESC,order_key LIMIT ? OFFSET ?''', (*params, PAGE_SIZE, (page-1)*PAGE_SIZE))]
     if orders:
@@ -310,7 +361,7 @@ def list_global_orders(db, user, query):
         marks = ','.join('?' for _ in by_key)
         for row in db.execute(f'''{cte} SELECT * FROM packages WHERE order_key IN ({marks})
             ORDER BY created_at DESC,id DESC''', (*params, *by_key)):
-            package = {key: row[key] for key in ('id','project_id','reference','tracking','shipped_on','shipped',
+            package = {key: row[key] for key in ('id','project_id','reference','parent_id','tracking','shipped_on','shipped',
                                                  'source','carrier','created_at','updated_at','items_configured')}
             owner = projects.get(row['project_id'])
             package.update(project_name=owner['name'] if owner else None, can_open=bool(owner),
@@ -324,7 +375,8 @@ def list_global_orders(db, user, query):
                                               'name': LEGACY_PRODUCTS[key][0], 'quantity': quantity, 'available': False}
                                              for key, quantity in legacy_quantities(json.loads(row['legacy_details']))]
             by_key[row['order_key']]['packages'].append(package)
-    return {'rows': orders, 'total': total, 'page': page, 'page_size': PAGE_SIZE, 'projects': list(projects.values())}
+    return {'rows': orders, 'total': total, 'page': page, 'page_size': PAGE_SIZE,
+            'projects': list(projects.values()), 'location': location}
 
 
 class ShippingError(ValueError):
@@ -455,12 +507,28 @@ def list_shipments(db, project, channel, query, allowed=None):
     join = 'FROM shipping_records s LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id'
     total = db.execute(f'SELECT count(*) {join} WHERE {predicate}', params).fetchone()[0]
     page = page_number(query)
+    location = None
+    locate = string(query.get('locate'), 100)
+    if locate:
+        row = get_shipment(db, project, locate, allowed, local=True)
+        if row['channel'] != channel or row['deleted_at']:
+            raise ShippingError('发货记录不在当前台账', 404)
+        ancestors = []
+        if query.get('roots') == '1':
+            while row['parent_id']:
+                ancestors.append(row['parent_id'])
+                row = get_shipment(db, project, row['parent_id'], allowed, local=True)
+        before = db.execute(f'''SELECT count(*) {join} WHERE {predicate} AND
+            (s.created_at>? OR (s.created_at=? AND s.id>?))''',
+            (*params, row['created_at'], row['created_at'], row['id'])).fetchone()[0]
+        page = before // PAGE_SIZE + 1
+        location = {'id': locate, 'ancestors': ancestors}
     rows = db.execute(f'''{SHIPMENT_SELECT} WHERE {predicate}
         ORDER BY s.created_at DESC,s.id DESC LIMIT ? OFFSET ?''',
         (*params, PAGE_SIZE, (page - 1) * PAGE_SIZE)).fetchall()
     devices = shipment_devices(db, project, [row['id'] for row in rows if row['project_id'] == project])
     return {'rows': [decode_shipment(row, devices.get(row['id'], []), db, allowed, project) for row in rows],
-            'total': total, 'page': page, 'page_size': PAGE_SIZE}
+            'total': total, 'page': page, 'page_size': PAGE_SIZE, 'location': location}
 
 
 def decode_shipment(row, devices, db, allowed=None, view_project=None):

@@ -245,6 +245,42 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(updated['shipped'])
         self.request('shipping/records/' + original['id'], status=404)
 
+    def test_global_orders_keep_unknown_goods_and_locate_child_without_filtering(self):
+        path = 'global-shipping/orders'
+        payload = {'project_id': self.project_id, 'reference': '#LOCATE-1',
+                   'details': {'name': '测试收件人', 'shipment_status': 'shipped'},
+                   'shipment_items': [{'project_id': self.project_id, 'product_id': None,
+                                       'name': '待确认配件', 'quantity': 2}]}
+        root = self.request(path, 'POST', payload, project=False)
+        line = root['shipment_items'][0]
+        self.assertIsNone(line['product_id'])
+        self.assertEqual(line['name'], '待确认配件')
+        self.request(path, 'POST', {**payload, 'reference': 'locate-1'}, 409, project=False)
+        child = self.request(path, 'POST', {**payload, 'reference': '#SUPPLEMENT-1', 'parent_id': root['id'],
+                                           'shipment_items': []}, project=False)
+        with app.transaction() as db:
+            for i in range(53):
+                app.shipping.save_shipment(db, self.project_id, app.uid(),
+                    {'channel': 'other', 'reference': 'FILLER-' + str(i)}, app.now(), None)
+        located = self.request(path + '?locate=' + child['id'], project=False)
+        self.assertEqual((located['page'], located['total']), (2, 54))
+        self.assertGreater(len(located['rows']), 1)
+        group = next(r for r in located['rows'] if r['order_key'] == located['location']['order_key'])
+        self.assertEqual({r['id'] for r in group['packages']}, {root['id'], child['id']})
+        local = self.request('shipping/records?channel=other&roots=1&locate=' + child['id'])
+        self.assertEqual((local['page'], local['total']), (2, 54))
+        self.assertEqual(local['location']['ancestors'], [root['id']])
+        self.assertIn(root['id'], [r['id'] for r in local['rows']])
+        edit_path = path + '/' + self.project_id + '/' + root['id']
+        edited = self.request(edit_path, 'PUT', {**payload, 'tracking': 'YT-TEST', 'version': root['updated_at'],
+                                                'shipment_items': [line]}, project=False)
+        self.assertEqual(edited['shipment_items'][0]['legacy_key'], line['legacy_key'])
+        self.assertEqual(edited['tracking'], 'YT-TEST')
+        self.request(edit_path, 'DELETE', {'version': edited['updated_at']}, 409, project=False)
+        child_path = path + '/' + self.project_id + '/' + child['id']
+        self.request(child_path, 'DELETE', {'version': child['updated_at']}, project=False)
+        self.assertEqual(self.request('shipping/records?channel=other&deleted=1')['rows'][0]['id'], child['id'])
+
     def test_shipping_clipboard_paste_and_creation_order(self):
         paste = 'shipping/orders/paste'
         result = self.request(paste, 'POST', {

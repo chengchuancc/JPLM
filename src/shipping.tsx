@@ -1,86 +1,21 @@
 import { Fragment, useEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent, type ReactNode } from "react";
-import { createPortal } from "react-dom";
-import { Camera, ChevronDown, ChevronRight, CornerDownRight, Link2, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
+import { ChevronDown, ChevronRight, CornerDownRight, ExternalLink, Link2, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
 import { Dialog } from "./dialog";
 import { FieldVisibility } from "./material-table";
-import { CameraReader } from "./inspection";
+import { DevicePicker } from "./shipping-devices";
 import { RelatedRecordDialog, formatTime, type RelatedTarget } from "./record-details";
-import { type Request, type Channel, type Order, type Device, type Shipment, type Page,
+import { type Request, type Channel, type Order, type Shipment, type Page,
   path, contactFields, otherContactFields, orderFields, items, costs, isOrder, isShipped, CarrierTags, SourceTag, Status, Tracking, shipmentLabel } from "./shipping-data";
 import { ShippingPicker } from "./shipping-options";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
 import { ShippingTableHeader } from "./shipping-table-header";
+import { useShipmentRowLocation } from "./shipping-location";
 import { columnClass, createdColumn, fieldColumns, groupedFields, ksGoodsColumns, productFields, shipmentColumns,
   type ShippingColumn as Column } from "./shipping-columns";
 
 type ImportReport = { added: number; updated: number; unchanged: number; duplicate: number; invalid: number;
   errors: { row: number; error: string }[] };
-
-function DevicePicker({ request, devices, setDevices }: {
-  request: Request; devices: Device[]; setDevices: (next: Device[]) => void;
-}) {
-  const [input, setInput] = useState("");
-  const [results, setResults] = useState<Device[]>([]);
-  const [message, setMessage] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [camera, setCamera] = useState(false);
-  function add(device: Device) {
-    if (!devices.some((item) => item.serial === device.serial)) setDevices([...devices, { ...device, registered: true }]);
-    setInput("");
-    setResults([]);
-    setMessage("");
-  }
-  async function search(value = input) {
-    const term = value.trim();
-    if (!term || busy) return;
-    setBusy(true);
-    setMessage("");
-    try {
-      const found: Device[] = await request(path + "devices?" + new URLSearchParams({ q: term }));
-      const exact = found.find((item) => item.serial.toLowerCase() === term.toLowerCase());
-      if (exact) add(exact);
-      else {
-        setResults(found);
-        if (!found.length) setMessage("当前项目没有匹配的设备");
-      }
-    } catch (error) { setMessage((error as Error).message); }
-    finally { setBusy(false); }
-  }
-  return <section className="shipping-device-picker">
-    <h3>发货设备 <span className="muted">{devices.length} 台</span></h3>
-    <div className="shipping-tools">
-      <input aria-label="设备 S/N" placeholder="扫码或搜索设备 S/N" value={input} disabled={busy}
-        onChange={(event) => setInput(event.target.value)} onKeyDown={(event) => {
-          if (event.key === "Enter" && !event.nativeEvent.isComposing) {
-            event.preventDefault();
-            void search();
-          }
-        }} />
-      <button type="button" className="btn" disabled={!input.trim() || busy} onClick={() => void search()}><Search size={15} />查询</button>
-      <button type="button" className="btn" disabled={busy} onClick={() => setCamera(true)}><Camera size={15} />扫码</button>
-    </div>
-    {message && <p className="muted" role="status">{message}</p>}
-    {!!results.length && <div className="shipping-picker-list">
-      {results.map((device) => <button type="button" key={device.serial} onClick={() => add(device)}>
-        <span className="mono">{device.serial}</span><small>{[device.result, device.shipments && "已关联 " + device.shipments].filter(Boolean).join(" · ")}</small>
-      </button>)}
-    </div>}
-    <div className="selected-records">
-      {devices.map((device) => <span className="record-tag" key={device.serial}>
-        <span className="mono">{device.serial}</span>
-        {device.registered === false && <small>未匹配设备</small>}
-        <button type="button" aria-label={"移除设备 " + device.serial} onClick={() =>
-          setDevices(devices.filter((item) => item.serial !== device.serial))}>×</button>
-      </span>)}
-    </div>
-    {camera && createPortal(<CameraReader live close={() => setCamera(false)} onRead={(value) => {
-      setCamera(false);
-      setInput(value);
-      void search(value);
-    }} />, document.body)}
-  </section>;
-}
 
 function OrderImport({ request, close, done }: { request: Request; close: () => void; done: () => void }) {
   const [file, setFile] = useState<File>();
@@ -348,6 +283,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
 }) {
   const [channel, setChannel] = useState<Channel>(initialRecord ? "other" : "ks");
   const [focused, setFocused] = useState(initialRecord || "");
+  const locatePending = useRef(initialRecord || "");
   const [orders, setOrders] = useState(false);
   const [term, setTerm] = useState("");
   const [search, setSearch] = useState("");
@@ -356,6 +292,9 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [treeRevision, setTreeRevision] = useState(0);
   const [page, setPage] = useState(1);
+  const [firstPage, setFirstPage] = useState(1);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
+  const listEpoch = useRef(0);
   const [data, setData] = useState<Page>();
   const [busy, setBusy] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -391,23 +330,30 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   const actionWidth = orders ? 104 : 126;
   const tableWidth = columns.reduce((total, column) => total + column.width, 45 + (readOnly ? 0 : actionWidth));
   const more = !!data && page * data.page_size < data.total;
-  const grouped = !orders && !search && !status && !deleted && !focused;
+  const grouped = !orders && !search && !status && !deleted;
   const expandable = !orders && !status && !deleted;
   const loadedIds = new Set(rows.map((row) => row.id));
+  useShipmentRowLocation(grid, focused, !!data && !busy);
 
   useEffect(() => {
     let active = true;
     setBusy(true);
     setLoadError("");
     const query = new URLSearchParams({ channel, q: search, status, page: String(page) });
-    if (focused && !orders) query.set("record", focused);
+    if (locatePending.current && !orders) query.set("locate", locatePending.current);
     if (grouped) query.set("roots", "1");
     if (!orders && deleted) query.set("deleted", "1");
     request(path + (orders ? "orders?" : "records?") + query).then(
       (result: Page) => {
         if (!active) return;
+        if (result.location) {
+          locatePending.current = "";
+          setExpanded((previous) => ({ ...previous, ...Object.fromEntries(result.location!.ancestors.map((id) => [id, true])) }));
+          setFirstPage(result.page);
+          setPage(result.page);
+        }
         setData((previous) => {
-          if (page === 1 || !previous) return result;
+          if (result.location || page === 1 || !previous) return result;
           const loaded = new Map(previous.rows.map((row) => [row.id, row]));
           for (const row of result.rows) loaded.set(row.id, row);
           return { ...result, rows: [...loaded.values()] };
@@ -416,7 +362,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
       (error) => { if (active) setLoadError(error.message); },
     ).finally(() => { if (active) setBusy(false); });
     return () => { active = false; };
-  }, [channel, orders, search, status, page, refresh, retry, grouped, deleted, focused]);
+  }, [channel, orders, search, status, page, refresh, retry, grouped, deleted]);
 
   useEffect(() => {
     const node = tail.current;
@@ -450,12 +396,32 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     return true;
   }
   function resetList(scroll = true) {
+    listEpoch.current++;
+    locatePending.current = "";
+    setFirstPage(1);
     if (scroll) grid.current?.scrollTo({ top: 0 });
     setData(undefined);
     setBusy(true);
     setPage(1);
     setCursor(undefined);
     setRefresh((value) => value + 1);
+  }
+  async function loadEarlier() {
+    if (loadingEarlier || firstPage <= 1) return;
+    const epoch = listEpoch.current;
+    setLoadingEarlier(true);
+    setLoadError("");
+    try {
+      const query = new URLSearchParams({ channel, page: String(firstPage - 1) });
+      if (grouped) query.set("roots", "1");
+      const earlier: Page = await request(path + "records?" + query);
+      if (epoch !== listEpoch.current) return;
+      setData((current) => current && { ...current, rows: [...earlier.rows,
+        ...current.rows.filter((row) => !earlier.rows.some((prior) => prior.id === row.id))] });
+      setFirstPage(earlier.page);
+    } catch (error) {
+      if (epoch === listEpoch.current) setLoadError((error as Error).message);
+    } finally { setLoadingEarlier(false); }
   }
   function select(next: Channel, showOrders = false) {
     if ((channel === next && orders === showOrders) || !abandon()) return;
@@ -713,8 +679,9 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     const isExpanded = !!expanded[item.id];
     const canExpand = expandable && !!item.child_count;
     const parentLabel = row.parent_reference || row.parent_tracking || "发货记录";
-    const rowClass = [editing && "shipping-row-editing", depth > 0 && "shipping-child-row"].filter(Boolean).join(" ");
-    return <Fragment key={row.id || "new"}><tr className={rowClass} aria-busy={editing && saving}>
+    const rowClass = [editing && "shipping-row-editing", depth > 0 && "shipping-child-row",
+      row.id && row.id === focused && "shipping-located-row"].filter(Boolean).join(" ");
+    return <Fragment key={row.id || "new"}><tr className={rowClass} data-shipment-id={row.id || undefined} aria-busy={editing && saving}>
       <td className="shipping-row-index">{writableItems && !editing && <button type="button" className="shipping-mobile-edit"
         aria-label={"编辑第 " + index + " 行"} title="编辑" disabled={saving} onClick={() => begin(row)}><Pencil size={12} /></button>}
         {index}</td>
@@ -737,6 +704,8 @@ export default function ShippingManagement({ request, products, admin, readOnly,
           <ShipmentCell row={row} column={column} edit={editing && !row.shared ? update : undefined} saving={saving} orderLocked={orderLocked}
             open={setDetail} pick={setPicker} request={request} />
           {!editing && canExpand && <span className="shipping-child-count">{item.child_count}</span>}
+          {!editing && row.channel === "other" && !row.deleted_at && <a className="shipping-icon-btn shipping-global-jump"
+            href={"#global-shipping/" + row.id} title="在全局发货中定位" aria-label="在全局发货中定位"><ExternalLink size={12} /></a>}
           {editing && !row.shared ? <button className="shipping-icon-btn" type="button" title={row.parent_id ? "父记录：" + parentLabel : "关联父记录"}
             aria-label="关联父记录" disabled={saving} onClick={() => setPicker("parent")}><Link2 size={14} /></button>
             : !depth && row.parent_id && <button className="shipping-icon-btn" type="button"
@@ -801,9 +770,6 @@ export default function ShippingManagement({ request, products, admin, readOnly,
         {channel === "ks" && <button className="btn" type="button" onClick={() => select("ks", !orders)}>
           {orders ? "返回 KS 发货台账" : "KS 发货信息"}
         </button>}
-        {focused && <button className="btn" type="button" onClick={() => {
-          if (abandon()) { setFocused(""); resetList(); }
-        }}>查看全部</button>}
         {!orders && <button type="button" className="btn" aria-pressed={deleted} onClick={() => {
           if (!abandon()) return;
           setDeleted(!deleted); setStatus(""); setTerm(""); setSearch(""); setNotice(""); resetList();
@@ -841,7 +807,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
           {rows.map((row, index) => {
             if (!isOrder(row)) {
               if (expandable && row.parent_id && expanded[row.parent_id] && loadedIds.has(row.parent_id)) return null;
-              return shipmentRow(row, index + 1);
+              return shipmentRow(row, index + 1 + (firstPage - 1) * (data?.page_size || 50));
             }
             return <tr key={row.id}><td className="shipping-row-index">{index + 1}</td>
               {columns.map((column) => <td key={column.key} data-order-row={row.id} data-order-field={column.key}
@@ -863,8 +829,14 @@ export default function ShippingManagement({ request, products, admin, readOnly,
       </div>}
       <div ref={tail} className="shipping-load-tail" style={{ width: tableWidth }}>{busy ? "正在加载…" : ""}</div>
     </div>
-    <div className="shipping-count" role="status">已加载 {rows.length} / {data?.total ?? rows.length} {grouped ? "组" : "条"}</div>
-    {detail && <RelatedRecordDialog target={detail} request={request} close={() => setDetail(undefined)} />}
+    <div className="shipping-count shipping-location-footer" role="status">
+      {firstPage > 1 && <button className="btn small" type="button" disabled={loadingEarlier || busy}
+        onClick={() => void loadEarlier()}>加载前面的记录</button>}
+      <span>已加载 {rows.length} / {data?.total ?? rows.length} {grouped ? "组" : "条"}</span>
+    </div>
+    {detail && <RelatedRecordDialog target={detail} request={request} close={() => setDetail(undefined)}
+      shipmentNavigation={(row) => row.channel === "other" && !row.deleted_at &&
+        <a className="btn small" href={"#global-shipping/" + row.id}>在全局发货中定位</a>} />}
     {picker === "order" && edit && <OrderPicker request={request} close={() => setPicker(undefined)} select={(order) => {
       update({ ks_order_id: order.id, backer: order.backer, order_details: order.details });
       setPicker(undefined);

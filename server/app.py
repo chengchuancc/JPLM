@@ -1046,17 +1046,35 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(shipping.product_catalog(db, self.user))
                 return self.send(shipping.list_global_orders(db, self.user, query))
         item_path = re.fullmatch(r'packages/([a-zA-Z0-9_-]+)/([a-f0-9]{24})/items', resource)
-        if (resource == 'packages' and method == 'POST') or (item_path and method == 'PUT'):
+        record_path = re.fullmatch(r'orders/([a-zA-Z0-9_-]+)/([a-f0-9]{24})', resource)
+        if ((resource in ('packages', 'orders') and method == 'POST') or (item_path and method == 'PUT')
+                or (record_path and method in ('PUT', 'DELETE'))):
             data = self.body()
             if not isinstance(data, dict):
                 raise Problem('发货记录格式无效')
-            project = item_path[1] if item_path else shipping.string(data.get('project_id'), 100)
+            route = item_path or record_path
+            project = route[1] if route else shipping.string(data.get('project_id'), 100)
             with FILE_LOCK, transaction() as db:
                 self.inspection_writer(db, project)
                 allowed = shipping.accessible_projects(db, self.user)
                 writable = {key for key, p in allowed.items() if not p['archived_at']}
                 stamp = now()
-                if item_path:
+                if record_path:
+                    row = shipping.get_shipment(db, project, record_path[2], allowed)
+                    if row['channel'] != 'other':
+                        raise Problem('发货记录不存在', 404)
+                    record_id, reference = row['id'], row['reference']
+                    if method == 'DELETE':
+                        shipping.set_shipment_deleted(db, project, record_id, data.get('version'), stamp, True)
+                    else:
+                        if not row['parent_id']:
+                            shipping.check_order_reference(db, data.get('reference'), allowed, row['reference'])
+                        payload = {**data, 'channel': 'other', 'ks_order_id': None,
+                                   'devices': data.get('devices', [d['serial'] for d in row['devices']])}
+                        result = shipping.save_shipment(db, project, record_id, payload, stamp, self.user['id'],
+                                                        writable=writable, cross_project=True)
+                        reference = result['reference']
+                elif item_path:
                     row = shipping.get_shipment(db, project, item_path[2], allowed)
                     shipping.update_shipment_items(db, row, data.get('version'), data.get('shipment_items'),
                                                    writable, stamp, self.user['id'])
@@ -1065,11 +1083,14 @@ class Handler(BaseHTTPRequestHandler):
                     record_id = uid()
                     payload = {**data, 'channel': 'other', 'ks_order_id': None,
                                'shipment_items': data.get('shipment_items', [])}
+                    if resource == 'orders' and not data.get('parent_id'):
+                        shipping.check_order_reference(db, data.get('reference'), allowed)
                     result = shipping.save_shipment(db, project, record_id, payload, stamp, self.user['id'],
                                                     writable=writable, cross_project=True)
                     reference = result['reference']
                 touch_project(db)
-                log_activity(db, self.user, '修改发货商品' if item_path else '登记发货', record_id, reference)
+                action = '删除发货记录' if method == 'DELETE' else '修改发货商品' if item_path else '修改发货记录' if record_path else '登记发货'
+                log_activity(db, self.user, action, record_id, reference)
                 result = shipping.get_shipment(db, project, record_id, allowed)
             return self.send(result)
         raise Problem('接口不存在', 404)

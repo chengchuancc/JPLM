@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ArrowLeft } from "lucide-react";
 import { Dialog } from "./dialog";
@@ -140,7 +140,9 @@ function ChildShipmentLinks({ id, request, open }: { id: string; request: Reques
   return value ? <ShipmentLinks rows={value} open={open} /> : <Loading error={error} />;
 }
 
-function ShipmentDetails({ id, request, open }: { id: string; request: Request; open: Open }) {
+function ShipmentDetails({ id, request, open, navigation }: {
+  id: string; request: Request; open: Open; navigation?: (row: Shipment) => ReactNode;
+}) {
   const { value: row, error } = useDetail<Shipment>(request, "shipping/records/" + id);
   if (!row) return <Loading error={error} />;
   const title = row.channel === "ks" ? "发货编号" : "订单号";
@@ -151,6 +153,7 @@ function ShipmentDetails({ id, request, open }: { id: string; request: Request; 
       {row.deleted_at ? <span className="muted">已删除 · {formatTime(row.deleted_at)}</span>
         : <Status sent={isShipped(row)} />}
     </div>
+    {navigation && <div className="shipping-detail-navigation">{navigation(row)}</div>}
     <div className="shipping-record-fields">
     <section className="shipping-detail-section">
       <h3>发货与物流</h3>
@@ -220,7 +223,9 @@ function OrderDetails({ id, request, open }: { id: string; request: Request; ope
   </>;
 }
 
-export function RelatedRecordDialog({ target, request, close }: { target: RelatedTarget; request: Request; close: () => void }) {
+export function RelatedRecordDialog({ target, request, close, shipmentNavigation }: {
+  target: RelatedTarget; request: Request; close: () => void; shipmentNavigation?: (row: Shipment) => ReactNode;
+}) {
   const [trail, setTrail] = useState<RelatedTarget[]>([target]);
   const current = trail[trail.length - 1];
   const content = useRef<HTMLDivElement>(null);
@@ -237,7 +242,8 @@ export function RelatedRecordDialog({ target, request, close }: { target: Relate
       onClick={() => setTrail((previous) => previous.slice(0, -1))}><ArrowLeft size={14} />返回上一条</button>}
     {current.kind === "inspection" && <InspectionDetails key={current.record.id} record={current.record} request={request} open={open} />}
     {current.kind === "device" && <DeviceDetails key={current.serial} serial={current.serial} request={request} open={open} />}
-    {current.kind === "shipment" && <ShipmentDetails key={current.id} id={current.id} request={request} open={open} />}
+    {current.kind === "shipment" && <ShipmentDetails key={current.id} id={current.id} request={request} open={open}
+      navigation={shipmentNavigation} />}
     {current.kind === "order" && <OrderDetails key={current.id} id={current.id} request={request} open={open} />}
   </div></Dialog>, document.body);
 }
