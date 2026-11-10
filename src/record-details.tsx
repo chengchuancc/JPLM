@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
-import { ArrowLeft } from "lucide-react";
+import { ArrowLeft, ExternalLink } from "lucide-react";
 import { Dialog } from "./dialog";
 import type { RecordRow } from "./inspection";
 import { contactFields, otherContactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList, isShipped, shipmentLabel,
@@ -36,6 +36,7 @@ export type RelatedTarget =
 
 type Open = (target: RelatedTarget) => void;
 type ShipmentLink = Pick<Shipment, "id" | "reference" | "channel" | "shipped_on" | "tracking" | "backer">;
+type DeviceOrderLink = ShipmentLink & { order_number: string; parent_id: string | null };
 
 function useDetail<T>(request: Request, path: string) {
   const [value, setValue] = useState<T>();
@@ -66,13 +67,24 @@ function ShipmentLinks({ rows, open }: { rows: ShipmentLink[]; open: Open }) {
   ))}</ul>;
 }
 
-function LinkedShipments({ serial, request, open }: { serial: string; request: Request; open: Open }) {
-  const { value, error } = useDetail<ShipmentLink[]>(request,
+function DeviceOrders({ serial, request, open }: { serial: string; request: Request; open: Open }) {
+  const { value, error } = useDetail<DeviceOrderLink[]>(request,
     "shipping/device-records?" + new URLSearchParams({ serial }));
-  if (error) return <p className="form-error" role="alert">{error}</p>;
-  if (!value?.length) return null;
-  return <section className="inspection-detail-group">
-    <h3>关联发货</h3><ShipmentLinks rows={value} open={open} />
+  return <section className="inspection-detail-group inspection-order-links">
+    <h3>关联订单号</h3>
+    {!value ? <Loading error={error} /> : !value.length ? <p className="muted">暂无关联订单</p> :
+      <ul className="shipping-device-detail">{value.map((item) => {
+        const child = item.parent_id && item.channel === "other"
+          ? "子订单" + (item.reference && item.reference !== item.order_number ? " " + item.reference : "") : "";
+        const orderNumber = item.order_number || item.reference || (item.backer ? "Backer #" + item.backer : "无订单号");
+        return <li key={item.id}>
+          {item.channel === "other" ? <a className="text-link mono" href={"#global-shipping/" + item.id}
+            title="在全局发货中定位">{orderNumber}<ExternalLink size={13} aria-hidden="true" /></a>
+            : <button type="button" className="text-link mono"
+              onClick={() => open({ kind: "shipment", id: item.id, reference: shipmentLabel(item) })}>{orderNumber}</button>}
+          <small>{[item.channel === "ks" ? "KS" : child, item.shipped_on, item.tracking].filter(Boolean).join(" · ")}</small>
+        </li>;
+      })}</ul>}
   </section>;
 }
 
@@ -82,6 +94,7 @@ function InspectionDetails({ record, request, open }: { record: RecordRow; reque
       <div><span>S/N</span> <strong className="mono">{record.serial}</strong></div>
       <ResultLabel value={record.result} />
     </div>
+    <DeviceOrders serial={record.serial} request={request} open={open} />
     <dl className="inspection-detail-grid inspection-detail-meta">
       <div><dt>检测表</dt><dd>{record.form.name}</dd></div>
       <div><dt>生产日期</dt><dd>{record.production_date || "—"}</dd></div>
@@ -91,7 +104,6 @@ function InspectionDetails({ record, request, open }: { record: RecordRow; reque
       {record.source_id && <div><dt>原记录 ID</dt><dd>{record.source_id}</dd></div>}
       {record.deleted_at && <div><dt>删除时间</dt><dd>{formatTime(record.deleted_at)}</dd></div>}
     </dl>
-    <LinkedShipments serial={record.serial} request={request} open={open} />
     {sections(record.form.fields).map(([group, fields]) => (
       <section className="inspection-detail-group" key={group}>
         <h3>{group}</h3>
@@ -119,6 +131,7 @@ function DeviceDetails({ serial, request, open }: { serial: string; request: Req
     <div className="inspection-record-summary"><strong className="mono">{serial}</strong>
       {value.device && <span>已登记</span>}
     </div>
+    {value.records.length !== 1 && <DeviceOrders serial={serial} request={request} open={open} />}
     {value.device && <DetailsList fields={[["production_date", "生产日期"], ["registered_at", "登记时间"]]}
       details={{ ...value.device, registered_at: formatTime(value.device.registered_at) }} />}
     {!value.records.length && <p className="shipping-detail-empty muted">{value.device ? "该设备暂无检测记录" : "该编号未匹配设备台账"}</p>}
@@ -131,7 +144,6 @@ function DeviceDetails({ serial, request, open }: { serial: string; request: Req
           <span>{formatTime(row.updated_at)} <ResultLabel value={row.result} /></span></li>
       ))}</ul>
     </section>}
-    {value.records.length !== 1 && <LinkedShipments serial={serial} request={request} open={open} />}
   </>;
 }
 

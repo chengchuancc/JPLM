@@ -167,6 +167,8 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
 .shipping-device-picker .selected-records { margin: 7px 0 0; }
 .shipping-device-detail { list-style: none; padding: 0; margin: 8px 0 0; }
 .shipping-device-detail li { display: flex; justify-content: space-between; gap: 8px; padding: 5px 0; border-bottom: 1px solid var(--border); }
+.inspection-order-links .shipping-device-detail a { display: inline-flex; align-items: center; gap: 5px; }
+.inspection-order-links .shipping-device-detail small { min-width: 0; overflow-wrap: anywhere; text-align: right; }
 .shipping-import-report { margin-top: 10px; }
 .shipping-detail-section { border-top: 1px solid var(--border); padding: 10px 0; margin-top: 8px; }
 .shipping-detail-section h3 { font-size: 14px; }

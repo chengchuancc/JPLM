@@ -120,7 +120,7 @@ class IntegrationTests(unittest.TestCase):
         parent = self.request(records, 'POST', payload)
         serial = '1234562611100001'
         self.request('inspection/devices', 'POST', {'serial': serial})
-        child = self.request(records, 'POST', {**payload, 'parent_id': parent['id'], 'tracking': 'CHILD-TRACK',
+        child = self.request(records, 'POST', {**payload, 'reference': '#SUPPLEMENT', 'parent_id': parent['id'], 'tracking': 'CHILD-TRACK',
                                                'devices': [serial], 'details': {'notes': '补发'}})
         parent_path = f"{records}/{parent['id']}"
         child_path = f"{records}/{child['id']}"
@@ -157,7 +157,9 @@ class IntegrationTests(unittest.TestCase):
         self.request(child_path + '/restore', 'POST', {'version': deleted['updated_at']})
         restored = self.request(parent_path + '/children')[0]
         self.assertIsNone(restored['deleted_at'])
-        self.assertEqual(self.request('shipping/device-records?serial=' + serial)[0]['id'], child['id'])
+        linked = self.request('shipping/device-records?serial=' + serial)[0]
+        self.assertEqual((linked['id'], linked['reference'], linked['order_number']),
+                         (child['id'], '#SUPPLEMENT', '#PARENT'))
         self.request(child_path, 'PUT', {**payload, 'parent_id': None, 'version': restored['updated_at']})
         self.assertEqual(self.request(records + '?channel=other&roots=1')['total'], 2)
 

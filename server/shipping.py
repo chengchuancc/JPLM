@@ -736,11 +736,21 @@ def find_devices(db, project, query):
 
 
 def for_device(db, project, serial):
-    return [dict(row) for row in db.execute('''SELECT s.id,s.reference,s.channel,s.shipped_on,s.tracking,o.backer
+    return [dict(row) for row in db.execute('''WITH RECURSIVE linked AS (
+        SELECT s.id,s.reference,s.parent_id,s.channel,s.shipped_on,s.tracking,s.created_at,o.backer
         FROM shipping_devices d JOIN shipping_records s ON s.project_id=d.project_id AND s.id=d.shipment_id
         LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id
         WHERE d.project_id=? AND d.serial=? AND s.deleted_at IS NULL
-        ORDER BY s.created_at DESC,s.id DESC''', (project, serial))]
+    ), lineage(shipment_id,id,parent_id,reference) AS (
+        SELECT id,id,parent_id,reference FROM linked WHERE channel='other'
+        UNION ALL
+        SELECT l.shipment_id,p.id,p.parent_id,p.reference FROM lineage l
+        JOIN shipping_records p ON p.project_id=? AND p.id=l.parent_id
+    )
+    SELECT s.id,s.reference,s.parent_id,s.channel,s.shipped_on,s.tracking,s.backer,
+        coalesce(nullif(l.reference,''),s.reference) AS order_number
+    FROM linked s LEFT JOIN lineage l ON l.shipment_id=s.id AND l.parent_id IS NULL
+    ORDER BY s.created_at DESC,s.id DESC''', (project, serial, project))]
 
 
 def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=None, imported=False,
