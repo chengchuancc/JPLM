@@ -83,6 +83,7 @@ export type Movement = {
   purchase_line_id: string | null;
   original_id: string | null;
   reason: string;
+  occurred_at: string;
   created_at: string;
 };
 export type FileRecord = {

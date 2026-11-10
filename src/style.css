@@ -1477,8 +1477,8 @@ td .text-link:hover {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   padding: 4px;
-  background: #f2f5ef;
-  border: 1px solid #e7ecdf;
+  background: #e9eff8;
+  border: 1px solid #d1dced;
   border-radius: 6px;
   margin-bottom: 24px;
 }
@@ -1486,28 +1486,16 @@ td .text-link:hover {
   padding: 9px;
   border-radius: 4px;
   font-size: 12px;
-  color: #8c9b7e;
+  color: #465a76;
 }
 .operation-switch button.selected {
   background: #fff;
-  color: #4c6740;
+  color: #174391;
   box-shadow: 0 1px 4px #30482013;
   font-weight: 550;
 }
-.part-selector {
-  display: flex;
-  gap: 8px;
-  margin-top: -12px;
-}
-.part-selector input {
-  width: 40%;
-  font-size: 10px;
-}
-.part-selector select {
-  flex: 1;
-  min-width: 0;
-  font-size: 11px;
-}
+.movement-fields { margin-top: 12px; }
+.purchase-overage { color: #8b4907; font-weight: 650; }
 .form-search {
   width: 100%;
   margin-bottom: 19px;
@@ -2657,13 +2645,6 @@ td .text-link:hover {
   .form-grid textarea {
     font-size: 11px;
   }
-  .part-selector {
-    flex-direction: column;
-    gap: 7px;
-  }
-  .part-selector input {
-    width: 100%;
-  }
   .stock-hint {
     font-size: 10px;
     flex-wrap: wrap;
@@ -2962,9 +2943,6 @@ td .text-link:hover {
     height: 39px;
   }
   .part-selector input,
-  .part-selector select {
-    font-size: 13px;
-  }
   .table-note {
     font-size: 11px;
   }
@@ -3746,20 +3724,26 @@ button.material-photo {
   position: sticky;
   z-index: 2;
 }
-.configurable-table td.fixed-code,
-.configurable-table td.fixed-actions {
-  background: #fff;
+.configurable-table thead th {
+  background: #e3ecf9;
+  color: #293e61;
+  border-bottom: 1px solid #bdcde4;
 }
-.configurable-table tbody tr:hover :is(.fixed-code, .fixed-actions) {
-  background: #fcfdfb;
+.configurable-table tbody tr { --material-row: #fff; }
+.configurable-table tbody tr:nth-child(even) { --material-row: #f5f8fd; }
+.configurable-table tbody tr:hover, .configurable-table tbody tr:focus-within { --material-row: #eaf2ff; }
+.configurable-table tbody td {
+  background: var(--material-row);
+  color: #283850;
+  border-bottom-color: #dce5f1;
 }
 .configurable-table .fixed-code {
   left: 0;
-  box-shadow: 1px 0 #e8ece7;
+  box-shadow: 1px 0 #d5e0f0;
 }
 .configurable-table .fixed-actions {
   right: 0;
-  box-shadow: -1px 0 #e8ece7;
+  box-shadow: -1px 0 #d5e0f0;
 }
 .configurable-table .fixed-actions .row-actions {
   gap: 3px;
@@ -3816,7 +3800,7 @@ button.material-photo {
 .column-filter .material-category-trigger:focus-visible {
   background: var(--accent-soft);
 }
-.column-filter .option-tag.slate { background: transparent; color: inherit; padding-inline: 0; }
+.column-filter .option-tag[title="类别"] { background: transparent; color: inherit; padding-inline: 0; box-shadow: none; }
 .configurable-table th:not(.fixed-code, .fixed-actions) {
   position: relative;
 }
@@ -3863,14 +3847,19 @@ button.material-photo {
   display: flex; align-items: center; justify-content: space-between; gap: 5px; width: 100%; min-height: 32px;
   padding: 4px 8px; border: 1px solid #dce1de; border-radius: 6px; background: #fff; text-align: left;
 }
-.option-tag { display: inline-block; max-width: 100%; padding: 2px 7px; border-radius: 4px; font-weight: 600; white-space: nowrap; }
-.option-tag.amber { background: #fff1cd; color: #704609; }
-.option-tag.green { background: #e0f4e7; color: #1b603f; }
-.option-tag.violet { background: #eee5ff; color: #5d3596; }
-.option-tag.rose { background: #ffe9eb; color: #923549; }
-.option-tag.blue { background: #e3efff; color: #24569a; }
-.option-tag.teal { background: #dcf4f0; color: #18665d; }
-.option-tag.slate { background: #eaf0f6; color: #485b75; }
+.option-tag { display: inline-block; max-width: 100%; padding: 2px 7px; border-radius: 4px; font-weight: 650; white-space: nowrap; box-shadow: inset 0 0 0 1px color-mix(in srgb, currentColor 22%, transparent); }
+.option-tag.amber { background: #ffdf9e; color: #603507; }
+.option-tag.green { background: #d2edce; color: #1c532a; }
+.option-tag.violet { background: #e8d8ff; color: #50257f; }
+.option-tag.rose { background: #fbd9de; color: #8b2b40; }
+.option-tag.blue { background: #d4e6ff; color: #194684; }
+.option-tag.teal { background: #ccf0e8; color: #115c50; }
+.option-tag.slate { background: #e2e8f0; color: #34485f; }
+.option-tag.cyan { background: #cbedf7; color: #165467; }
+.option-tag.orange { background: #ffd6bb; color: #853b18; }
+.option-tag.pink { background: #f5d8ec; color: #74295b; }
+.option-tag.indigo { background: #dddcff; color: #373480; }
+.option-tag.olive { background: #e5edba; color: #4b541d; }
 .material-category-trigger span, .material-category-options button span {
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
 }

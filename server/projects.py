@@ -4,7 +4,8 @@ PROJECT_VERSION = 9
 MATERIAL_CATEGORIES_VERSION = 20
 MATERIAL_CODE_PREFIX_VERSION = 21
 RECORD_DELETION_VERSION = 22
-VERSION = RECORD_DELETION_VERSION
+INVENTORY_TIME_VERSION = 23
+VERSION = INVENTORY_TIME_VERSION
 LEGACY_PROJECT_ID = 'legacy'
 BUSINESS_TABLES = (
     'products', 'parts', 'suppliers', 'quotes', 'bom_versions', 'bom_lines',
@@ -80,6 +81,36 @@ def migrate_material_categories(db):
         db.execute(MATERIAL_CATEGORY_TABLE)
         if db.execute('PRAGMA foreign_key_check').fetchone():
             raise RuntimeError('物料类别升级后的关联校验未通过')
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.execute('PRAGMA legacy_alter_table=OFF')
+        db.execute('PRAGMA foreign_keys=ON')
+
+def migrate_inventory(db):
+    old_check = 'CHECK(received>=0 AND received<=qty)'
+    db.execute('PRAGMA foreign_keys=OFF')
+    db.execute('PRAGMA legacy_alter_table=ON')
+    try:
+        db.execute('BEGIN IMMEDIATE')
+        sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='purchase_lines'").fetchone()[0]
+        if old_check in sql:
+            indexes = [row[0] for row in db.execute("""SELECT sql FROM sqlite_master
+                WHERE tbl_name='purchase_lines' AND type IN ('index','trigger') AND sql IS NOT NULL""")]
+            schema = sql[sql.index('('):].replace(old_check, 'CHECK(received>=0)', 1)
+            db.execute('CREATE TABLE purchase_lines_inventory_upgrade ' + schema)
+            db.execute('INSERT INTO purchase_lines_inventory_upgrade SELECT * FROM purchase_lines ORDER BY rowid')
+            db.execute('DROP TABLE purchase_lines')
+            db.execute('ALTER TABLE purchase_lines_inventory_upgrade RENAME TO purchase_lines')
+            for statement in indexes:
+                db.execute(statement)
+        if 'occurred_at' not in {row['name'] for row in db.execute('PRAGMA table_info(movements)')}:
+            db.execute("ALTER TABLE movements ADD COLUMN occurred_at TEXT NOT NULL DEFAULT ''")
+        db.execute("UPDATE movements SET occurred_at=created_at WHERE occurred_at=''")
+        if db.execute('PRAGMA foreign_key_check').fetchone():
+            raise RuntimeError('库存升级后的关联校验未通过')
         db.commit()
     except Exception:
         db.rollback()

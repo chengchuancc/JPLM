@@ -589,13 +589,19 @@ class IntegrationTests(unittest.TestCase):
         self.request('movements','POST',{'type':'报废','part_id':self.part,'qty':1},400)
         self.assertEqual(self.stock(),4)
     def test_partial_purchase_receipts(self):
-        po=self.request('purchases','POST',{'supplier_id':self.supplier_for(self.part),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':10,'price':2}]})['id']
-        line=self.state()['purchase_lines'][0]['id'];self.move('入库',4,purchase_line_id=line)
-        self.assertEqual(self.state()['purchase_lines'][0]['received'],4)
-        self.request('movements','POST',{'type':'入库','part_id':self.part,'qty':7,'purchase_line_id':line},400)
-        self.assertEqual(self.stock(),4);self.move('入库',6,purchase_line_id=line)
-        self.assertEqual(self.state()['purchase_lines'][0]['received'],10)
-        self.assertEqual(self.stock(),10)
+        self.request('purchases','POST',{'supplier_id':self.supplier_for(self.part),'date':'2026-11-06','lines':[{'part_id':self.part,'qty':10,'price':2}]})
+        line = self.state()['purchase_lines'][0]['id']
+        self.move('入库', 4, purchase_line_id=line)
+        self.assertEqual(self.state()['purchase_lines'][0]['received'], 4)
+        self.move('入库', 7, purchase_line_id=line)
+        extra = self.move('入库', 2, purchase_line_id=line)['id']
+        self.assertEqual(self.state()['purchase_lines'][0]['received'], 13)
+        self.assertEqual(self.stock(), 13)
+        self.request('movements/' + extra, 'PUT', {'qty': 3})
+        self.assertEqual(self.state()['purchase_lines'][0]['received'], 14)
+        self.request('movements/' + extra, 'DELETE')
+        self.assertEqual(self.state()['purchase_lines'][0]['received'], 11)
+        self.assertEqual(self.stock(), 11)
     def test_movement_edit_reconciles_receipts_and_rejects_negative_history(self):
         self.request('purchases', 'POST', {
             'supplier_id': self.supplier_for(self.part), 'date': '2026-11-06',
@@ -608,7 +614,6 @@ class IntegrationTests(unittest.TestCase):
         before = self.state()
         path = 'movements/' + receipt
         self.request(path, 'PUT', {'qty': 8}, 409)
-        self.request(path, 'PUT', {'qty': 16}, 400)
         self.assertEqual(self.state(), before)
         self.request(path, 'PUT', {'qty': 12, 'reason': '核对后修正', 'expected': before['movements'][0]})
         self.request(path, 'PUT', {'qty': 11, 'expected': before['movements'][0]}, 409)
@@ -679,6 +684,28 @@ class IntegrationTests(unittest.TestCase):
                 row = db.execute('SELECT qty,deleted_at FROM movements WHERE id=?', (receipt,)).fetchone()
                 self.assertEqual(row['qty'], 4)
                 self.assertTrue(row['deleted_at'])
+
+    def test_backdated_movement_recalculates_history_and_validates_return_order(self):
+        def when(hour, minute=0):
+            return f'2026-11-10T{hour:02d}:{minute:02d}:00+08:00'
+
+        self.move('入库', 10, occurred_at=when(8))
+        out = self.move('出库', 4, occurred_at=when(10))['id']
+        self.move('入库', 2, occurred_at=when(9))
+        records = self.state()['movements']
+        self.assertEqual([row['balance'] for row in records], [10, 8, 12])
+        self.assertEqual(records[1]['occurred_at'], '2026-11-10T02:00:00.000000+00:00')
+        path = 'movements/' + out
+        self.request(path, 'PUT', {'occurred_at': when(7)}, 409)
+        self.request('movements', 'POST', {'type': '退库', 'part_id': self.part, 'qty': 1,
+                     'original_id': out, 'occurred_at': when(9, 30)}, 400)
+        self.assertEqual(self.state()['movements'], records)
+        self.request(path, 'PUT', {'occurred_at': when(9, 15), 'expected': records[1]})
+        self.move('退库', 1, occurred_at=when(9, 30), original_id=out)
+        self.request(path, 'PUT', {'occurred_at': when(10)}, 400)
+        state = self.state()
+        self.assertEqual(state['movements'][1]['created_at'], records[1]['created_at'])
+        self.assertEqual(self.stock(), 9)
 
     def test_delete_movement_checks_history_and_active_returns(self):
         first = self.move('入库', 8)['id']
@@ -857,14 +884,13 @@ class IntegrationTests(unittest.TestCase):
         self.request(path, 'DELETE', {'expected': snapshot}, 409)
         self.request(path, 'PUT', {**payload, 'supplier_id': other_supplier}, 409)
         self.request(path, 'PUT', {**payload, 'lines': [payload['lines'][1]]}, 409)
-        self.request(path, 'PUT', {**payload, 'lines': [{**payload['lines'][0], 'qty': 3}]}, 409)
-        updated = {**payload, 'notes': '更新数量和价格', 'lines': [{**payload['lines'][0], 'qty': 5, 'price': 4}]}
+        updated = {**payload, 'notes': '更新数量和价格', 'lines': [{**payload['lines'][0], 'qty': 3, 'price': 4}]}
         self.request(path, 'PUT', {**updated, 'expected': snapshot})
         self.request(path, 'DELETE', {'expected': snapshot}, 409)
         state = self.state()
         self.assertEqual((state['purchases'][0]['code'], state['purchases'][0]['created_at']),
                          (order['code'], order['created_at']))
-        self.assertEqual([(row['id'], row['qty'], row['received']) for row in state['purchase_lines']], [(line, 5, 4)])
+        self.assertEqual([(row['id'], row['qty'], row['received']) for row in state['purchase_lines']], [(line, 3, 4)])
         self.request('movements/' + receipt, 'DELETE')
         self.request(path, 'PUT', {**updated, 'supplier_id': other_supplier, 'lines': payload['lines']})
         self.assertIn((other_part, other_supplier), {(row['part_id'], row['supplier_id']) for row in self.state()['quotes']})

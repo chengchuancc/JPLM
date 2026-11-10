@@ -77,7 +77,7 @@ import {
   type Column,
 } from "./material-table";
 import { MaterialCategory, TableOptionPicker } from "./material-category";
-import { OptionTag } from "./option-tag";
+import { materialCategoryTone, OptionTag } from "./option-tag";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
 import { Dialog } from "./dialog";
@@ -101,6 +101,12 @@ const date = (s: string) =>
   });
 const datetime = (s: string) =>
   new Date(s).toLocaleString("zh-CN", { hour12: false });
+const recentMovements = (rows: Movement[]) => rows.slice().reverse()
+  .sort((a, b) => b.occurred_at.localeCompare(a.occurred_at));
+const localDateTime = (value?: string) => {
+  const date = value ? new Date(value) : new Date();
+  return new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 19);
+};
 const appBase = new URL(".", document.baseURI).pathname;
 const fileUrl = (id: string) => appBase + "files/" + encodeURIComponent(id);
 async function api(path: string, method = "GET", data?: unknown) {
@@ -1875,6 +1881,11 @@ function Workspace({
       </div>
     </div>;
   }
+  function receivedQuantity(line: PurchaseLine) {
+    return <>{amount(line.received)}
+      {line.received > line.qty && <small className="purchase-overage">超收 {amount(line.received - line.qty)}</small>}
+    </>;
+  }
   const supplier = findSupplier(detail);
   const suppliedMaterials = supplier
     ? state.quotes.filter((q) => q.supplier_id === supplier.id)
@@ -2319,7 +2330,7 @@ function Workspace({
       />
     );
   }
-  function movementTable(rows: Movement[]) {
+  function movementTable(rows: Movement[], limit = rows.length) {
     return (
       <div className="table-wrap">
         <table>
@@ -2332,14 +2343,12 @@ function Workspace({
               <th>关联记录</th>
               <th>经办人</th>
               <th>用途 / 原因</th>
-              <th>时间</th>
+              <th>操作时间</th>
               {!archived && <th>操作</th>}
             </tr>
           </thead>
           <tbody>
-            {rows
-              .slice()
-              .reverse()
+            {recentMovements(rows).slice(0, limit)
               .map((m) => {
                 const p = findPart(m.part_id);
                 const pl = state.purchase_lines.find(
@@ -2351,7 +2360,7 @@ function Workspace({
                 return (
                   <tr key={m.id}>
                     <td>
-                      <Badge>{m.type}</Badge>
+                      <OptionTag label={m.type} />
                       <small className="mono">{m.code}</small>
                     </td>
                     <td>
@@ -2397,7 +2406,7 @@ function Workspace({
                     </td>
                     <td>{userName(m.handler_id)}</td>
                     <td>{m.reason || "—"}</td>
-                    <td className="muted nowrap">{datetime(m.created_at)}</td>
+                    <td className="muted nowrap" title={"登记时间 " + datetime(m.created_at)}>{datetime(m.occurred_at)}</td>
                     {!archived && <td>{p && !p.deleted_at && (
                       <Button type="button" small aria-label={"编辑流水 " + m.code}
                         onClick={() => setModal({ kind: "movement", item: m })}>
@@ -3837,7 +3846,7 @@ function Workspace({
                               </td>
                               <td>{findSupplier(po.supplier_id)?.name}</td>
                               <td className="num">{amount(l.qty)}</td>
-                              <td className="num">{amount(l.received)}</td>
+                              <td className="num">{receivedQuantity(l)}</td>
                               <td className="num">
                                 {amount(Math.max(0, l.qty - l.received))}
                               </td>
@@ -4180,7 +4189,7 @@ function Workspace({
                               </td>
                               <td>
                                 <div className="purchase-summary-actions">
-                                  <Badge>{costStatus(p)}</Badge>
+                                  <OptionTag label={costStatus(p)} />
                                   {!archived && <Button type="button" small
                                     aria-label={"编辑采购单 " + p.code}
                                     onClick={() => setModal({ kind: "purchase", item: p })}>
@@ -4203,7 +4212,7 @@ function Workspace({
                                   <td className="num">
                                     {amount(l.qty)} {part?.unit}
                                   </td>
-                                  <td className="num">{amount(l.received)}</td>
+                                  <td className="num">{receivedQuantity(l)}</td>
                                   <td className="num">
                                     {amount(Math.max(0, l.qty - l.received))}
                                   </td>
@@ -4211,8 +4220,7 @@ function Workspace({
                                     {money(l.price * l.qty)}
                                   </td>
                                   <td>
-                                    {l.received < l.qty &&
-                                      !part?.deleted_at && (
+                                    {!archived && part && !part.deleted_at && (
                                         <Button
                                           small
                                           onClick={() =>
@@ -4225,7 +4233,7 @@ function Workspace({
                                             })
                                           }
                                         >
-                                          办理入库
+                                          {l.received >= l.qty ? "补充入库" : "办理入库"}
                                           <ChevronRight size={13} />
                                         </Button>
                                       )}
@@ -4267,7 +4275,7 @@ function Workspace({
                 <div className="detail-title">
                   <div className="inline">
                     <h1 className="mono">{purchase.code}</h1>
-                    <Badge>{costStatus(purchase)}</Badge>
+                    <OptionTag label={costStatus(purchase)} />
                   </div>
                   <p>
                     {findSupplier(purchase.supplier_id)?.name}
@@ -4291,6 +4299,7 @@ function Workspace({
                           采购数量: l.qty,
                           已入库: l.received,
                           待入库: Math.max(0, l.qty - l.received),
+                          超收: Math.max(0, l.received - l.qty),
                           单价: l.price,
                         })),
                       purchase.code,
@@ -4329,14 +4338,14 @@ function Workspace({
                             </td>
                             <td className="num">{money(l.price)}</td>
                             <td className="num">{money(l.price * l.qty)}</td>
-                            <td className="num">{amount(l.received)}</td>
+                            <td className="num">{receivedQuantity(l)}</td>
                             <td className="num">
                               {amount(Math.max(0, l.qty - l.received))}
                             </td>
                             <td>
                               {p?.deleted_at ? (
                                 <span className="muted">物料已删除</span>
-                              ) : l.received < l.qty ? (
+                              ) : !archived ? (
                                 <Button
                                   small
                                   onClick={() =>
@@ -4347,7 +4356,7 @@ function Workspace({
                                   }
                                 >
                                   <ArrowDownToLine size={14} />
-                                  入库
+                                  {l.received >= l.qty ? "补充入库" : "入库"}
                                 </Button>
                               ) : (
                                 <span className="muted">已完成</span>
@@ -4412,7 +4421,7 @@ function Workspace({
                     small
                     onClick={() =>
                       exportCSV(
-                        state.movements
+                        recentMovements(state.movements)
                           .filter(
                             (m) =>
                               (filter === "全部" || m.type === filter) &&
@@ -4432,7 +4441,8 @@ function Workspace({
                             结存: m.balance,
                             关联产品: findProduct(m.product_id)?.name || "",
                             原因: m.reason,
-                            时间: datetime(m.created_at),
+                            操作时间: datetime(m.occurred_at),
+                            登记时间: datetime(m.created_at),
                           })),
                         "库存流水",
                       )
@@ -4898,11 +4908,11 @@ function Workspace({
               </dl>
               {!archived && <div className="inventory-detail-actions">{inventoryRowActions(inventoryPart, true)}</div>}
               <h3>库存流水</h3>
-              {movementTable(state.movements.filter((row) => row.part_id === inventoryPart.id).slice(-10))}
+              {movementTable(state.movements.filter((row) => row.part_id === inventoryPart.id), 10)}
             </Dialog>
           )}
           {modal.kind === "movement" && (
-            <Dialog title={modal.item.id ? "编辑库存流水" : "库存操作"} onClose={() => setModal(null)}>
+            <Dialog title={modal.item.id ? "编辑库存流水" : "库存操作"} onClose={() => setModal(null)} wide>
               <MovementForm
                 state={state}
                 initial={modal.item}
@@ -5380,19 +5390,19 @@ function MovementForm({
   const [original, setOriginal] = useState(initial.original_id || "");
   const [qty, setQty] = useState(String(initial.qty || ""));
   const [product, setProduct] = useState(initial.product_id || "");
+  const [initialTimestamp] = useState(() => initial.occurred_at || initial.created_at || new Date().toISOString());
+  const initialTime = localDateTime(initialTimestamp);
+  const [operationTime, setOperationTime] = useState(initialTime);
   const [handler, setHandler] = useState(initial.handler_id || "");
   const [reason, setReason] = useState(initial.reason || "");
   const removal = useRecordRemoval(remove);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const p = state.parts.find((p) => p.id === part);
-  const image = p && state.files.find((file) =>
-    file.owner_type === "parts" && file.owner_id === p.id && file.kind === "image",
-  );
-  const position = state.movements.findIndex((movement) => movement.id === initial.id);
-  const priorMovements = position < 0 ? state.movements : state.movements.slice(0, position);
-  const originals = priorMovements
-    .filter((m) => m.type === "出库" && m.part_id === part)
+  const photos = React.useMemo(() => firstMaterialPhotos(state.files), [state.files]);
+  const timestamp = new Date(operationTime === initialTime ? initialTimestamp : operationTime);
+  const originals = state.movements
+    .filter((m) => m.type === "出库" && m.part_id === part && new Date(m.occurred_at) <= timestamp)
     .map((m) => ({
       ...m,
       remaining:
@@ -5405,12 +5415,14 @@ function MovementForm({
         ) / 1e6,
     }))
     .filter((m) => m.remaining > 0);
-  const sources = state.purchase_lines.filter((line) => line.part_id === part).map((line) => ({
-    ...line,
-    remaining: Math.round((line.qty - line.received +
-      (line.id === initial.purchase_line_id && initial.id ? initial.qty || 0 : 0)) * 1e6) / 1e6,
-  })).filter((line) => line.remaining > 0);
+  const sources = state.purchase_lines.filter((line) => line.part_id === part);
   const handlers = [...state.users, ...state.former_users.filter((user) => user.id === initial.handler_id)];
+  function choosePart(id: string) {
+    setPart(id);
+    setSource("");
+    setOriginal("");
+    setQty("");
+  }
   return (
     <form
       onSubmit={async (e) => {
@@ -5429,6 +5441,7 @@ function MovementForm({
             original_id: type === "退库" ? original : null,
             reason,
             handler_id: handler,
+            occurred_at: initial.id && operationTime === initialTime ? undefined : timestamp.toISOString(),
           });
         } catch (e) {
           setError((e as Error).message);
@@ -5454,31 +5467,27 @@ function MovementForm({
           </button>
         ))}
       </div>
-      <div className="form-grid">
-        <PersonSelect
-          users={handlers}
-          label="经办人"
-          value={handler}
-          onChange={setHandler}
-        />
-
-        <label className="wide-field">选择物料 *</label>
-        <SearchPart
-          parts={state.parts}
-          create={type === "入库" ? { resource: "parts" } : undefined}
-          value={part}
-          onChange={(v) => {
-            setPart(v);
-            setSource("");
-            setOriginal("");
-            setQty("");
-          }}
-        />
+      <MaterialPicker
+        state={state}
+        photos={photos}
+        selected={new Set(part ? [part] : [])}
+        onToggle={(id) => choosePart(id === part ? "" : id)}
+        onAdd={type === "入库" ? choosePart : undefined}
+        forStock
+      />
+      <div className="form-grid movement-fields">
+        <PersonSelect users={handlers} label="经办人" value={handler} onChange={setHandler} />
+        <label>
+          操作时间 *
+          <input type="datetime-local" required step={1} value={operationTime}
+            onChange={(event) => setOperationTime(event.target.value)} />
+        </label>
         {p && (
           <div className="stock-hint wide-field">
-            <MaterialThumbnail imageId={image?.id} alt={p.name + "物料图片"} className="stock-material-photo" />
+            <MaterialThumbnail imageId={photos.get(p.id)} alt={p.name + "物料图片"} className="stock-material-photo" />
             <div className="stock-material-info">
-              当前库存 <strong>{amount(p.stock)} {p.unit}</strong>
+              <strong>{p.name}</strong>
+              <small>{p.code} · 当前库存 {amount(p.stock)} {p.unit}</small>
               {p.spec && <small>{p.spec}</small>}
               {p.location && <small>仓库位置 {p.location}</small>}
             </div>
@@ -5517,18 +5526,22 @@ function MovementForm({
           <label>
             关联采购明细
             <select
+              aria-label="关联采购明细"
               value={source}
               onChange={(e) => {
                 setSource(e.target.value);
                 const l = sources.find((l) => l.id === e.target.value);
-                if (l) setQty(String(l.remaining));
+                if (l) {
+                  const remaining = Math.max(0, l.qty - l.received);
+                  setQty(remaining ? String(remaining) : "");
+                }
               }}
             >
               <option value="">独立入库</option>
               {sources.map((l) => (
                 <option key={l.id} value={l.id}>
                   {state.purchases.find((p) => p.id === l.purchase_id)?.code} ·
-                  {initial.id ? "可入" : "待入"} {amount(l.remaining)}
+                  已入 {amount(l.received)} / 采购 {amount(l.qty)}
                 </option>
               ))}
             </select>
@@ -5538,6 +5551,7 @@ function MovementForm({
           <label className="wide-field">
             原出库记录 *
             <select
+              aria-label="原出库记录"
               required
               value={original}
               onChange={(e) => setOriginal(e.target.value)}
@@ -5545,7 +5559,7 @@ function MovementForm({
               <option value="">请选择原出库记录</option>
               {originals.map((m) => (
                 <option key={m.id} value={m.id}>
-                  {m.code} · 可退 {amount(m.remaining)} {p?.unit} ·{" "}
+                  {m.code} · {datetime(m.occurred_at)} · 可退 {amount(m.remaining)} {p?.unit} ·{" "}
                   {m.reason || "研发领料"}
                 </option>
               ))}
@@ -5577,58 +5591,21 @@ function MovementForm({
         </div>
       )}
       <RecordFormActions removal={removal} busy={busy} onCancel={onCancel}
-        saveLabel={initial.id ? "保存修改" : "确认" + type} deleteLabel="删除流水"
+        canSave={!!part} saveLabel={initial.id ? "保存修改" : "确认" + type} deleteLabel="删除流水"
         confirmText={`删除流水 ${initial.code}？库存和采购入库数量将重新计算。`} />
     </form>
   );
 }
-function SearchPart({
-  parts,
-  create,
-  value,
-  onChange,
-}: {
-  parts: Part[];
-  create?: CreateChoice;
-  value: string;
-  onChange: (v: string) => void;
-}) {
-  const [search, setSearch] = useState("");
-  return (
-    <div className="part-selector wide-field">
-      <input
-        placeholder="搜索物料编码、名称、规格…"
-        aria-label="搜索物料"
-        value={search}
-        onChange={(e) => setSearch(e.target.value)}
-      />
-      <ChoiceSelect
-        create={create}
-        required
-        aria-label="选择物料"
-        value={value}
-        onValueChange={onChange}
-      >
-        <option value="">请选择物料</option>
-        {parts
-          .filter(
-            (p) =>
-              p.id === value ||
-              [p.name, p.code, p.spec]
-                .join(" ")
-                .toLowerCase()
-                .includes(search.toLowerCase()),
-          )
-          .map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.code} · {p.name} / {p.spec}
-            </option>
-          ))}
-      </ChoiceSelect>
-    </div>
-  );
+const MATERIAL_PICKER_PAGE_SIZE = 40;
+
+function firstMaterialPhotos(files: FileRecord[]) {
+  const photos = new Map<string, string>();
+  for (const file of files) {
+    if (file.owner_type === "parts" && file.kind === "image" && !photos.has(file.owner_id))
+      photos.set(file.owner_id, file.id);
+  }
+  return photos;
 }
-const PURCHASE_MATERIAL_PAGE_SIZE = 40;
 
 function MaterialThumbnail({ imageId, alt = "", className }: { imageId?: string; alt?: string; className: string }) {
   const [failedImage, setFailedImage] = useState<string>();
@@ -5643,20 +5620,22 @@ function MaterialThumbnail({ imageId, alt = "", className }: { imageId?: string;
   );
 }
 
-function PurchaseMaterialPicker({
+function MaterialPicker({
   state,
   photos,
   quotesByPart,
   selected,
   onToggle,
   onAdd,
+  forStock = false,
 }: {
   state: State;
   photos: Map<string, string>;
-  quotesByPart: Map<string, Map<string, Quote>>;
+  quotesByPart?: Map<string, Map<string, Quote>>;
   selected: Set<string>;
   onToggle: (id: string) => void;
-  onAdd: (id: string) => void;
+  onAdd?: (id: string) => void;
+  forStock?: boolean;
 }) {
   const openChoice = useContext(ChoiceContext);
   const [query, setQuery] = useState("");
@@ -5688,22 +5667,22 @@ function PurchaseMaterialPicker({
       .toLowerCase();
     return terms.every((term) => searchText.includes(term));
   });
-  const lastPage = Math.max(0, Math.ceil(matches.length / PURCHASE_MATERIAL_PAGE_SIZE) - 1);
+  const lastPage = Math.max(0, Math.ceil(matches.length / MATERIAL_PICKER_PAGE_SIZE) - 1);
   const currentPage = Math.min(page, lastPage);
-  const start = currentPage * PURCHASE_MATERIAL_PAGE_SIZE;
+  const start = currentPage * MATERIAL_PICKER_PAGE_SIZE;
   const updateFilter = (setter: (value: string) => void, value: string) => {
     setter(value);
     setPage(0);
   };
 
   return (
-    <section aria-label="选择采购物料">
+    <section aria-label={forStock ? "选择库存物料" : "选择采购物料"}>
       <div className="purchase-picker-toolbar">
         <div className="search-input">
           <Search size={15} />
           <input
             type="search"
-            aria-label="搜索采购物料"
+            aria-label={forStock ? "搜索库存物料" : "搜索采购物料"}
             placeholder="搜索料号、名称、规格、外部料号…"
             value={query}
             onChange={(event) => updateFilter(setQuery, event.target.value)}
@@ -5712,7 +5691,7 @@ function PurchaseMaterialPicker({
             }}
           />
         </div>
-        {openChoice && (
+        {openChoice && onAdd && (
           <Button
             small
             type="button"
@@ -5762,7 +5741,7 @@ function PurchaseMaterialPicker({
         </select>
       </div>
       <div className="purchase-picker-results" key={JSON.stringify([query, category, level, product, currentPage])}>
-        {matches.slice(start, start + PURCHASE_MATERIAL_PAGE_SIZE).map((part) => {
+        {matches.slice(start, start + MATERIAL_PICKER_PAGE_SIZE).map((part) => {
           const checked = selected.has(part.id);
           const products = Array.from(bomProductsByPart.get(part.id) || [],
             (id) => productById.get(id)?.name).filter(Boolean);
@@ -5780,10 +5759,11 @@ function PurchaseMaterialPicker({
                 <small>{[part.code, part.spec, part.external_code].filter(Boolean).join(" · ")}</small>
               </span>
               <span className="purchase-material-meta">
-                <span>{part.category} · {part.material_level === 1 ? "一级" : "二级"}</span>
+                <OptionTag label={part.category} tone={materialCategoryTone(part.category, state.material_categories)} />
                 <small>
-                  {products.join("、") || "未关联 BOM"}
-                  {!quotesByPart.get(part.id)?.size && " · 未关联供应商"}
+                  {forStock ? "库存 " + amount(part.stock) + " " + part.unit +
+                    (part.location ? " · " + part.location : "") :
+                    (products.join("、") || "未关联 BOM") + (!quotesByPart?.get(part.id)?.size ? " · 未关联供应商" : "")}
                 </small>
               </span>
               {checked ? <Check size={16} /> : <Plus size={16} />}
@@ -5865,11 +5845,7 @@ function PurchaseForm({
   const owners = [...state.users, ...state.former_users.filter((user) => user.id === initial?.responsible_id)];
   const { partsById, photos, quotesByPart } = React.useMemo(() => {
     const partsById = new Map([...state.parts, ...state.deleted_parts].map((part) => [part.id, part]));
-    const photos = new Map<string, string>();
-    for (const file of state.files) {
-      if (file.owner_type === "parts" && file.kind === "image" && !photos.has(file.owner_id))
-        photos.set(file.owner_id, file.id);
-    }
+    const photos = firstMaterialPhotos(state.files);
     const quotesByPart = new Map<string, Map<string, Quote>>();
     for (const quote of state.quotes) {
       if (!quotesByPart.has(quote.part_id)) quotesByPart.set(quote.part_id, new Map());
@@ -5936,7 +5912,7 @@ function PurchaseForm({
         }
       }}
     >
-      <PurchaseMaterialPicker
+      <MaterialPicker
         state={state}
         photos={photos}
         quotesByPart={quotesByPart}
@@ -5972,7 +5948,7 @@ function PurchaseForm({
                   aria-label={part.name + " 数量"}
                   type="number"
                   required
-                  min={Math.max(received, 0.000001)}
+                  min="0.000001"
                   step="any"
                   value={line.qty}
                   onChange={(event) => updateLine(part.id, { qty: event.target.value })}
@@ -6646,7 +6622,9 @@ function InlineCell({
     }
   }
   const display = options?.find((option) => option.value === String(value))?.label ?? String(value ?? "");
-  const content = display && (options || categoryOptions) ? <OptionTag label={display} /> : display || "—";
+  const content = display && (options || categoryOptions)
+    ? <OptionTag label={display} tone={categoryOptions && materialCategoryTone(display, categoryOptions)} />
+    : display || "—";
   if (archived) return <span>{content}</span>;
   if (!editing)
     return (

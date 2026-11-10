@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { GripVertical, SlidersHorizontal } from "lucide-react";
 import { TableOptionPicker } from "./material-category";
+import { materialCategoryTone } from "./option-tag";
 
 const fields = {
   code: ["料号", 110],
@@ -337,7 +338,7 @@ export function MaterialTable({
                         label="类别筛选"
                         value={category}
                         choices={[{ value: "", label: "类别", tone: "slate" },
-                          ...categoryOptions.map((item) => ({ value: item, label: item }))]}
+                          ...categoryOptions.map((item) => ({ value: item, label: item, tone: materialCategoryTone(item, categoryOptions) }))]}
                         onChange={setCategory}
                       />
                     </div>

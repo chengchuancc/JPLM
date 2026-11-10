@@ -16,7 +16,7 @@ import shipping
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
-    RECORD_DELETION_VERSION, migrate_material_categories, migrate_projects,
+    RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_material_links_child ON material_links(child_id);
 CREATE TABLE IF NOT EXISTS bom_versions(id TEXT PRIMARY KEY,product_id TEXT NOT NULL REFERENCES products(id),name TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL,UNIQUE(product_id,name));
 CREATE TABLE IF NOT EXISTS bom_lines(id TEXT PRIMARY KEY,version_id TEXT NOT NULL REFERENCES bom_versions(id) ON DELETE CASCADE,part_id TEXT NOT NULL REFERENCES parts(id),qty REAL NOT NULL CHECK(qty>0),reference TEXT NOT NULL DEFAULT '',notes TEXT NOT NULL DEFAULT '',UNIQUE(version_id,part_id));
 CREATE TABLE IF NOT EXISTS purchases(id TEXT PRIMARY KEY,code TEXT UNIQUE NOT NULL,supplier_id TEXT NOT NULL REFERENCES suppliers(id),date TEXT NOT NULL,notes TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS purchase_lines(id TEXT PRIMARY KEY,purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,part_id TEXT NOT NULL REFERENCES parts(id),qty REAL NOT NULL CHECK(qty>0),price REAL NOT NULL CHECK(price>=0),received REAL NOT NULL DEFAULT 0 CHECK(received>=0 AND received<=qty),UNIQUE(purchase_id,part_id));
+CREATE TABLE IF NOT EXISTS purchase_lines(id TEXT PRIMARY KEY,purchase_id TEXT NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,part_id TEXT NOT NULL REFERENCES parts(id),qty REAL NOT NULL CHECK(qty>0),price REAL NOT NULL CHECK(price>=0),received REAL NOT NULL DEFAULT 0 CHECK(received>=0),UNIQUE(purchase_id,part_id));
 CREATE TABLE IF NOT EXISTS movements(id TEXT PRIMARY KEY,code TEXT UNIQUE NOT NULL,type TEXT NOT NULL CHECK(type IN ('入库','出库','退库','报废')),part_id TEXT NOT NULL REFERENCES parts(id),qty REAL NOT NULL CHECK(qty>0),balance REAL NOT NULL CHECK(balance>=0),product_id TEXT REFERENCES products(id),purchase_line_id TEXT REFERENCES purchase_lines(id),original_id TEXT REFERENCES movements(id),reason TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY,owner_type TEXT NOT NULL CHECK(owner_type IN ('products','parts')),owner_id TEXT NOT NULL,name TEXT NOT NULL,mime TEXT NOT NULL,size INTEGER NOT NULL,kind TEXT NOT NULL,created_at TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS idx_movements_part ON movements(part_id);
@@ -114,6 +114,8 @@ def init_db(directory=None, bootstrap=None):
             migrate_projects(db, now())
         if version < MATERIAL_CATEGORIES_VERSION:
             migrate_material_categories(db)
+        if version < INVENTORY_TIME_VERSION:
+            migrate_inventory(db)
         db.execute('BEGIN IMMEDIATE')
         db.execute(COVER_TABLE)
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(projects)')}:
@@ -468,20 +470,41 @@ def movement_delta(kind, qty):
     return qty if kind in ('入库', '退库') else -qty
 
 
-def adjust_stock(db, part, delta, after=None):
-    balance = round(part['stock'] + delta, 6)
-    if balance < 0:
-        raise Problem('库存不足，无法完成此操作')
-    if delta:
-        if after is not None:
-            # 按登记顺序修正后续结存，保留编辑位置之前的历史。
-            params = (db.project_id, part['id'], after)
-            lowest = db.execute("""SELECT code,balance FROM movements WHERE project_id=? AND part_id=?
-                AND rowid>? AND deleted_at IS NULL ORDER BY balance LIMIT 1""", params).fetchone()
-            if lowest and round(lowest['balance'] + delta, 6) < 0:
-                raise Problem(f'操作后流水 {lowest["code"]} 的库存结存会为负数', 409)
-            db.execute("""UPDATE movements SET balance=ROUND(balance+?,6)
-                WHERE project_id=? AND part_id=? AND rowid>? AND deleted_at IS NULL""", (delta, *params))
+def movement_time(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if parsed.tzinfo is None:
+            raise ValueError()
+        return parsed.astimezone(timezone.utc).isoformat(timespec='microseconds')
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        raise Problem('请选择有效的操作时间') from None
+
+
+def opening_stock(db, part):
+    total = db.execute("""SELECT COALESCE(SUM(CASE WHEN type IN ('入库','退库') THEN qty ELSE -qty END),0)
+        FROM movements WHERE project_id=? AND part_id=? AND deleted_at IS NULL""", (db.project_id, part['id'])).fetchone()[0]
+    return round(part['stock'] - total, 6)
+
+
+def rebuild_stock(db, part, opening, status=409):
+    balance = opening
+    outflows = set()
+    updates = []
+    # 同一时间按原登记顺序排，保留旧流水的顺序。
+    for row in db.execute("""SELECT id,code,type,qty,balance,original_id FROM movements
+        WHERE project_id=? AND part_id=? AND deleted_at IS NULL ORDER BY occurred_at,rowid""",
+        (db.project_id, part['id'])):
+        if row['original_id'] and row['original_id'] not in outflows:
+            raise Problem('原出库记录必须早于退库记录')
+        if row['type'] == '出库':
+            outflows.add(row['id'])
+        balance = round(balance + movement_delta(row['type'], row['qty']), 6)
+        if balance < 0:
+            raise Problem(f'库存不足，流水 {row["code"]} 的结存会为负数', status)
+        if row['balance'] != balance:
+            updates.append((balance, row['id']))
+    db.executemany('UPDATE movements SET balance=? WHERE id=?', updates)
+    if part['stock'] != balance:
         db.execute('UPDATE parts SET stock=?,updated_at=? WHERE id=?', (balance, now(), part['id']))
     return balance
 
@@ -499,19 +522,19 @@ def movement_description(db, row, part):
         text += ' · 经办人 ' + exists(db, 'users', row['handler_id'])['name']
     if row['reason']:
         text += ' · 用途 / 原因 ' + row['reason']
-    return text
+    return text + ' · 操作时间 ' + row['occurred_at']
 
 
 def check_movement_snapshot(row, expected):
     if expected is not None and (not isinstance(expected, dict) or any(
-            key not in expected or expected[key] != row[key] for key in MOVEMENT_FIELDS)):
+            key not in expected or expected[key] != row[key] for key in MOVEMENT_FIELDS)
+            or expected.get('occurred_at', row['occurred_at']) != row['occurred_at']):
         raise Problem('该流水已被修改，请刷新后重试', 409)
 
 
 def adjust_purchase_received(db, line_id, delta):
     line = active_purchase_line(db, line_id)
     received = round(line['received'] + delta, 6)
-    if received > line['qty']: raise Problem('入库数量超过待入库数量')
     if received < 0: raise Problem('采购明细的已入库数量不足，无法调整')
     if delta:
         db.execute('UPDATE purchase_lines SET received=? WHERE id=?', (received, line_id))
@@ -526,11 +549,11 @@ def delete_movement(db, movement_id, expected, actor):
                   (movement_id,)).fetchone():
         raise Problem('该流水仍有关联的退库记录，请先处理退库记录', 409)
     part = active_part(db, row['part_id'])
-    position = db.execute('SELECT rowid FROM movements WHERE id=?', (movement_id,)).fetchone()[0]
-    balance = adjust_stock(db, part, -movement_delta(row['type'], row['qty']), position)
+    opening = opening_stock(db, part)
     if row['purchase_line_id']:
         adjust_purchase_received(db, row['purchase_line_id'], -row['qty'])
     db.execute('UPDATE movements SET deleted_at=? WHERE id=?', (now(), movement_id))
+    balance = rebuild_stock(db, part, opening)
     log_activity(db, actor, '删除库存流水', part['id'], row['code'],
                  f'{movement_description(db, row, part)} · 当前结存 {balance:g} {part["unit"]}')
     return movement_id
@@ -538,12 +561,10 @@ def delete_movement(db, movement_id, expected, actor):
 
 def record_movement(db, data, actor=None, *, movement_id=None):
     old = exists(db, 'movements', movement_id) if movement_id else None
-    position = None
     if old:
         if old['deleted_at']:
             raise Problem('库存流水已删除', 404)
         check_movement_snapshot(old, data.get('expected'))
-        position = db.execute('SELECT rowid FROM movements WHERE id=?', (movement_id,)).fetchone()[0]
         data = {**old, **data}
 
     kind = data.get('type')
@@ -572,8 +593,6 @@ def record_movement(db, data, actor=None, *, movement_id=None):
         original = exists(db, 'movements', original_id)
         if original['deleted_at'] or original['type'] != '出库' or original['part_id'] != part['id']:
             raise Problem('请选择该物料的原出库记录')
-        if old and db.execute('SELECT rowid FROM movements WHERE id=?', (original_id,)).fetchone()[0] >= position:
-            raise Problem('原出库记录必须早于退库记录')
         returned = db.execute("""SELECT COALESCE(SUM(qty),0) FROM movements
             WHERE original_id=? AND id<>? AND deleted_at IS NULL""", (original_id, movement_id or '')).fetchone()[0]
         if qty > round(original['qty'] - returned,6): raise Problem('退库数量超过原出库尚未退回的数量')
@@ -594,40 +613,35 @@ def record_movement(db, data, actor=None, *, movement_id=None):
         handler = old['handler_id'] if old['handler_id'] == handler_id else assign_user(db, handler_id)
     else:
         handler = assign_user(db, handler_id or (actor['id'] if actor else None))
-    delta = movement_delta(kind, qty)
+    stamp = now()
+    occurred_at = data.get('occurred_at', stamp)
+    if not old or occurred_at != old['occurred_at']:
+        occurred_at = movement_time(occurred_at)
     values = dict(type=kind, part_id=part['id'], qty=qty, product_id=product_id, purchase_line_id=purchase_line,
-                  original_id=original_id, reason=reason, handler_id=handler)
+                  original_id=original_id, reason=reason, handler_id=handler, occurred_at=occurred_at)
     if old:
         if all(old[key] == value for key, value in values.items()):
             return movement_id
         old_part = part if old['part_id'] == part['id'] else active_part(db, old['part_id'])
-        old_delta = movement_delta(old['type'], old['qty'])
-        if old_part['id'] == part['id']:
-            balance = round(old['balance'] + delta - old_delta, 6)
-            adjust_stock(db, part, round(delta - old_delta, 6), position)
-        else:
-            # 用新物料下一条流水反推当时库存，兼容有期初库存的旧数据。
-            following = db.execute("""SELECT type,qty,balance FROM movements
-                WHERE project_id=? AND part_id=? AND rowid>? AND deleted_at IS NULL ORDER BY rowid LIMIT 1""",
-                (db.project_id, part['id'], position)).fetchone()
-            opening = following['balance'] - movement_delta(following['type'], following['qty']) if following else part['stock']
-            balance = round(opening + delta, 6)
-            adjust_stock(db, old_part, -old_delta, position)
-            adjust_stock(db, part, delta, position)
-        if balance < 0:
-            raise Problem('修改后该流水的库存结存会为负数', 409)
-        values['balance'] = balance
+        stock_fields = ('part_id', 'qty', 'type', 'occurred_at', 'original_id')
+        changed_stock = any(old[key] != values[key] for key in stock_fields)
+        affected = {part['id']: part, old_part['id']: old_part} if changed_stock else {}
+        openings = {id: opening_stock(db, record) for id, record in affected.items()}
         db.execute('UPDATE movements SET ' + ','.join(key+'=?' for key in values) + ' WHERE id=?',
                    (*values.values(), movement_id))
+        for id, record in affected.items():
+            rebuild_stock(db, record, openings[id])
         before = movement_description(db, old, old_part)
         after = movement_description(db, values, part)
         log_activity(db, actor, '修改库存流水', part['id'], old['code'], before + ' → ' + after)
         return movement_id
 
-    balance = adjust_stock(db, part, delta)
+    opening = opening_stock(db, part)
     mid = uid()
     code = next_code(db, 'ST')
-    insert_scoped(db, 'movements', dict(id=mid, code=code, balance=balance, created_at=now(), **values))
+    insert_scoped(db, 'movements', dict(id=mid, code=code, balance=0, created_at=stamp, **values))
+    rebuild_stock(db, part, opening, status=400)
+    balance = exists(db, 'movements', mid)['balance']
     handler_name = exists(db, 'users', handler)['name'] if handler else ''
     log_activity(db, actor, kind, part['id'], f"{part['code']} {part['name']}",
                  f'{code} · {qty:g} {part["unit"]} · 结余 {balance:g} · 经办人 {handler_name}')
@@ -709,8 +723,6 @@ def record_purchase(db, data, actor, previous=None):
         existing = old_line and not old_line['deleted_at']
         part = exists(db, 'parts', part_id) if existing else active_part(db, part_id)
         qty, price = num(row.get('qty'), True), num(row.get('price'))
-        if old_line and qty < old_line['received']:
-            raise Problem(f'物料「{part["name"]}」的采购数量不能少于已入库数量', 409)
         if old_line:
             db.execute('UPDATE purchase_lines SET qty=?,price=?,deleted_at=NULL WHERE id=?', (qty, price, old_line['id']))
         else:
@@ -1017,6 +1029,8 @@ def stage_restore(archive_path, directory):
                         optional.add('deleted_at')
                     if table in ('movements', 'purchases', 'purchase_lines') and version < RECORD_DELETION_VERSION:
                         optional.add('deleted_at')
+                    if table == 'movements' and version < INVENTORY_TIME_VERSION:
+                        optional.add('occurred_at')
                     if table == 'shipping_ks_orders' and version < shipping.CREATED_AT_VERSION:
                         optional.add('created_at')
                     if table == 'shipping_records' and version < shipping.RECORD_RELATIONS_VERSION:
@@ -1028,6 +1042,8 @@ def stage_restore(archive_path, directory):
                     columns = ','.join(name for name in target_columns if name in source_columns)
                     records = source.execute(f'SELECT {columns} FROM {table} ORDER BY rowid')
                     db.executemany(f'INSERT INTO {table}({columns}) VALUES({",".join("?" for _ in columns.split(","))})', records)
+                if PROJECT_VERSION <= version < INVENTORY_TIME_VERSION:
+                    db.execute("UPDATE movements SET occurred_at=created_at WHERE occurred_at=''")
                 if version == 12:
                     inspection.backfill_from_records(db)
                 if shipping.VERSION <= version < shipping.CREATED_AT_VERSION:

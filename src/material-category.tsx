@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { Check, ChevronDown, Plus } from "lucide-react";
-import { OptionTag, type OptionTone } from "./option-tag";
+import { materialCategoryTone, OptionTag, type OptionTone } from "./option-tag";
 
 type PickerProps = {
   label: string; value: string; options: string[]; disabled?: boolean; autoOpen?: boolean;
@@ -10,7 +10,9 @@ type PickerProps = {
 type Choice = { value: string; label: string; tone?: OptionTone };
 
 export function MaterialCategory({ options, ...props }: PickerProps) {
-  const choices = [...new Set([...options, props.value].filter(Boolean))].map((value) => ({ value, label: value }));
+  const choices = [...new Set([...options, props.value].filter(Boolean))].map((value) => ({
+    value, label: value, tone: materialCategoryTone(value, options),
+  }));
   return <TableOptionPicker {...props} choices={choices} allowNew />;
 }
 
