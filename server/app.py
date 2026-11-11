@@ -2,7 +2,7 @@
 """捷程未来PLM：仅依赖 Python 3.10+ 标准库。"""
 import argparse, hashlib, hmac, io, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil, tempfile, zipfile
 import unicodedata
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from datetime import datetime, timezone
 from email.parser import BytesParser
 from email.policy import default
@@ -16,7 +16,7 @@ import shipping
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
-    RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, COVER_SIZE_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
+    RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, COVER_SIZE_VERSION, IMAGE_NAME_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,6 +26,9 @@ SESSION_COOKIE = ('plm_session_' + hashlib.sha256(BASE_PATH.encode()).hexdigest(
 DATA = Path(os.environ.get('PLM_DATA_DIR', str(ROOT / 'data'))).resolve()
 FILE_BATCH_TYPE = "application/vnd.jplm.file-batch"
 UPLOAD_CHUNK = 1024 * 1024
+MAX_UPLOAD = 20 * UPLOAD_CHUNK
+MAX_COVER = 4 * UPLOAD_CHUNK
+LARGE_UPLOAD = threading.BoundedSemaphore(1)
 FILE_LOCK = threading.RLock()
 IMAGE_MIMES = {
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -138,6 +141,10 @@ def init_db(directory=None, bootstrap=None):
             inspection.backfill_from_records(db)
         if version < MATERIAL_CODE_PREFIX_VERSION:
             migrate_material_codes(db)
+        if version < IMAGE_NAME_VERSION:
+            if 'display_name' not in {row['name'] for row in db.execute('PRAGMA table_info(files)')}:
+                db.execute("ALTER TABLE files ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+            assign_existing_image_names(db)
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -367,6 +374,53 @@ def owner_file_name(original, owner_code, owner_name, position):
         extension = ''
     stem = f'{owner_code} {label}' if label else owner_code
     return f'{stem}（{position:02d}）{extension.lower()}'
+
+def assign_existing_image_names(db):
+    owners = {(table, row['id']): (row['code'], row['name'])
+              for table in ('products', 'parts')
+              for row in db.execute(f'SELECT id,code,name FROM {table}')}
+    positions = {}
+    for file in db.execute('SELECT id,owner_type,owner_id,kind,name,display_name FROM files ORDER BY rowid').fetchall():
+        owner = (file['owner_type'], file['owner_id'])
+        positions[owner] = positions.get(owner, 0) + 1
+        if owner in owners and file['kind'] == 'image' and not file['display_name']:
+            name = owner_file_name(file['name'], *owners[owner], positions[owner])
+            db.execute('UPDATE files SET display_name=? WHERE id=?', (name, file['id']))
+
+
+@contextmanager
+def large_upload_slot():
+    if not LARGE_UPLOAD.acquire(blocking=False):
+        raise Problem('有大文件正在处理，请稍后再试', 429)
+    try:
+        yield
+    finally:
+        LARGE_UPLOAD.release()
+
+
+@contextmanager
+def stage_upload_deletion(ids):
+    folder = Path(tempfile.mkdtemp(dir=DATA, prefix='delete-upload-'))
+    moved = []
+    try:
+        for id in ids:
+            if not UPLOAD_ID.fullmatch(id):
+                raise Problem('附件编号无效')
+            source = DATA / 'uploads' / id
+            try:
+                source.replace(folder / id)
+                moved.append(id)
+            except FileNotFoundError:
+                continue
+        yield
+    except Exception:
+        for id in moved:
+            (folder / id).replace(DATA / 'uploads' / id)
+        folder.rmdir()
+        raise
+    else:
+        shutil.rmtree(folder)
+
 
 def remove_upload(id):
     try:
@@ -901,7 +955,7 @@ def get_state(db):
         record = owners.get(owner)
         if record:
             file['original_name'] = file['name']
-            file['name'] = owner_file_name(file['name'], record['code'], record['name'], positions[owner])
+            file['name'] = file['display_name'] or owner_file_name(file['name'], record['code'], record['name'], positions[owner])
     state['deleted_parts'] = [p for p in state['parts'] if p['deleted_at']]
     state['parts'] = [p for p in state['parts'] if not p['deleted_at']]
     state['movements'] = [row for row in state['movements'] if not row['deleted_at']]
@@ -1040,6 +1094,8 @@ def stage_restore(archive_path, directory):
                         optional.add('deleted_at')
                     if table == 'movements' and version < INVENTORY_TIME_VERSION:
                         optional.add('occurred_at')
+                    if table == 'files' and version < IMAGE_NAME_VERSION:
+                        optional.add('display_name')
                     if table == 'shipping_ks_orders' and version < shipping.CREATED_AT_VERSION:
                         optional.add('created_at')
                     if table == 'shipping_records' and version < shipping.RECORD_RELATIONS_VERSION:
@@ -1076,6 +1132,8 @@ def stage_restore(archive_path, directory):
                 db.execute("DELETE FROM settings WHERE key='password'")
                 if version >= 7 and not db.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
                     raise Problem('备份中没有管理员账户')
+                if PROJECT_VERSION <= version < IMAGE_NAME_VERSION:
+                    assign_existing_image_names(db)
                 file_ids = {r['id'] for r in db.execute('SELECT id FROM files')}
                 if any(not UPLOAD_ID.fullmatch(id) or 'uploads/' + id not in names for id in file_ids):
                     raise Problem('备份缺少图片或附件')
@@ -1133,6 +1191,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def body(self):
         size = self.body_size()
+        if size > MAX_UPLOAD:
+            raise Problem('单次上传不能超过 20 MB', 413)
         raw = self.rfile.read(size)
         if len(raw) != size:
             raise Problem('上传不完整')
@@ -1245,6 +1305,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.require_admin()
                 return self.list_assets()
             asset_path = re.fullmatch(r'/api/assets/(file|cover|avatar)/([0-9a-f]{24}|legacy)', path)
+            if asset_path and method == 'DELETE':
+                self.require_admin()
+                return self.delete_library_image(*asset_path.groups())
             if asset_path and method == 'GET':
                 self.require_admin()
                 kind, asset_id = asset_path.groups()
@@ -1415,6 +1478,9 @@ class Handler(BaseHTTPRequestHandler):
             return self.electronic_preview(project_id)
         if path == '/api/files' and method == 'POST':
             return self.upload(project_id)
+        if method == 'DELETE' and (match := re.fullmatch(r'/api/deleted-parts/([0-9a-f]{24})', path)):
+            self.require_admin()
+            return self.purge_deleted_part(project_id, match[1])
         data = self.body()
         with FILE_LOCK:
             with transaction() as db:
@@ -1791,6 +1857,8 @@ class Handler(BaseHTTPRequestHandler):
                 project = enter_project(db, project_id, self.user, write=True)
                 if self.user['role'] != 'admin' and project['owner_id'] != self.user['id']:
                     raise Problem('无权修改项目封面', 403)
+            if self.body_size() > MAX_COVER + 65536:
+                raise Problem('项目封面不能超过 4 MB', 413)
             _, uploads = self.multipart()
             if len(uploads) != 1:
                 raise Problem('请选择一张封面图片')
@@ -1798,6 +1866,8 @@ class Handler(BaseHTTPRequestHandler):
             mime = image_mime(image[:12])
             if mime not in ('image/jpeg', 'image/png', 'image/webp'):
                 raise Problem('请选择 JPG、PNG 或 WebP 图片')
+            if len(image) > MAX_COVER:
+                raise Problem('项目封面不能超过 4 MB', 413)
         with FILE_LOCK, transaction() as db:
             user = self.authorized(db)
             if not user or user['must_change']:
@@ -1854,8 +1924,8 @@ class Handler(BaseHTTPRequestHandler):
             raise Problem('请选择一张头像图片')
         _, _, blob = files[0]
         mime = image_mime(blob[:12])
-        if not mime:
-            raise Problem('请选择有效的头像图片')
+        if not mime or len(blob) > 2 * UPLOAD_CHUNK:
+            raise Problem('请选择 2 MB 以内的图片')
         with FILE_LOCK, transaction() as db:
             if not self.authorized(db):
                 raise Problem('请先登录', 401)
@@ -2341,7 +2411,8 @@ class Handler(BaseHTTPRequestHandler):
     def upload(self, project_id):
         with connect() as db:
             enter_project(db, project_id, self.user, write=True)
-        with tempfile.TemporaryDirectory(dir=DATA) as folder:
+        slot = large_upload_slot() if self.body_size() > MAX_UPLOAD else nullcontext()
+        with slot, tempfile.TemporaryDirectory(dir=DATA) as folder:
             directory = Path(folder)
             if self.headers.get_content_type() == FILE_BATCH_TYPE:
                 fields, uploads = self.receive_file_batch(directory)
@@ -2371,13 +2442,17 @@ class Handler(BaseHTTPRequestHandler):
                 if not user or user['must_change']:
                     raise Problem('请先登录', 401)
                 enter_project(db, project_id, user, write=True)
-                exists(db, owner, owner_id)
+                record = exists(db, owner, owner_id)
                 db.execute(f'UPDATE {owner} SET updated_at=? WHERE id=?', (now(), owner_id))
                 old = None
                 if replace_id:
                     old = exists(db, 'files', replace_id)
                     if old['owner_type'] != owner or old['owner_id'] != owner_id:
                         raise Problem('不能替换其他记录的附件')
+                existing = db.execute('SELECT display_name FROM files WHERE owner_type=? AND owner_id=?',
+                                      (owner, owner_id)).fetchall()
+                used_names = {row[0] for row in existing}
+                position = len(existing) + 1
                 for filename, temporary, size in uploads:
                     if not size:
                         raise Problem('不能上传空文件')
@@ -2391,14 +2466,26 @@ class Handler(BaseHTTPRequestHandler):
                         with temporary.open('rb') as source:
                             if image_mime(source.read(12)) != image_type:
                                 raise Problem('图片格式与文件内容不匹配')
+                    display_name = ''
+                    if image_type:
+                        if old and old['display_name']:
+                            display_name = Path(old['display_name']).stem + ext
+                        else:
+                            display_name = owner_file_name(name, record['code'], record['name'], position)
+                            while display_name in used_names:
+                                position += 1
+                                display_name = owner_file_name(name, record['code'], record['name'], position)
+                            used_names.add(display_name)
+                            position += 1
                     temporary.replace(DATA / 'uploads' / fid)
                     created.append(fid)
                     if old:
-                        db.execute('UPDATE files SET id=?,name=?,mime=?,size=?,kind=?,created_at=? WHERE id=?',
-                                   (fid, name, mime, size, kind, now(), old['id']))
+                        db.execute('UPDATE files SET id=?,name=?,mime=?,size=?,kind=?,created_at=?,display_name=? WHERE id=?',
+                                   (fid, name, mime, size, kind, now(), display_name, old['id']))
                     else:
                         insert_scoped(db, 'files', dict(id=fid, owner_type=owner, owner_id=owner_id,
-                                                       name=name, mime=mime, size=size, kind=kind, created_at=now()))
+                                                       name=name, mime=mime, size=size, kind=kind,
+                                                       created_at=now(), display_name=display_name))
                 touch_project(db)
         except Exception:
             for fid in created:
@@ -2407,6 +2494,57 @@ class Handler(BaseHTTPRequestHandler):
         if replace_id:
             remove_upload(replace_id)
         return created
+
+    def delete_library_image(self, kind, id):
+        if self.body().get('confirm') is not True:
+            raise Problem('请确认永久删除图片')
+        with FILE_LOCK, ExitStack() as files, transaction() as db:
+            user = self.authorized(db)
+            if not user or user['role'] != 'admin' or user['must_change']:
+                raise Problem('需要管理员权限', 403)
+            if kind == 'file':
+                file = exists(db, 'files', id)
+                if file['kind'] != 'image':
+                    raise Problem('请选择图片')
+                files.enter_context(stage_upload_deletion([id]))
+                db.execute('DELETE FROM files WHERE id=?', (id,))
+                db.execute('UPDATE projects SET updated_at=? WHERE id=?', (now(), file['project_id']))
+            elif kind == 'cover':
+                db.execute('DELETE FROM project_covers WHERE project_id=?', (id,))
+                db.execute('UPDATE projects SET updated_at=? WHERE id=?', (now(), id))
+            else:
+                db.execute("UPDATE users SET avatar=NULL,avatar_mime='' WHERE id=?", (id,))
+        self.send({'ok': True})
+
+    def purge_deleted_part(self, project_id, id):
+        if self.body().get('confirm') is not True:
+            raise Problem('请确认永久删除物料')
+        with FILE_LOCK, ExitStack() as files, transaction() as db:
+            user = self.authorized(db)
+            if not user or user['role'] != 'admin' or user['must_change']:
+                raise Problem('需要管理员权限', 403)
+            enter_project(db, project_id, user, write=True)
+            part = exists(db, 'parts', id)
+            if not part['deleted_at']:
+                raise Problem('请先将物料移至已删除物料', 409)
+            blockers = [
+                label for table, label in (
+                    ('bom_lines', 'BOM'), ('purchase_lines', '采购明细'), ('movements', '库存流水'),
+                )
+                if db.execute(f'SELECT 1 FROM {table} WHERE part_id=? LIMIT 1', (id,)).fetchone()
+            ]
+            if blockers:
+                raise Problem('物料仍被' + '、'.join(blockers) + '引用，无法永久删除', 409)
+            ids = [row[0] for row in db.execute(
+                "SELECT id FROM files WHERE project_id=? AND owner_type='parts' AND owner_id=?", (project_id, id))]
+            if ids:
+                files.enter_context(stage_upload_deletion(ids))
+            db.execute("DELETE FROM files WHERE project_id=? AND owner_type='parts' AND owner_id=?", (project_id, id))
+            db.execute('DELETE FROM quotes WHERE part_id=?', (id,))
+            db.execute('DELETE FROM parts WHERE id=?', (id,))
+            log_activity(db, user, '永久删除物料', '', part['code'])
+            touch_project(db)
+        self.send({'ok': True})
 
     def list_assets(self):
         query = parse_qs(urlparse(self.path).query)
@@ -2428,7 +2566,7 @@ class Handler(BaseHTTPRequestHandler):
                     FROM projects j LEFT JOIN project_covers c ON c.project_id = j.id
                     WHERE j.deleted_at IS NULL AND c.project_id IS NULL
                 ), assets AS (
-                    SELECT 'file' AS source, f.id, f.name, f.kind, f.size, f.created_at,
+                    SELECT 'file' AS source, f.id, COALESCE(NULLIF(f.display_name, ''), f.name) AS name, f.kind, f.size, f.created_at,
                            COALESCE(j.name, '') AS project,
                            COALESCE(p.code || ' · ' || p.name, m.code || ' · ' || m.name, '') AS owner,
                            (p.id IS NOT NULL OR m.id IS NOT NULL) + (fc.file_id IS NOT NULL) AS reference_count,
@@ -2439,7 +2577,9 @@ class Handler(BaseHTTPRequestHandler):
                     LEFT JOIN parts m ON f.owner_type = 'parts' AND m.id = f.owner_id AND m.project_id = f.project_id
                     LEFT JOIN fallback_covers fc ON fc.file_id = f.id
                     UNION ALL
-                    SELECT 'cover', c.project_id, j.name || ' · 项目封面', 'image', length(c.image),
+                    SELECT 'cover', c.project_id, j.code || ' · 项目封面' ||
+                           CASE c.mime WHEN 'image/jpeg' THEN '.jpg' WHEN 'image/webp' THEN '.webp' ELSE '.png' END,
+                           'image', length(c.image),
                            c.updated_at, j.name, '项目封面', 1, 0
                     FROM project_covers c JOIN projects j ON j.id = c.project_id
                     UNION ALL
@@ -2469,10 +2609,10 @@ class Handler(BaseHTTPRequestHandler):
                         raise Problem('需要管理员权限', 403)
                 else:
                     enter_project(db, f['project_id'], user)
-                name = f['name']
+                name = f['display_name'] or f['name']
                 owner = f['owner_type']
                 record = db.execute(f'SELECT code,name FROM {owner} WHERE id=?', (f['owner_id'],)).fetchone()
-                if record:
+                if record and not f['display_name']:
                     position = db.execute(
                         """SELECT COUNT(*) FROM files WHERE owner_type=? AND owner_id=?
                            AND rowid <= (SELECT rowid FROM files WHERE id=?)""",
@@ -2512,6 +2652,10 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.copyfileobj(source, self.wfile, 1024 * 1024)
 
     def restore(self):
+        with large_upload_slot():
+            return self.receive_restore()
+
+    def receive_restore(self):
         size = self.body_size()
         if not size:
             raise Problem('请选择 ZIP 备份')

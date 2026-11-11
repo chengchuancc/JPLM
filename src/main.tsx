@@ -1160,7 +1160,7 @@ function assetSize(bytes: number) {
   return bytes + " B";
 }
 
-function AssetLibrary() {
+function AssetLibrary({ onChanged }: { onChanged: () => Promise<unknown> }) {
   const [draft, setDraft] = usePageState("assets.draft", "");
   const [search, setSearch] = usePageState("assets.search", "");
   const [kind, setKind] = usePageState("assets.kind", "");
@@ -1169,6 +1169,8 @@ function AssetLibrary() {
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
   const [preview, setPreview] = useState<LibraryAsset | null>(null);
+  const [deleting, setDeleting] = useState<LibraryAsset | null>(null);
+  const [revision, setRevision] = useState(0);
   useEffect(() => {
     let active = true;
     setBusy(true);
@@ -1183,7 +1185,7 @@ function AssetLibrary() {
       }
     }).finally(() => { if (active) setBusy(false); });
     return () => { active = false; };
-  }, [search, kind, page]);
+  }, [search, kind, page, revision]);
 
   return <section className="asset-library">
     <form className="toolbar-controls asset-library-toolbar" onSubmit={(event) => {
@@ -1228,7 +1230,13 @@ function AssetLibrary() {
               {asset.owner || "—"}{asset.fallback_cover ? "、项目封面" : ""}
               {asset.project && <small>{asset.project}</small>}
             </td>
-            <td><a className="text-link" href={assetUrl(asset)} download={asset.name}>下载</a></td>
+            <td><div className="row-actions">
+              <a className="text-link" href={assetUrl(asset)} download={asset.name}>下载</a>
+              {asset.kind === "image" && <button type="button" className="text-link"
+                title="永久删除图片" aria-label={"永久删除图片 " + asset.name} onClick={() => setDeleting(asset)}>
+                <Trash2 size={15} />
+              </button>}
+            </div></td>
           </tr>
         ))}</tbody>
       </table>
@@ -1243,6 +1251,16 @@ function AssetLibrary() {
     </div>}
     {preview && <Dialog title={preview.name} wide onClose={() => setPreview(null)}>
       <div className="image-preview"><img src={assetUrl(preview)} alt={preview.name} /></div>
+    </Dialog>}
+    {deleting && <Dialog title="永久删除图片" onClose={() => setDeleting(null)}>
+      <p className="confirm-copy">确定从服务器删除「{deleting.name}」？当前关联会一并移除。</p>
+      <AsyncAction label="永久删除" onCancel={() => setDeleting(null)} action={async () => {
+        await api("assets/" + deleting.source + "/" + encodeURIComponent(deleting.id), "DELETE", { confirm: true });
+        if (data?.items.length === 1 && page > 1) setPage(page - 1);
+        else setRevision((value) => value + 1);
+        setDeleting(null);
+        await onChanged();
+      }} />
     </Dialog>}
   </section>;
 }
@@ -1558,6 +1576,10 @@ function ProjectCoverSettings({ project, editable, onSaved }: {
   async function change(file?: File) {
     if (!editable || busy) return;
     setError("");
+    if (file && file.size > 4 * 1024 * 1024) {
+      setError("项目封面不能超过 4 MB");
+      return;
+    }
     setBusy(true);
     try {
       const form = file ? new FormData() : undefined;
@@ -1583,7 +1605,7 @@ function ProjectCoverSettings({ project, editable, onSaved }: {
       <div>
         <h3>项目封面</h3>
         {editable && <>
-          <p className="muted">JPG、PNG、WebP</p>
+          <p className="muted">JPG、PNG、WebP，最大 4 MB</p>
           <div className="project-cover-actions">
             <input ref={input} type="file" accept="image/jpeg,image/png,image/webp"
               aria-label="选择项目封面文件" hidden onChange={(event) => {
@@ -4661,7 +4683,7 @@ function Workspace({
                   }}
                 />
               )}
-              {currentUser.role === "admin" && accountView === "assets" && <AssetLibrary />}
+              {currentUser.role === "admin" && accountView === "assets" && <AssetLibrary onChanged={reloadProjects} />}
               {currentUser?.role === "admin" && accountView === "backup" && (
                 <div className="settings-grid">
                   <BackupPanel onRestored={onRestore} />
@@ -5200,12 +5222,29 @@ function Workspace({
                           >
                             恢复
                           </Button>
+                          {currentUser.role === "admin" && !archived && <Button small
+                            onClick={() => setModal({ kind: "purge-part", item: material })}>
+                            <Trash2 size={14} />永久删除
+                          </Button>}
                         </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
+            </Dialog>
+          )}
+          {modal.kind === "purge-part" && (
+            <Dialog title="永久删除物料" onClose={() => setModal({ kind: "deleted-parts" })}>
+              <p className="confirm-copy">
+                确定永久删除「{modal.item.code} {modal.item.name}」及其图片和附件？此操作无法撤销。
+              </p>
+              <AsyncAction label="永久删除" onCancel={() => setModal({ kind: "deleted-parts" })} action={async () => {
+                await businessApi("deleted-parts/" + modal.item.id, "DELETE", { confirm: true });
+                await refresh();
+                setModal({ kind: "deleted-parts" });
+                notify("物料已永久删除");
+              }} />
             </Dialog>
           )}
           {modal.kind === "restore-part" && (
@@ -6243,7 +6282,7 @@ function ImportForm({
       <label className="upload-zone">
         <Upload size={24} />
         <strong>{filename || "选择 CSV 文件"}</strong>
-        <span>UTF-8 编码 · 最多 5,000 行</span>
+        <span>UTF-8 编码 · 最多 5,000 行 · 20 MB</span>
         <input
           type="file"
           accept=".csv,text/csv"
@@ -6252,6 +6291,10 @@ function ImportForm({
             setRows([]);
             const f = e.target.files?.[0];
             if (!f) return;
+            if (f.size > 20 * 1024 * 1024) {
+              setError("文件不能超过 20 MB");
+              return;
+            }
             setFilename(f.name);
             Papa.parse<Record<string, string>>(await f.text(), {
               header: true,
@@ -7350,6 +7393,7 @@ function ElectronicImportForm({
     setRows([]);
     reset();
     try {
+      if (f.size > 20 * 1024 * 1024) throw Error("文件不能超过 20 MB");
       const form = new FormData();
       form.append("file", f);
       if (sheet) form.append("sheet", sheet);
