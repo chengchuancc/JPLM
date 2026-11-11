@@ -1,5 +1,6 @@
 import React, { Suspense, lazy, useContext, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
+import { clearNavigationSnapshots, NavigationPage, useNavigationHistory, usePageState } from "./navigation";
 import {
   Boxes,
   Box,
@@ -1134,8 +1135,8 @@ type AuthState = {
 type WorkspaceRoute = { projectId: string; view: string; detail: string };
 const projectHome: WorkspaceRoute = { projectId: "", view: "projects", detail: "" };
 
-function readWorkspaceRoute(): WorkspaceRoute {
-  const [top, id, view, detail] = location.hash.slice(1).split("/");
+function readWorkspaceRoute(hash = location.hash): WorkspaceRoute {
+  const [top, id, view, detail] = hash.slice(1).split("/");
   if (top === "settings") return { ...projectHome, view: "settings" };
   if (top === "global-shipping") return { ...projectHome, view: "global-shipping", detail: /^[a-f0-9]{24}$/.test(id || "") ? id : "" };
   if (top === "projects" && id) {
@@ -1155,13 +1156,18 @@ function workspaceHash(route: WorkspaceRoute) {
 function App() {
   const [auth, setAuth] = useState<AuthState | null>(null);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [route, setRoute] = useState(readWorkspaceRoute);
   const [restored, setRestored] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const draftOpen = useRef(false);
-  const currentRoute = useRef(route);
-  currentRoute.current = route;
+  const { route, entry, navigate, back } = useNavigationHistory({
+    readRoute: readWorkspaceRoute,
+    routeHash: workspaceHash,
+    canLeave: (current, next) => !draftOpen.current || (
+      current.projectId === next.projectId &&
+      (!["inspection", "shipping", "global-shipping"].includes(current.view) || (current.view === next.view && current.detail === next.detail))
+    ) || window.confirm("有未保存的内容。离开当前页面？"),
+  });
 
   const reloadProjects = async () => {
     const next: ProjectSummary[] = await api("projects");
@@ -1181,39 +1187,16 @@ function App() {
       setLoading(false);
     }
   }
-  function navigate(next: WorkspaceRoute, replace = false) {
-    if ((currentRoute.current.projectId !== next.projectId ||
-        (["inspection", "shipping", "global-shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
-        !window.confirm("有未保存的内容。离开当前项目？")) return;
-    if (location.hash !== workspaceHash(next)) {
-      if (replace) history.replaceState(null, "", workspaceHash(next));
-      else history.pushState(null, "", workspaceHash(next));
-    }
-    currentRoute.current = next;
-    setRoute(next);
-  }
   useEffect(() => {
     void load();
-    const changed = () => {
-      const next = readWorkspaceRoute();
-      if ((currentRoute.current.projectId !== next.projectId ||
-          (["inspection", "shipping", "global-shipping"].includes(currentRoute.current.view) && currentRoute.current.view !== next.view)) && draftOpen.current &&
-          !window.confirm("有未保存的内容。离开当前项目？")) {
-        history.replaceState(null, "", workspaceHash(currentRoute.current));
-        return;
-      }
-      currentRoute.current = next;
-      setRoute(next);
-    };
     const expire = () => {
       draftOpen.current = false;
+      clearNavigationSnapshots();
       setProjects([]);
       setAuth((a) => a && { ...a, authenticated: false, user: null });
     };
-    window.addEventListener("hashchange", changed);
     window.addEventListener("plm-session-expired", expire);
     return () => {
-      window.removeEventListener("hashchange", changed);
       window.removeEventListener("plm-session-expired", expire);
     };
   }, []);
@@ -1249,17 +1232,19 @@ function App() {
     return (
       <div className="loading-page">
         <BrandMark /><span>项目不存在或无权访问</span>
-        <Button onClick={() => navigate(projectHome)}>返回项目列表</Button>
+        <Button onClick={() => back(projectHome)}>返回上一页</Button>
       </div>
     );
   return (
+    <NavigationPage key={entry.id} id={entry.id}>
       <Workspace
-        key={project?.id || "system"}
         route={route}
         project={project}
         projects={projects}
         currentUser={auth.user}
         navigate={navigate}
+        back={back}
+        canGoBack={!!entry.previous}
         draftOpen={draftOpen}
         reloadProjects={reloadProjects}
         updateUser={async () => setAuth(await api("auth/status"))}
@@ -1267,17 +1252,20 @@ function App() {
           await api("auth/logout", "POST");
           draftOpen.current = false;
           navigate(projectHome, true);
+          clearNavigationSnapshots();
           setProjects([]);
           setAuth({ ...auth, authenticated: false, user: null });
         }}
         onRestore={() => {
           draftOpen.current = false;
           navigate(projectHome, true);
+          clearNavigationSnapshots();
           setProjects([]);
           setRestored(true);
           setAuth({ initialized: true, authenticated: false, user: null });
         }}
       />
+    </NavigationPage>
   );
 }
 
@@ -1306,8 +1294,8 @@ function ProjectDirectory({ projects, open, create, onRecovered }: {
   create?: (name: string) => Promise<void>;
   onRecovered: () => Promise<unknown>;
 }) {
-  const [query, setQuery] = useState("");
-  const [status, setStatus] = useState<"active" | "archived" | "deleted">("active");
+  const [query, setQuery] = usePageState("projects.query", "");
+  const [status, setStatus] = usePageState<"active" | "archived" | "deleted">("projects.status", "active");
   const [creating, setCreating] = useState(false);
   const [deleted, setDeleted] = useState<DeletedProject[] | null>(null);
   const [deletedError, setDeletedError] = useState("");
@@ -1519,7 +1507,7 @@ function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }:
   canSeed: boolean;
   onSeed: () => void;
 }) {
-  const [tab, setTab] = useState("settings");
+  const [tab, setTab] = usePageState("project-settings.tab", "settings");
   const [details, setDetails] = useState<ProjectDetails | null>(null);
   const [users, setUsers] = useState<UserOption[]>([]);
   const [name, setName] = useState(project.name);
@@ -1646,14 +1634,16 @@ function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }:
 }
 
 function Workspace({
-  route, project, projects, currentUser, navigate, draftOpen, reloadProjects,
+  route, project, projects, currentUser, navigate, back, canGoBack, draftOpen, reloadProjects,
   updateUser, onLogout, onRestore,
 }: {
   route: WorkspaceRoute;
   project?: ProjectSummary;
   projects: ProjectSummary[];
   currentUser: User;
-  navigate: (route: WorkspaceRoute) => void;
+  navigate: (route: WorkspaceRoute, replace?: boolean, initial?: Record<string, unknown>) => void;
+  back: (fallback: WorkspaceRoute) => void;
+  canGoBack: boolean;
   draftOpen: React.MutableRefObject<boolean>;
   reloadProjects: () => Promise<ProjectSummary[]>;
   updateUser: () => Promise<void>;
@@ -1662,7 +1652,7 @@ function Workspace({
 }) {
   const [state, setState] = useState<State>(emptyState);
   const [avatarVersion, setAvatarVersion] = useState(0);
-  const [accountView, setAccountView] = useState("profile");
+  const [accountView, setAccountView] = usePageState("workspace.accountView", "profile");
   const { view, detail } = route;
   const projectId = project?.id || "";
   const archived = !!project?.archived_at || !!state.project?.archived_at;
@@ -1677,11 +1667,11 @@ function Workspace({
     mounted.current = true;
     return () => { mounted.current = false; };
   }, []);
-  const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState("全部产品");
-  const [locationFilter, setLocationFilter] = useState("");
-  const [expandedPurchases, setExpandedPurchases] = useState<Set<string>>(new Set());
-  const [materialLevel, setMaterialLevel] = useState(1);
+  const [search, setSearch] = usePageState("workspace.search", "");
+  const [filter, setFilter] = usePageState("workspace.filter", view === "products" ? "全部产品" : "全部");
+  const [locationFilter, setLocationFilter] = usePageState("workspace.locationFilter", "");
+  const [expandedPurchases, setExpandedPurchases] = usePageState<Set<string>>("workspace.expandedPurchases", new Set());
+  const [materialLevel, setMaterialLevel] = usePageState("workspace.materialLevel", 1);
   const [hiddenColumns, setHiddenColumns] = useState<Record<string, Column[]>>(
     () => {
       try {
@@ -1699,8 +1689,8 @@ function Workspace({
       }
     },
   );
-  const [parentFilter, setParentFilter] = useState("");
-  const [categories, setCategories] = useState<Record<string, string>>({});
+  const [parentFilter, setParentFilter] = usePageState("workspace.parentFilter", "");
+  const [categories, setCategories] = usePageState<Record<string, string>>("workspace.categories", {});
   const categoryProps = (key: string) => ({
     category: categories[key] || "",
     categoryOptions: state.material_categories,
@@ -1709,10 +1699,15 @@ function Workspace({
   });
   const matchesCategory = (key: string, part?: Part) =>
     !categories[key] || categories[key] === part?.category;
-  const [layout, setLayout] = useState("grid");
-  const [version, setVersion] = useState("");
-  const [tab, setTab] = useState("info");
-  const [modal, setModal] = useState<Modal>(null);
+  const [layout, setLayout] = usePageState("workspace.layout", "grid");
+  const [version, setVersion] = usePageState("workspace.version", "");
+  const [tab, setTab] = usePageState("workspace.tab", "info");
+  const [inventoryDetail, setInventoryDetail] = usePageState<Modal>("workspace.inventoryDetail", null, false);
+  const [modal, changeModal] = useState<Modal>(inventoryDetail);
+  function setModal(next: Modal) {
+    setInventoryDetail(next?.kind === "inventory-part" ? next : null);
+    changeModal(next);
+  }
   const [choice, setChoice] = useState<ChoiceRequest | null>(null);
   const [toast, setToast] = useState("");
   const [mobile, setMobile] = useState(false);
@@ -1758,19 +1753,6 @@ function Workspace({
       document.removeEventListener("visibilitychange", sync);
     };
   }, [projectId]);
-  const internalRoute = useRef("");
-  useEffect(() => {
-    setSearch("");
-    setFilter(view === "products" ? "全部产品" : "全部");
-    if (internalRoute.current !== workspaceHash(route)) {
-      setTab("info");
-      setVersion("");
-    }
-    internalRoute.current = "";
-    setMobile(false);
-    setModal(null);
-    setChoice(null);
-  }, [view, detail]);
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 4000);
@@ -1791,18 +1773,21 @@ function Workspace({
       window.removeEventListener("beforeunload", warn);
     };
   }, [projectId, modal, choice]);
-  function go(nextView: string, id = "") {
+  function go(nextView: string, id = "", initial?: Record<string, unknown>) {
     if (!mounted.current) return;
     const next = {
       projectId: ["settings", "projects", "global-shipping"].includes(nextView) ? "" : projectId,
       view: nextView,
       detail: id,
     };
-    internalRoute.current = workspaceHash(next);
-    setTab("info");
-    setVersion("");
-    navigate(next);
+    navigate(next, false, initial);
     setMobile(false);
+  }
+  function goBack() {
+    back({ ...route, detail: "" });
+  }
+  function openDetailTab(nextTab: string) {
+    if (tab !== nextTab) navigate(route, false, { "workspace.tab": nextTab });
   }
   useEffect(() => {
     if (view === "projects") void reloadProjects().catch((e) => setFatal(e.message));
@@ -1990,8 +1975,7 @@ function Workspace({
     (l) => l.child_id === part?.id,
   );
   function openMaterial(id: string, section = "info") {
-    go("parts", id);
-    setTab(section);
+    go("parts", id, section === "info" ? undefined : { "workspace.tab": section });
   }
   function openInventoryPart(id: string) {
     setModal({ kind: "inventory-part", item: { id } });
@@ -2390,10 +2374,7 @@ function Workspace({
                       {po ? (
                         <button
                           className="text-link"
-                          onClick={() => {
-                            setModal(null);
-                            go("purchases", po.id);
-                          }}
+                          onClick={() => go("purchases", po.id)}
                         >
                           {po.code}
                         </button>
@@ -2523,8 +2504,7 @@ function Workspace({
               <button
                 className="text-link"
                 onClick={() => {
-                  setAccountView("profile");
-                  go("settings");
+                  go("settings", "", { "workspace.accountView": "profile" });
                 }}
               >
                 <strong>{currentUser?.name}</strong>
@@ -2553,6 +2533,10 @@ function Workspace({
           >
             <Menu size={20} />
           </button>
+          {(!detail ? canGoBack : ["shipping", "global-shipping", "inspection"].includes(view)) &&
+            <button className="icon-btn topbar-back" type="button" aria-label="返回上一页" title="返回上一页" onClick={goBack}>
+              <ArrowLeft size={18} />
+            </button>}
           <div className="breadcrumb">
             {project && <>
               <button onClick={() => go("projects")}>项目</button>
@@ -2585,8 +2569,7 @@ function Workspace({
             <button
               aria-label="个人资料"
               onClick={() => {
-                setAccountView("profile");
-                go("settings");
+                go("settings", "", { "workspace.accountView": "profile" });
               }}
             >
               <Avatar user={currentUser} version={avatarVersion} small />
@@ -2884,7 +2867,7 @@ function Workspace({
           {view === "products" && detail && product && (
             <>
               <div className="detail-heading">
-                <button className="back-btn" onClick={() => go("products")}>
+                <button className="back-btn" aria-label="返回上一页" onClick={goBack}>
                   <ArrowLeft size={18} />
                 </button>
                 <Thumb owner="products" id={product.id} />
@@ -3338,8 +3321,8 @@ function Workspace({
               <div className="detail-heading">
                 <button
                   className="back-btn"
-                  aria-label="返回物料库"
-                  onClick={() => go("parts")}
+                  aria-label="返回上一页"
+                  onClick={goBack}
                 >
                   <ArrowLeft size={18} />
                 </button>
@@ -3368,7 +3351,7 @@ function Workspace({
           {view === "parts" && detail && part && !part.deleted_at && (
             <>
               <div className="detail-heading">
-                <button className="back-btn" onClick={() => go("parts")}>
+                <button className="back-btn" aria-label="返回上一页" onClick={goBack}>
                   <ArrowLeft size={18} />
                 </button>
                 <Thumb owner="parts" id={part.id} />
@@ -3380,7 +3363,7 @@ function Workspace({
                   <p className="mono">{part.code}</p>
                 </div>
                 {part.material_level === 1 && (
-                  <Button onClick={() => setTab("children")}>
+                  <Button onClick={() => openDetailTab("children")}>
                     <Layers size={16} />
                     二级物料 <span>{childLinks.length}</span>
                   </Button>
@@ -3666,7 +3649,7 @@ function Workspace({
                       <dt>关联产品</dt>
                       <dd>
                         {partBomProducts.length ? (
-                          <button className="text-link" onClick={() => setTab("boms")}>
+                          <button className="text-link" onClick={() => openDetailTab("boms")}>
                             {partBomProducts.join("、")}
                             <ChevronRight size={14} />
                           </button>
@@ -3704,7 +3687,7 @@ function Workspace({
                     <section className="panel">
                       <div className="panel-heading">
                         <h3>物料图片</h3>
-                        <Button small onClick={() => setTab("files")}><ImageIcon size={14} />图片与附件</Button>
+                        <Button small onClick={() => openDetailTab("files")}><ImageIcon size={14} />图片与附件</Button>
                       </div>
                       <div className="material-detail-gallery">
                         {files("parts", part.id).filter((file) => file.kind === "image").map((file) => (
@@ -3796,9 +3779,7 @@ function Workspace({
                                 <button
                                   className="text-link"
                                   onClick={() => {
-                                    go("products", v.product_id);
-                                    setVersion(v.id);
-                                    setMaterialLevel(part.material_level);
+                                    go("products", v.product_id, { "workspace.version": v.id, "workspace.materialLevel": part.material_level });
                                   }}
                                 >
                                   {findProduct(v.product_id)?.name}
@@ -4002,8 +3983,8 @@ function Workspace({
               <div className="detail-heading">
                 <button
                   className="back-btn"
-                  aria-label="返回供应商列表"
-                  onClick={() => go("suppliers")}
+                  aria-label="返回上一页"
+                  onClick={goBack}
                 >
                   <ArrowLeft size={18} />
                 </button>
@@ -4276,7 +4257,7 @@ function Workspace({
           {view === "purchases" && detail && purchase && (
             <>
               <div className="detail-heading">
-                <button className="back-btn" onClick={() => go("purchases")}>
+                <button className="back-btn" aria-label="返回上一页" onClick={goBack}>
                   <ArrowLeft size={18} />
                 </button>
                 <div className="detail-title">
@@ -4539,7 +4520,7 @@ function Workspace({
               (view === "suppliers" && !supplier)) && (
               <Empty
                 title="记录不存在"
-                action={<Button onClick={() => go(view)}>返回列表</Button>}
+                action={<Button onClick={goBack}>返回上一页</Button>}
               />
             )}
           </>}

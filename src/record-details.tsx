@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { ArrowLeft, ExternalLink } from "lucide-react";
 import { Dialog } from "./dialog";
+import { usePageState } from "./navigation";
 import type { RecordRow } from "./inspection";
 import { contactFields, otherContactFields, costs, items, orderFields, CarrierTags, SourceTag, Status, Tracking, DetailsList, isShipped, shipmentLabel,
   type Request, type Order, type Shipment } from "./shipping-data";
@@ -244,18 +245,43 @@ function OrderDetails({ id, request, open }: { id: string; request: Request; ope
 export function RelatedRecordDialog({ target, request, close, shipmentNavigation }: {
   target: RelatedTarget; request: Request; close: () => void; shipmentNavigation?: (row: Shipment) => ReactNode;
 }) {
-  const [trail, setTrail] = useState<RelatedTarget[]>([target]);
-  const current = trail[trail.length - 1];
+  const rootKey = target.kind === "inspection" ? target.record.id : target.kind === "device" ? target.serial : target.id;
+  const [trail, setTrail] = usePageState<{ target: RelatedTarget; top: number }[]>(
+    "related:" + target.kind + ":" + rootKey, [{ target, top: 0 }], false,
+  );
+  const current = trail[trail.length - 1].target;
   const content = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const dialog = content.current?.closest(".dialog");
-    dialog?.scrollTo({ top: 0 });
-    dialog?.querySelector<HTMLButtonElement>(trail.length > 1 ? ".shipping-detail-back" : ".dialog-heading button")?.focus();
+    if (!dialog) return;
+    const top = trail[trail.length - 1].top;
+    dialog.querySelector<HTMLButtonElement>(trail.length > 1 ? ".shipping-detail-back" : ".dialog-heading button")
+      ?.focus({ preventScroll: true });
+    const restore = () => {
+      dialog.scrollTop = top;
+      if (Math.abs(dialog.scrollTop - top) < 2) observer.disconnect();
+    };
+    const observer = new MutationObserver(restore);
+    observer.observe(dialog, { childList: true, subtree: true });
+    restore();
+    const timer = window.setTimeout(() => observer.disconnect(), 5000);
+    return () => { clearTimeout(timer); observer.disconnect(); };
   }, [current]);
-  const open: Open = (next) => setTrail((previous) => [...previous, next]);
+  const open: Open = (next) => {
+    const top = content.current?.closest(".dialog")?.scrollTop || 0;
+    setTrail((previous) => [...previous.slice(0, -1), { target: current, top }, { target: next, top: 0 }]);
+  };
+  const dismiss = () => {
+    setTrail([{ target, top: 0 }]);
+    close();
+  };
   const title = current.kind === "inspection" ? "检测记录明细" : current.kind === "device" ? "设备检测记录" :
     current.kind === "order" ? (current.backer ? "Backer #" + current.backer : "KS 订单") : current.reference || "发货记录";
-  return createPortal(<Dialog title={title} wide onClose={close}><div ref={content}>
+  return createPortal(<Dialog title={title} wide onClose={dismiss}><div ref={content} onClickCapture={(event) => {
+    if (!(event.target as Element).closest('a[href^="#"]')) return;
+    const top = content.current?.closest(".dialog")?.scrollTop || 0;
+    setTrail((previous) => [...previous.slice(0, -1), { target: current, top }]);
+  }}>
     {trail.length > 1 && <button type="button" className="btn small shipping-detail-back"
       onClick={() => setTrail((previous) => previous.slice(0, -1))}><ArrowLeft size={14} />返回上一条</button>}
     {current.kind === "inspection" && <InspectionDetails key={current.record.id} record={current.record} request={request} open={open} />}

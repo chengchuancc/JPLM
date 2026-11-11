@@ -447,6 +447,7 @@ nav > button:not(.active) .nav-count {
   padding: 0 34px;
   gap: 12px;
 }
+.topbar-back + .breadcrumb { margin-right: auto; }
 .breadcrumb {
   display: flex;
   align-items: center;

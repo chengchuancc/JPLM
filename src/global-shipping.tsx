@@ -9,6 +9,7 @@ import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./
 import { ShippingPicker } from "./shipping-options";
 import { ShippingTableHeader } from "./shipping-table-header";
 import { columnClass, groupedFields, type ShippingColumn } from "./shipping-columns";
+import { restoreListPages, usePageState } from "./navigation";
 import { useShipmentRowLocation } from "./shipping-location";
 import { DevicePicker } from "./shipping-devices";
 import { TableOptionPicker } from "./material-category";
@@ -226,12 +227,14 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
 export default function GlobalShipping({ request, projectRequest, onDraftChange, initialRecord = "" }: {
   request: Request; projectRequest: (project: string) => Request; onDraftChange: (dirty: boolean) => void; initialRecord?: string;
 }) {
+  const [visited, setVisited] = usePageState("global-shipping.visited", false);
+  const restored = useRef(visited).current;
   const [data, setData] = useState<Page>();
-  const [q, setQuery] = useState("");
-  const [search, setSearch] = useState("");
-  const [project, setProject] = useState("");
-  const [status, setStatus] = useState("");
-  const [range, setRange] = useState({ first: 1, last: 1 });
+  const [q, setQuery] = usePageState("global-shipping.q", "");
+  const [search, setSearch] = usePageState("global-shipping.search", "");
+  const [project, setProject] = usePageState("global-shipping.project", "");
+  const [status, setStatus] = usePageState("global-shipping.status", "");
+  const [range, setRange] = usePageState("global-shipping.range", { first: 1, last: 1 });
   const [loadingMore, setLoadingMore] = useState(false);
   const [moreError, setMoreError] = useState("");
   const [revision, setRevision] = useState(0);
@@ -239,12 +242,14 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [opened, setOpened] = useState<Record<string, boolean>>({});
-  const [detail, setDetail] = useState<{ target: RelatedTarget; project: string; full: boolean }>();
+  const [opened, setOpened] = usePageState<Record<string, boolean>>("global-shipping.opened", {});
+  const [detail, setDetail] = usePageState<{ target: RelatedTarget; project: string; full: boolean } | undefined>("global-shipping.detail", undefined, false);
   const [editor, setEditor] = useState<Editor>();
   const [catalog, setCatalog] = useState<ProductChoice[]>([]);
-  const [focused, setFocused] = useState(initialRecord);
-  const pending = useRef(initialRecord);
+  const [focused, setFocused] = usePageState("global-shipping.focused", initialRecord);
+  const pending = useRef(restored ? "" : initialRecord);
+  const restoreRange = useRef(restored ? range : null);
+  const restoredFocus = useRef(restored ? focused : "");
   const grid = useRef<HTMLDivElement>(null);
   const top = useRef<HTMLDivElement>(null);
   const tail = useRef<HTMLDivElement>(null);
@@ -261,7 +266,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   const canCreate = projects.some((p) => !p.archived_at);
   const displayed = columns.filter((column) => column.fixed || !hidden.includes(column.key));
   const tableWidth = displayed.reduce((total, column) => total + column.width, 156);
-  useShipmentRowLocation(grid, focused, !!data && !busy);
+  useShipmentRowLocation(grid, focused, !!data && !busy && (!restored || focused !== restoredFocus.current));
   function open(row: RecordRow, target?: RelatedTarget) {
     const scope = row.can_open ? row.project_id : row.shipment_items[0]?.project_id || row.handling_project_ids?.[0];
     if (scope) setDetail({ project: scope, full: row.can_open,
@@ -279,8 +284,14 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     setBusy(true); setError(""); setMoreError(""); setLoadingMore(false);
     const query = new URLSearchParams({ q: search, project, status });
     if (pending.current) query.set("locate", pending.current);
-    request("global-shipping/orders?" + query).then((value: Page) => {
+    const savedRange = restoreRange.current;
+    restoreListPages(savedRange, (number) => {
+      if (number !== undefined) query.set("page", String(number));
+      return request("global-shipping/orders?" + query) as Promise<Page>;
+    }, (row) => row.order_key).then((value) => {
       if (!active) return;
+      restoreRange.current = null;
+      setVisited(true);
       if (value.location) {
         pending.current = "";
         const group = value.rows.find((row) => row.order_key === value.location!.order_key);
@@ -288,7 +299,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
           setOpened((previous) => ({ ...previous, [value.location!.order_key]: true }));
         }
       }
-      setRange({ first: value.page, last: value.page });
+      setRange(savedRange || { first: value.page, last: value.page });
       setData(value);
     }, (e) => { if (active) setError(e.message); }).finally(() => { if (active) setBusy(false); });
     return () => { active = false; if (epoch === generation.current) generation.current++; };
@@ -343,7 +354,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     return () => { active = false; };
   }, [request, revision]);
 
-  function resetFocus() { pending.current = ""; setFocused(""); grid.current?.scrollTo({ top: 0 }); }
+  function resetFocus() { restoreRange.current = null; pending.current = ""; setFocused(""); grid.current?.scrollTo({ top: 0 }); }
   function afterSave(id: string) {
     setEditor(undefined); setNotice("发货记录已保存");
     setSearch(""); setQuery(""); setProject(""); setStatus("");

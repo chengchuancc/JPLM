@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { usePageState } from "./navigation";
 import { ArrowDown, ArrowUp, Camera, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-react";
 import type { IScannerControls } from "@zxing/browser";
 import { RelatedRecordDialog, formatTime, ResultLabel, sections } from "./record-details";
@@ -704,18 +705,19 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
   onImported: () => void;
   revision: number;
 }) {
-  const [draft, setDraft] = useState<Filters>({ ...defaultFilters, prefix });
-  const [filters, setFilters] = useState<Filters>({ ...defaultFilters, prefix });
-  const [page, setPage] = useState(1);
-  const [perPage, setPerPage] = useState(50);
-  const [sort, setSort] = useState({ key: "updated_at", direction: "desc" });
-  const [deleted, setDeleted] = useState(false);
+  const scope = "inspection.history:" + template.id + ":" + prefix + ":";
+  const [draft, setDraft] = usePageState<Filters>(scope + "draft", { ...defaultFilters, prefix });
+  const [filters, setFilters] = usePageState<Filters>(scope + "filters", { ...defaultFilters, prefix });
+  const [page, setPage] = usePageState(scope + "page", 1);
+  const [perPage, setPerPage] = usePageState(scope + "perPage", 50);
+  const [sort, setSort] = usePageState(scope + "sort", { key: "updated_at", direction: "desc" });
+  const [deleted, setDeleted] = usePageState(scope + "deleted", false);
   const [reload, setReload] = useState(0);
   const [data, setData] = useState<RecordPage | null>(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(true);
   const [pending, setPending] = useState("");
-  const [openedRecord, setOpenedRecord] = useState<RecordRow | null>(null);
+  const [openedRecord, setOpenedRecord] = usePageState<RecordRow | null>(scope + "openedRecord", null, false);
   const query = parameters(template.id, {
     ...filters, per_page: String(perPage), sort: sort.key, direction: sort.direction,
     deleted: deleted ? "1" : "", page: String(page),
@@ -849,10 +851,11 @@ function DeviceRegistry({ request, prefix, refresh, readOnly, open, register }: 
   request: Request; prefix: string; refresh: number; readOnly: boolean;
   open: (device: Device) => void; register: () => void;
 }) {
-  const [draft, setDraft] = useState("");
-  const [search, setSearch] = useState("");
-  const [activePrefix, setActivePrefix] = useState(prefix);
-  const [page, setPage] = useState(1);
+  const scope = "inspection.devices:" + prefix + ":";
+  const [draft, setDraft] = usePageState(scope + "draft", "");
+  const [search, setSearch] = usePageState(scope + "search", "");
+  const [activePrefix, setActivePrefix] = usePageState(scope + "activePrefix", prefix);
+  const [page, setPage] = usePageState(scope + "page", 1);
   const [data, setData] = useState<DevicePage | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
@@ -916,18 +919,18 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
   onDraftChange: (dirty: boolean) => void;
 }) {
   const [templates, setTemplates] = useState<Template[]>([]);
-  const [templateId, setTemplateId] = useState("");
-  const [tab, setTab] = useState<"entry" | "devices" | "history" | "settings">("entry");
+  const [templateId, setTemplateId] = usePageState("inspection.templateId", "");
+  const [tab, setTab] = usePageState<"entry" | "devices" | "history" | "settings">("inspection.tab", "entry");
   const [editor, setEditor] = useState<Template | null | undefined>(undefined);
   const [copy, setCopy] = useState<Template>();
   const [serial, setSerial] = useState("");
   const [prefix, setPrefix] = useState("");
-  const [historyPrefix, setHistoryPrefix] = useState("");
+  const [historyPrefix, setHistoryPrefix] = usePageState("inspection.historyPrefix", "");
   const [values, setValues] = useState<Values>({});
   const [record, setRecord] = useState<RecordRow | null>(null);
   const [device, setDevice] = useState<Device | null>(null);
   const [savedOptions, setSavedOptions] = useState<SavedOption[]>([]);
-  const [optionSearch, setOptionSearch] = useState("");
+  const [optionSearch, setOptionSearch] = usePageState("inspection.optionSearch", "");
   const [dirty, setDirty] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
   const [camera, setCamera] = useState<"live" | "photo" | null>(null);
@@ -951,7 +954,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
       (items: Template[]) => {
         if (!active) return;
         setTemplates(items);
-        setTemplateId(items[0]?.id || "");
+        setTemplateId((selected) => items.some((item) => item.id === selected) ? selected : items[0]?.id || "");
       },
       (error) => { if (active) setError(error.message); },
     ).finally(() => { if (active) setLoading(false); });

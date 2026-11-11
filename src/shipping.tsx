@@ -11,6 +11,7 @@ import { ShippingPicker } from "./shipping-options";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
 import { ShippingTableHeader } from "./shipping-table-header";
+import { restoreListPages, usePageState } from "./navigation";
 import { useShipmentRowLocation } from "./shipping-location";
 import { TableOptionPicker } from "./material-category";
 import { columnClass, createdColumn, fieldColumns, groupedFields, ksGoodsColumns, productFields, shipmentColumns,
@@ -291,18 +292,22 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   request: Request; products: ProductChoice[]; admin: boolean; readOnly: boolean;
   onDraftChange: (dirty: boolean) => void; initialRecord?: string;
 }) {
-  const [channel, setChannel] = useState<Channel>(initialRecord ? "other" : "ks");
-  const [focused, setFocused] = useState(initialRecord || "");
-  const locatePending = useRef(initialRecord || "");
-  const [orders, setOrders] = useState(false);
-  const [term, setTerm] = useState("");
-  const [search, setSearch] = useState("");
-  const [status, setStatus] = useState("");
-  const [deleted, setDeleted] = useState(false);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [visited, setVisited] = usePageState("shipping.visited", false);
+  const restored = useRef(visited).current;
+  const [channel, setChannel] = usePageState<Channel>("shipping.channel", initialRecord ? "other" : "ks");
+  const [focused, setFocused] = usePageState("shipping.focused", initialRecord || "");
+  const locatePending = useRef(restored ? "" : initialRecord || "");
+  const [orders, setOrders] = usePageState("shipping.orders", false);
+  const [term, setTerm] = usePageState("shipping.term", "");
+  const [search, setSearch] = usePageState("shipping.search", "");
+  const [status, setStatus] = usePageState("shipping.status", "");
+  const [deleted, setDeleted] = usePageState("shipping.deleted", false);
+  const [expanded, setExpanded] = usePageState<Record<string, boolean>>("shipping.expanded", {});
   const [treeRevision, setTreeRevision] = useState(0);
-  const [page, setPage] = useState(1);
-  const [firstPage, setFirstPage] = useState(1);
+  const [page, setPage] = usePageState("shipping.page", 1);
+  const [firstPage, setFirstPage] = usePageState("shipping.firstPage", 1);
+  const restoreRange = useRef(restored ? { first: firstPage, last: page } : null);
+  const restoredFocus = useRef(restored ? focused : "");
   const [loadingEarlier, setLoadingEarlier] = useState(false);
   const listEpoch = useRef(0);
   const [data, setData] = useState<Page>();
@@ -312,7 +317,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   const [saveError, setSaveError] = useState("");
   const [refresh, setRefresh] = useState(0);
   const [retry, setRetry] = useState(0);
-  const [detail, setDetail] = useState<RelatedTarget>();
+  const [detail, setDetail] = usePageState<RelatedTarget | undefined>("shipping.detail", undefined, false);
   const [edit, setEdit] = useState<Shipment>();
   const [draftAnchor, setDraftAnchor] = useState<string>();
   const initialParent = useRef<string | null>(null);
@@ -345,7 +350,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   const grouped = !orders && !search && !status && !deleted;
   const expandable = !orders && !status && !deleted;
   const loadedIds = new Set(rows.map((row) => row.id));
-  useShipmentRowLocation(grid, focused, !!data && !busy);
+  useShipmentRowLocation(grid, focused, !!data && !busy && (!restored || focused !== restoredFocus.current));
 
   useEffect(() => {
     let active = true;
@@ -355,9 +360,15 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     if (locatePending.current && !orders) query.set("locate", locatePending.current);
     if (grouped) query.set("roots", "1");
     if (!orders && deleted) query.set("deleted", "1");
-    request(path + (orders ? "orders?" : "records?") + query).then(
+    const savedRange = restoreRange.current;
+    restoreListPages(savedRange, (number) => {
+      if (number !== undefined) query.set("page", String(number));
+      return request(path + (orders ? "orders?" : "records?") + query) as Promise<Page>;
+    }, (row) => row.id).then(
       (result: Page) => {
         if (!active) return;
+        restoreRange.current = null;
+        setVisited(true);
         if (result.location) {
           locatePending.current = "";
           setExpanded((previous) => ({ ...previous, ...Object.fromEntries(result.location!.ancestors.map((id) => [id, true])) }));
@@ -365,7 +376,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
           setPage(result.page);
         }
         setData((previous) => {
-          if (result.location || page === 1 || !previous) return result;
+          if (savedRange || result.location || page === 1 || !previous) return result;
           const loaded = new Map(previous.rows.map((row) => [row.id, row]));
           for (const row of result.rows) loaded.set(row.id, row);
           return { ...result, rows: [...loaded.values()] };
@@ -429,6 +440,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   }
   function resetList(scroll = true) {
     listEpoch.current++;
+    restoreRange.current = null;
     scrollAnchor.current = undefined;
     locatePending.current = "";
     setFirstPage(1);
