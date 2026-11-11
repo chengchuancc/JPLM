@@ -1253,7 +1253,7 @@ function AssetLibrary({ onChanged }: { onChanged: () => Promise<unknown> }) {
       <div className="image-preview"><img src={assetUrl(preview)} alt={preview.name} /></div>
     </Dialog>}
     {deleting && <Dialog title="永久删除图片" onClose={() => setDeleting(null)}>
-      <p className="confirm-copy">确定从服务器删除「{deleting.name}」？当前关联会一并移除。</p>
+      <p className="confirm-copy">确定从服务器永久删除图片「{deleting.name}」？关联的业务记录会保留。</p>
       <AsyncAction label="永久删除" onCancel={() => setDeleting(null)} action={async () => {
         await api("assets/" + deleting.source + "/" + encodeURIComponent(deleting.id), "DELETE", { confirm: true });
         if (data?.items.length === 1 && page > 1) setPage(page - 1);
@@ -5307,7 +5307,7 @@ function Workspace({
                       : modal.kind === "delete-quote"
                         ? "将解除此物料与供应商的关联。"
                         : modal.kind === "delete-file"
-                          ? "将删除该图片或附件。"
+                          ? "将从服务器删除该图片或附件，所属产品或物料会保留。"
                           : "确定删除「" +
                             modal.item.name +
                             "」？已有业务关联的记录将无法删除。"}
