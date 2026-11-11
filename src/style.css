@@ -1019,6 +1019,9 @@ tbody tr:last-child td {
 tbody tr:hover td {
   background: #fcfdfb;
 }
+.activity-table td {
+  white-space: nowrap;
+}
 td small {
   display: block;
   font-size: 9px;

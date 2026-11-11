@@ -1009,8 +1009,8 @@ function ActivityPanel({
           {error}
         </p>
       )}
-      <div className="table-wrap">
-        <table>
+      <div className="table-wrap" tabIndex={0} role="region" aria-label={title}>
+        <table className="activity-table">
           <thead>
             <tr>
               <th>时间</th>
