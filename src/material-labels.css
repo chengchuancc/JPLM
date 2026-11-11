@@ -18,10 +18,12 @@
   flex: none;
   width: 100%;
   height: var(--barcode-height);
+  max-width: var(--barcode-max-width);
+  align-self: center;
 }
 .material-label-code {
   flex: none;
-  font: bold 9pt/1.2 ui-monospace, monospace;
+  font: bold var(--label-font-size)/1.2 ui-monospace, monospace;
   overflow-wrap: anywhere;
 }
 .material-label-name {
@@ -29,7 +31,7 @@
   min-height: 0;
   overflow: hidden;
   overflow-wrap: anywhere;
-  font-size: 9pt;
+  font-size: var(--label-font-size);
   font-weight: 600;
   line-height: 1.2;
 }

@@ -4362,6 +4362,7 @@ button.material-photo {
 .material-label-preview {
   display: grid;
   place-items: center;
+  container-type: inline-size;
   min-height: 175px;
   margin-top: 14px;
   padding: 12px;
@@ -4372,12 +4373,18 @@ button.material-photo {
 .material-label-preview article {
   outline: 1px solid var(--border);
 }
+@container (max-width: 380px) {
+  .large-label .material-barcode-label { zoom: .72; }
+}
+@container (max-width: 280px) {
+  .large-label .material-barcode-label { zoom: .58; }
+}
 .material-label-print-frame {
   position: fixed;
   left: -1000px;
   top: 0;
-  width: 240px;
-  height: 220px;
+  width: 420px;
+  height: 320px;
   border: 0;
   pointer-events: none;
 }

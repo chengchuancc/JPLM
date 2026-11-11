@@ -7,14 +7,17 @@ import labelCss from "./material-labels.css?inline";
 export type LabelMaterial = { code: string; name: string };
 
 const formats = [
-  { width: 30, height: 40, barcodeHeight: 13 },
-  { width: 50, height: 30, barcodeHeight: 10 },
+  { width: 40, height: 30, barcodeHeight: 10, fontSize: 9 },
+  { width: 50, height: 30, barcodeHeight: 10, fontSize: 9 },
+  { width: 100, height: 75, barcodeHeight: 22, fontSize: 14 },
 ] as const;
 type LabelFormat = typeof formats[number];
 const formatKey = "plm-material-label-format";
 
-function formatCss({ width, height, barcodeHeight }: LabelFormat) {
-  return `--label-width:${width}mm; --label-height:${height}mm; --barcode-height:${barcodeHeight}mm;`;
+function formatCss({ width, height, barcodeHeight, fontSize }: LabelFormat) {
+  return `--label-width:${width}mm; --label-height:${height}mm;
+    --barcode-height:${barcodeHeight}mm; --label-font-size:${fontSize}pt;
+    --barcode-max-width:${width === 100 ? "72mm" : "100%"};`;
 }
 
 function createLabel(doc: Document, material: LabelMaterial) {
@@ -48,10 +51,10 @@ function createLabel(doc: Document, material: LabelMaterial) {
   return { label, name };
 }
 
-function fitNames(names: HTMLElement[]) {
+function fitNames(names: HTMLElement[], fontSize: number) {
   // Resize only names that exceed the space beneath the barcode.
   let overflowing = names.filter((name) => name.scrollHeight > name.clientHeight);
-  for (let points = 8.5; points >= 6 && overflowing.length; points -= 0.5) {
+  for (let points = fontSize - 0.5; points >= 6 && overflowing.length; points -= 0.5) {
     for (const name of overflowing) name.style.fontSize = points + "pt";
     overflowing = overflowing.filter((name) => name.scrollHeight > name.clientHeight);
   }
@@ -62,8 +65,12 @@ export default function MaterialLabelsDialog({ materials, close }: {
   close: () => void;
 }) {
   const [formatIndex, setFormatIndex] = useState(() => {
-    try { return localStorage.getItem(formatKey) === "1" ? 1 : 0; }
-    catch { return 0; }
+    try {
+      const saved = Number(localStorage.getItem(formatKey));
+      return formats[saved] ? saved : 0;
+    } catch {
+      return 0;
+    }
   });
   const [error, setError] = useState("");
   const preview = useRef<HTMLDivElement>(null);
@@ -78,7 +85,7 @@ export default function MaterialLabelsDialog({ materials, close }: {
     try {
       const { label, name } = createLabel(container.ownerDocument, first);
       container.append(label);
-      fitNames([name]);
+      fitNames([name], format.fontSize);
       setError("");
     } catch (e) {
       setError((e as Error).message);
@@ -105,7 +112,7 @@ export default function MaterialLabelsDialog({ materials, close }: {
       doc.head.replaceChildren(style);
       doc.title = "物料标签";
       doc.body.replaceChildren(...labels.map(({ label }) => label));
-      fitNames(labels.map(({ name }) => name));
+      fitNames(labels.map(({ name }) => name), format.fontSize);
       setError("");
       target.focus();
       target.print();
@@ -129,7 +136,7 @@ export default function MaterialLabelsDialog({ materials, close }: {
       </label>
       <span>{materials.length} 张标签</span>
     </div>
-    <div ref={preview} className="material-label-preview" aria-label="标签预览" />
+    <div ref={preview} className={format.width === 100 ? "material-label-preview large-label" : "material-label-preview"} aria-label="标签预览" />
     {error && <p role="alert" className="form-error">{error}</p>}
     <div className="dialog-actions">
       <button type="button" className="btn" onClick={close}>取消</button>
