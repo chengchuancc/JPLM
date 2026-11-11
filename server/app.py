@@ -1927,9 +1927,11 @@ class Handler(BaseHTTPRequestHandler):
         if not mime or len(blob) > 2 * UPLOAD_CHUNK:
             raise Problem('请选择 2 MB 以内的图片')
         with FILE_LOCK, transaction() as db:
-            if not self.authorized(db):
+            user = self.authorized(db)
+            if not user or user['must_change']:
                 raise Problem('请先登录', 401)
-            db.execute('UPDATE users SET avatar=?,avatar_mime=? WHERE id=?', (blob, mime, self.user['id']))
+            db.execute('UPDATE users SET avatar=?,avatar_mime=? WHERE id=?', (blob, mime, user['id']))
+            log_activity(db, user, '更换头像', user['id'], user['name'])
         self.send({'ok': True})
 
     def serve_avatar(self, id):
@@ -1949,22 +1951,34 @@ class Handler(BaseHTTPRequestHandler):
         query = parse_qs(urlparse(self.path).query)
         before = int(query.get('before', ['0'])[0])
         subject = query.get('part', [''])[0]
-        logins = query.get('kind', [''])[0] == 'login'
+        kind = query.get('kind', [''])[0]
+        conditions = ["(?=0 OR a.id<?)", "(?='' OR a.subject_id=?)"]
+        params = [before, before, subject, subject]
         with connect() as db:
             db.execute('BEGIN')
             if project_id:
                 enter_project(db, project_id, self.user)
-                if logins:
-                    raise Problem('请在系统设置查看登录记录', 404)
-            elif not logins:
+                if kind in ('user', 'login'):
+                    raise Problem('请在系统设置查看用户操作日志', 404)
+            elif kind not in ('user', 'login'):
                 self.require_admin()
+            if kind == 'user':
+                if self.user['role'] != 'admin':
+                    conditions.append("""a.actor_id=? AND (a.project_id IS NULL OR
+                        (p.deleted_at IS NULL AND EXISTS (
+                            SELECT 1 FROM project_members m WHERE m.project_id=a.project_id AND m.user_id=?
+                        )))""")
+                    params.extend((self.user['id'], self.user['id']))
+            else:
+                conditions.extend(("a.project_id IS ?", "(a.action IN ('登录','退出登录')) = ?"))
+                params.extend((project_id, kind == 'login'))
+                if kind == 'login' and self.user['role'] != 'admin':
+                    conditions.append('a.actor_id=?')
+                    params.append(self.user['id'])
             rows = db.execute(
-                """SELECT * FROM activity WHERE (?=0 OR id<?) AND (?='' OR subject_id=?)
-                   AND project_id IS ?
-                   AND (action IN ('登录','退出登录')) = ?
-                   AND (?=0 OR actor_id=?) ORDER BY id DESC LIMIT 101""",
-                (before, before, subject, subject, project_id, logins,
-                 logins and self.user['role'] != 'admin', self.user['id']),
+                """SELECT a.*, p.name AS project_name FROM activity a
+                   LEFT JOIN projects p ON p.id=a.project_id WHERE """ + ' AND '.join(conditions)
+                + ' ORDER BY a.id DESC LIMIT 101', params,
             ).fetchall()
         self.send({'items': [dict(row) for row in rows[:100]], 'more': len(rows) > 100})
 
@@ -1983,6 +1997,7 @@ class Handler(BaseHTTPRequestHandler):
                 if db.execute('SELECT 1 FROM users WHERE email=? AND id<>?', (email, id)).fetchone():
                     raise Problem('邮箱已使用', 409)
                 db.execute('UPDATE users SET name=?,email=? WHERE id=?', (name, email, id))
+                log_activity(db, actor, '修改用户', id, name)
                 return {'id': id}
         if resource == 'reset-password' and method == 'POST' and id:
             self.require_admin()
@@ -2002,6 +2017,7 @@ class Handler(BaseHTTPRequestHandler):
                 if len(phone) > 30:
                     raise Problem('手机号最多 30 个字符')
                 db.execute('UPDATE users SET phone=? WHERE id=?', (phone, actor['id']))
+                log_activity(db, actor, '修改个人资料', actor['id'], actor['name'])
                 return {'ok': True}
             if id == 'password' and method == 'POST':
                 user = exists(db, 'users', actor['id'])
@@ -2013,6 +2029,7 @@ class Handler(BaseHTTPRequestHandler):
                            (password_record(password), actor['id']))
                 db.execute('DELETE FROM sessions WHERE user_id=? AND token<>?',
                            (actor['id'], self.session_token()))
+                log_activity(db, actor, '修改密码', actor['id'], actor['name'])
                 return {'ok': True}
         raise Problem('不支持的账户操作', 405)
 
@@ -2101,6 +2118,8 @@ class Handler(BaseHTTPRequestHandler):
                 if v['product_id']!=d['product_id']: raise Problem('仅可复制本产品的 BOM')
                 for line in db.execute('SELECT * FROM bom_lines WHERE version_id=? ORDER BY rowid',(v['id'],)).fetchall():
                     insert_bom_line(db, bid, line['part_id'], line['qty'], line['reference'], line['notes'])
+            version = exists(db, 'bom_versions', bid)
+            log_activity(db, self.user, '新建 BOM 版本', version['product_id'], version['name'])
             return {'id':bid}
         if resource=='bom-materials' and method=='POST':
             version=exists(db,'bom_versions',d.get('version_id'))
@@ -2202,7 +2221,10 @@ class Handler(BaseHTTPRequestHandler):
         if resource=='quotes' and method=='DELETE':
             exists(db, 'quotes', id); db.execute('DELETE FROM quotes WHERE id=?',(id,)); return {'ok':True}
         if resource=='files' and method=='DELETE':
-            f=exists(db,'files',id); db.execute('DELETE FROM files WHERE id=?',(id,))
+            f = exists(db, 'files', id)
+            db.execute('DELETE FROM files WHERE id=?', (id,))
+            log_activity(db, self.user, '删除图片' if f['kind'] == 'image' else '删除附件',
+                         f['owner_id'], f['display_name'] or f['name'])
             return {'ok':True,'_delete_files':[id]}
         if resource == 'deleted-parts' and method == 'PUT':
             part = exists(db, 'parts', id)
@@ -2236,6 +2258,8 @@ class Handler(BaseHTTPRequestHandler):
                     db.execute('UPDATE parts SET numbering_product_id=NULL WHERE numbering_product_id=?', (id,))
                     log_activity(db, self.user, '删除产品', id, f"{record['code']} {record['name']}")
                 db.execute(f'DELETE FROM {resource} WHERE id=?',(id,))
+                if resource == 'suppliers':
+                    log_activity(db, self.user, '删除供应商', id, record['name'])
                 removed=[r[0] for r in db.execute('SELECT id FROM files WHERE owner_type=? AND owner_id=?',(resource,id))]
                 db.execute('DELETE FROM files WHERE owner_type=? AND owner_id=?',(resource,id)); return {'ok':True,'_delete_files':removed}
             if method not in ('POST','PUT'): raise Problem('不支持的操作',405)
@@ -2276,10 +2300,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.change_part_suppliers(db, id, d['supplier_changes'])
             if resource=='parts' and 'bom_changes' in d:
                 self.change_part_boms(db, id, d['bom_changes'])
-            if resource in ('parts', 'products'):
-                noun = '物料' if resource == 'parts' else '产品'
-                log_activity(db, self.user, ('新增' if method == 'POST' else '修改') + noun,
-                             id, f"{values['code']} {values['name']}")
+            noun = {'parts': '物料', 'products': '产品', 'suppliers': '供应商'}[resource]
+            subject = f"{values['code']} {values['name']}" if 'code' in values else values['name']
+            log_activity(db, self.user, ('新增' if method == 'POST' else '修改') + noun, id, subject)
             return {'id':id}
         raise Problem('接口不存在或不支持该操作',404)
     def electronic_preview(self, project_id):
@@ -2486,6 +2509,8 @@ class Handler(BaseHTTPRequestHandler):
                         insert_scoped(db, 'files', dict(id=fid, owner_type=owner, owner_id=owner_id,
                                                        name=name, mime=mime, size=size, kind=kind,
                                                        created_at=now(), display_name=display_name))
+                log_activity(db, user, '替换文件' if replace_id else '上传文件', owner_id,
+                             record['name'], f'{len(created)} 个文件')
                 touch_project(db)
         except Exception:
             for fid in created:
@@ -2508,12 +2533,19 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem('请选择图片')
                 files.enter_context(stage_upload_deletion([id]))
                 db.execute('DELETE FROM files WHERE id=?', (id,))
-                db.execute('UPDATE projects SET updated_at=? WHERE id=?', (now(), file['project_id']))
+                db.project_id = file['project_id']
+                log_activity(db, user, '永久删除图片', file['owner_id'], file['display_name'] or file['name'])
+                touch_project(db)
             elif kind == 'cover':
-                db.execute('DELETE FROM project_covers WHERE project_id=?', (id,))
-                db.execute('UPDATE projects SET updated_at=? WHERE id=?', (now(), id))
+                project = exists(db, 'projects', id)
+                if db.execute('DELETE FROM project_covers WHERE project_id=?', (id,)).rowcount:
+                    db.project_id = id
+                    log_activity(db, user, '移除项目封面', id, project['name'])
+                    touch_project(db)
             else:
-                db.execute("UPDATE users SET avatar=NULL,avatar_mime='' WHERE id=?", (id,))
+                account = exists(db, 'users', id)
+                if db.execute("UPDATE users SET avatar=NULL,avatar_mime='' WHERE id=? AND avatar IS NOT NULL", (id,)).rowcount:
+                    log_activity(db, user, '删除用户头像', id, account['name'])
         self.send({'ok': True})
 
     def purge_deleted_part(self, project_id, id):
@@ -2641,6 +2673,8 @@ class Handler(BaseHTTPRequestHandler):
         with tempfile.TemporaryDirectory(dir=DATA) as folder:
             output = Path(folder) / 'backup.zip'
             write_backup(output)
+            with transaction() as db:
+                log_activity(db, self.user, '导出数据备份', '', 'ZIP 数据备份')
             self.send_response(200)
             self.send_header('Content-Type', 'application/zip')
             self.send_header('Content-Disposition', 'attachment; filename="jiecheng-plm-backup-' + datetime.now().strftime('%Y%m%d-%H%M%S') + '.zip"')

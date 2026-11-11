@@ -138,6 +138,7 @@ export type User = UserOption & {
 };
 export type Activity = {
   id: number;
+  project_name?: string | null;
   actor_name: string;
   action: string;
   subject: string;

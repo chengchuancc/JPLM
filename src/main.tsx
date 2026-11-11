@@ -966,9 +966,10 @@ function ActivityPanel({
   kind = "operation",
 }: {
   part?: string;
-  kind?: "operation" | "login";
+  kind?: "operation" | "user";
 }) {
   const { id: projectId } = useContext(ProjectContext);
+  const title = kind === "user" ? "用户操作日志" : "操作记录";
   const [items, setItems] = useState<Activity[]>([]);
   const [more, setMore] = useState(false);
   const [busy, setBusy] = useState(true);
@@ -997,7 +998,7 @@ function ActivityPanel({
   return (
     <>
       <div className="section-toolbar">
-        <h3>{kind === "login" ? "登录记录" : "操作记录"}</h3>
+        <h3>{title}</h3>
         <Button small disabled={busy} onClick={() => loadActivity()}>
           <RefreshCw size={14} />
           刷新
@@ -1015,12 +1016,9 @@ function ActivityPanel({
               <th>时间</th>
               <th>用户</th>
               <th>操作</th>
-              {kind !== "login" && (
-                <>
-                  <th>记录</th>
-                  <th>详情</th>
-                </>
-              )}
+              {kind === "user" && <th>项目</th>}
+              <th>记录</th>
+              <th>详情</th>
             </tr>
           </thead>
           <tbody>
@@ -1029,18 +1027,15 @@ function ActivityPanel({
                 <td className="nowrap">{datetime(item.created_at)}</td>
                 <td>{item.actor_name}</td>
                 <td>{item.action}</td>
-                {kind !== "login" && (
-                  <>
-                    <td>{item.subject}</td>
-                    <td>{item.detail || "—"}</td>
-                  </>
-                )}
+                {kind === "user" && <td>{item.project_name || "—"}</td>}
+                <td>{item.subject}</td>
+                <td>{item.detail || "—"}</td>
               </tr>
             ))}
           </tbody>
         </table>
         {!busy && !items.length && (
-          <Empty title={kind === "login" ? "暂无登录记录" : "暂无操作记录"} />
+          <Empty title={"暂无" + title} />
         )}
       </div>
       {more && (
@@ -4641,7 +4636,7 @@ function Workspace({
               <div className="tabs page-tabs">
                 {[
                   ["profile", "个人资料"],
-                  ["login-activity", "登录记录"],
+                  ["login-activity", "用户操作日志"],
                   ...(currentUser?.role === "admin"
                     ? [
                         ["users", "用户管理"],
@@ -4673,7 +4668,7 @@ function Workspace({
               )}
               {currentUser.role === "admin" && accountView === "system-activity" && <ActivityPanel />}
               {accountView === "login-activity" && (
-                <ActivityPanel key="login" kind="login" />
+                <ActivityPanel key="user" kind="user" />
               )}
               {currentUser?.role === "admin" && accountView === "users" && (
                 <UserAdmin
