@@ -168,8 +168,8 @@ def numeric(value, label, required=False):
 
 
 def parse_electronic_file(blob, filename, sheet_name=''):
-    if not blob or len(blob) > 20 * 1024 * 1024:
-        raise ElectronicBomError('文件为空或超过 20 MB')
+    if not blob:
+        raise ElectronicBomError('文件为空')
     if filename.lower().endswith('.xlsx'):
         try:
             sheets, selected, grid = read_xlsx(blob, sheet_name)

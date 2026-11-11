@@ -93,14 +93,14 @@ python3 -m unittest discover -s tests -v
 python3 scripts/package-release.py
 ```
 
-部署包生成在上级 `releases/jiecheng-plm-1.9.16.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
+部署包生成在上级 `releases/jiecheng-plm-1.9.17.tar.gz`，不包含数据库、密码、图片、node_modules 或测试数据。
 
 ## 部署到服务器
 
 将部署包上传并解压到空目录：
 
 ```sh
-tar -xzf jiecheng-plm-1.9.16.tar.gz
+tar -xzf jiecheng-plm-1.9.17.tar.gz
 cd jiecheng-plm
 ./start.sh --host 127.0.0.1 --port 8787
 ```
@@ -159,7 +159,7 @@ python3 server/app.py --bootstrap-admin '管理员姓名' admin@example.com
 
 1.5 将原管理员迁移为邮箱账户，原密码可继续使用。迁移前可设置 `PLM_ADMIN_EMAIL` 和 `PLM_ADMIN_NAME`；默认邮箱为 `admin@localhost`。已有业务记录的责任人可在详情补填，历史库存流水保留原样。
 
-管理员可在「设置与数据 → 备份与恢复」下载完整 ZIP，或上传不超过 1 GB 的数据库版本 6 至 8 的备份。恢复覆盖当前数据，旧会话失效。版本 6 备份保留当前账户，版本 7 及以上会还原备份中的账户。覆盖前的 ZIP 保存在数据目录的 `before-restore.zip`。备份含用户资料和密码哈希，需私下保管。
+管理员可在「设置与数据 → 备份与恢复」下载完整 ZIP，或上传数据库版本 6 至当前版本的 ZIP 备份。恢复覆盖当前数据，旧会话失效。版本 6 备份保留当前账户，版本 7 及以上会还原备份中的账户。覆盖前的 ZIP 保存在数据目录的 `before-restore.zip`。备份含用户资料和密码哈希，需私下保管。
 
 忘记密码时，由服务器管理员停止服务后执行：
 
@@ -173,4 +173,4 @@ python3 scripts/admin.py reset-password --email admin@example.com --data-dir /va
 
 单工作空间，管理员可创建成员并重置密码。成员可修改自己的手机号、头像和密码。产品经理、物料管理员、采购负责人和库存经办人分别记录。物料删除后可以恢复，原库存、BOM 和采购等关联保留。产品删除须由当前管理员验证密码，关联库存流水的产品可归档。库存流水可在编辑窗口修改或删除。保存或确认删除后重新计算受影响的库存结存和采购入库数量，变更记入操作记录。仍有关联退库的出库流水须先处理退库记录。
 
-图片支持 PNG、JPG、JPEG、WebP、GIF、BMP，其他附件下载到本地查看。单次最多 12 个文件、总计 20 MB。数量最多 6 位小数，价格用于研发成本估算。手机摄像头及实体扫码枪需在实际设备与 HTTPS 环境验收。
+图片支持 PNG、JPG、JPEG、WebP、GIF、BMP，其他附件下载到本地查看。数量最多 6 位小数，价格用于研发成本估算。手机摄像头及实体扫码枪需在实际设备与 HTTPS 环境验收。

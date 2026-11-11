@@ -116,9 +116,11 @@ async function api(path: string, method = "GET", data?: unknown) {
   const r = await fetch(appBase + "api/" + path, {
     method,
     headers:
-      data instanceof FormData ? {} : { "Content-Type": "application/json" },
+      data instanceof FormData ? {} : {
+        "Content-Type": data instanceof Blob ? data.type : "application/json",
+      },
     body: data
-      ? data instanceof FormData
+      ? data instanceof FormData || data instanceof Blob
         ? data
         : JSON.stringify(data)
       : undefined,
@@ -134,6 +136,19 @@ async function api(path: string, method = "GET", data?: unknown) {
 const ProjectContext = React.createContext({ id: "", archived: false });
 function projectRequest(projectId: string, path: string, method = "GET", data?: unknown) {
   return api("projects/" + encodeURIComponent(projectId) + "/" + path, method, data);
+}
+
+function uploadProjectFiles(projectId: string, owner: string, id: string, files: File[], replace?: string) {
+  const manifest = {
+    owner_type: owner,
+    owner_id: id,
+    replace_id: replace,
+    files: files.map((file) => ({ name: file.name, size: file.size })),
+  };
+  const batch = new Blob([JSON.stringify(manifest) + "\n", ...files], {
+    type: "application/vnd.jplm.file-batch",
+  });
+  return projectRequest(projectId, "files", "POST", batch);
 }
 
 function download(content: Blob | string, name: string) {
@@ -441,12 +456,8 @@ function EntityForm({
   });
   function addImages(files: File[]) {
     if (!files.length) return;
-    try {
-      setSelected(mergeImages(selected, files));
-      setError("");
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    setSelected((current) => [...current, ...files]);
+    setError("");
   }
   return (
     <form
@@ -1078,10 +1089,7 @@ function BackupPanel({ onRestored }: { onRestored: () => void }) {
             });
             if (!response.ok) {
               const result = await response.json().catch(() => ({}));
-              throw Error(
-                result.error ||
-                  (response.status === 413 ? "备份超过 1 GB" : "恢复失败"),
-              );
+              throw Error(result.error || "恢复失败");
             }
             onRestored();
           } catch (error) {
@@ -1550,10 +1558,6 @@ function ProjectCoverSettings({ project, editable, onSaved }: {
   async function change(file?: File) {
     if (!editable || busy) return;
     setError("");
-    if (file && file.size > 4 * 1024 * 1024) {
-      setError("项目封面不能超过 4 MB");
-      return;
-    }
     setBusy(true);
     try {
       const form = file ? new FormData() : undefined;
@@ -1579,7 +1583,7 @@ function ProjectCoverSettings({ project, editable, onSaved }: {
       <div>
         <h3>项目封面</h3>
         {editable && <>
-          <p className="muted">JPG、PNG、WebP，最大 4 MB</p>
+          <p className="muted">JPG、PNG、WebP</p>
           <div className="project-cover-actions">
             <input ref={input} type="file" accept="image/jpeg,image/png,image/webp"
               aria-label="选择项目封面文件" hidden onChange={(event) => {
@@ -4766,14 +4770,7 @@ function Workspace({
                   return r.id;
                 }}
                 upload={async (id, images) => {
-                  const fd = new FormData();
-                  fd.append(
-                    "owner_type",
-                    modal.kind === "product" ? "products" : "parts",
-                  );
-                  fd.append("owner_id", id);
-                  images.forEach((f) => fd.append("file", f));
-                  await businessApi("files", "POST", fd);
+                  await uploadProjectFiles(projectId, modal.kind === "product" ? "products" : "parts", id, images);
                 }}
                 done={async () => {
                   await refresh();
@@ -4887,11 +4884,7 @@ function Workspace({
                     modal.kind === "product" || modal.kind === "part"
                       ? {
                           upload: async (files) => {
-                            const form = new FormData();
-                            form.append("owner_type", modal.kind === "part" ? "parts" : "products");
-                            form.append("owner_id", modal.item.id);
-                            files.forEach((file) => form.append("file", file));
-                            await businessApi("files", "POST", form);
+                            await uploadProjectFiles(projectId, modal.kind === "part" ? "parts" : "products", modal.item.id, files);
                           },
                           finish: async () => {
                             await refresh();
@@ -5344,11 +5337,7 @@ function Workspace({
               (await businessApi(choice.resource, "POST", data)).id
             }
             upload={async (id, images) => {
-              const form = new FormData();
-              form.append("owner_type", choice.resource);
-              form.append("owner_id", id);
-              images.forEach((image) => form.append("file", image));
-              await businessApi("files", "POST", form);
+              await uploadProjectFiles(projectId, choice.resource, id, images);
             }}
             done={async (id) => {
               const updated = await refresh();
@@ -6254,7 +6243,7 @@ function ImportForm({
       <label className="upload-zone">
         <Upload size={24} />
         <strong>{filename || "选择 CSV 文件"}</strong>
-        <span>UTF-8 编码 · 最多 5,000 行 · 20 MB</span>
+        <span>UTF-8 编码 · 最多 5,000 行</span>
         <input
           type="file"
           accept=".csv,text/csv"
@@ -6263,10 +6252,6 @@ function ImportForm({
             setRows([]);
             const f = e.target.files?.[0];
             if (!f) return;
-            if (f.size > 20 * 1024 * 1024) {
-              setError("文件不能超过 20 MB");
-              return;
-            }
             setFilename(f.name);
             Papa.parse<Record<string, string>>(await f.text(), {
               header: true,
@@ -6364,12 +6349,7 @@ function FileManager({
     setBusy(true);
     setError("");
     try {
-      const fd = new FormData();
-      fd.append("owner_type", owner);
-      fd.append("owner_id", id);
-      if (replace) fd.append("replace_id", replace);
-      for (const f of Array.from(fs)) fd.append("file", f);
-      await projectRequest(projectId, "files", "POST", fd);
+      await uploadProjectFiles(projectId, owner, id, Array.from(fs), replace);
       await onRefresh();
       onError(replace ? "文件已替换" : "文件已上传");
     } catch (e) {
@@ -6488,7 +6468,7 @@ function FileManager({
           <ImageIcon size={30} />
           <strong>上传图片或附件</strong>
           <span>
-            点击上传图片、规格书或图纸，每次最多 12 个文件，总计不超过 20 MB。
+            点击上传图片、规格书或图纸。
           </span>
           <input
             type="file"
@@ -6961,13 +6941,6 @@ function ImagePasteArea({
     </div>
   );
 }
-function mergeImages(previous: File[], files: File[]) {
-  const next = [...previous, ...files];
-  if (next.length > 12) throw Error("每次最多 12 张图片");
-  if (next.reduce((size, file) => size + file.size, 0) > 20 * 1024 * 1024)
-    throw Error("图片总计不能超过 20 MB");
-  return next;
-}
 function QuickCreateForm({
   images,
   fields,
@@ -7002,13 +6975,9 @@ function QuickCreateForm({
   const uploaded = useRef(false);
   function addImages(files: File[]) {
     if (!files.length) return;
-    try {
-      setSelected(mergeImages(selected, files));
-      uploaded.current = false;
-      setError("");
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    setSelected((current) => [...current, ...files]);
+    uploaded.current = false;
+    setError("");
   }
   return (
     <form
@@ -7024,9 +6993,6 @@ function QuickCreateForm({
         setBusy(true);
         setError("");
         try {
-          if (selected.length > 12) throw Error("每次最多 12 张图片");
-          if (selected.reduce((sum, f) => sum + f.size, 0) > 20 * 1024 * 1024)
-            throw Error("图片总计不能超过 20 MB");
           if (!created.current)
             created.current = await create({
               ...values,
@@ -7384,7 +7350,6 @@ function ElectronicImportForm({
     setRows([]);
     reset();
     try {
-      if (f.size > 20 * 1024 * 1024) throw Error("文件不能超过 20 MB");
       const form = new FormData();
       form.append("file", f);
       if (sheet) form.append("sheet", sheet);

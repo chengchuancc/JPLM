@@ -5,7 +5,8 @@ MATERIAL_CATEGORIES_VERSION = 20
 MATERIAL_CODE_PREFIX_VERSION = 21
 RECORD_DELETION_VERSION = 22
 INVENTORY_TIME_VERSION = 23
-VERSION = INVENTORY_TIME_VERSION
+COVER_SIZE_VERSION = 24
+VERSION = COVER_SIZE_VERSION
 LEGACY_PROJECT_ID = 'legacy'
 BUSINESS_TABLES = (
     'products', 'parts', 'suppliers', 'quotes', 'bom_versions', 'bom_lines',
@@ -49,7 +50,7 @@ COVER_TABLE = """
 CREATE TABLE IF NOT EXISTS project_covers (
     project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id),
     mime TEXT NOT NULL CHECK(mime IN ('image/jpeg','image/png','image/webp')),
-    image BLOB NOT NULL CHECK(length(image) BETWEEN 1 AND 4194304),
+    image BLOB NOT NULL CHECK(length(image) > 0),
     updated_at TEXT NOT NULL
 )
 """

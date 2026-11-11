@@ -16,7 +16,7 @@ import shipping
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
-    RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
+    RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, COVER_SIZE_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -24,9 +24,8 @@ BASE_PATH = os.environ.get("PLM_BASE_PATH", "").rstrip("/")
 SESSION_COOKIE = ('plm_session_' + hashlib.sha256(BASE_PATH.encode()).hexdigest()[:8]
                   if BASE_PATH else 'plm_session')
 DATA = Path(os.environ.get('PLM_DATA_DIR', str(ROOT / 'data'))).resolve()
-MAX_UPLOAD = 20 * 1024 * 1024
-MAX_COVER = 4 * 1024 * 1024
-MAX_RESTORE = 1024 ** 3
+FILE_BATCH_TYPE = "application/vnd.jplm.file-batch"
+UPLOAD_CHUNK = 1024 * 1024
 FILE_LOCK = threading.RLock()
 IMAGE_MIMES = {
     '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
@@ -117,7 +116,15 @@ def init_db(directory=None, bootstrap=None):
         if version < INVENTORY_TIME_VERSION:
             migrate_inventory(db)
         db.execute('BEGIN IMMEDIATE')
-        db.execute(COVER_TABLE)
+        if PROJECT_VERSION <= version < COVER_SIZE_VERSION and db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='project_covers'"
+        ).fetchone():
+            db.execute('ALTER TABLE project_covers RENAME TO project_covers_before_upload_upgrade')
+            db.execute(COVER_TABLE)
+            db.execute('INSERT INTO project_covers SELECT * FROM project_covers_before_upload_upgrade')
+            db.execute('DROP TABLE project_covers_before_upload_upgrade')
+        else:
+            db.execute(COVER_TABLE)
         if 'deleted_at' not in {row['name'] for row in db.execute('PRAGMA table_info(projects)')}:
             db.execute('ALTER TABLE projects ADD COLUMN deleted_at TEXT '
                        'CHECK(deleted_at IS NULL OR archived_at IS NOT NULL)')
@@ -974,8 +981,10 @@ def stage_restore(archive_path, directory):
     with zipfile.ZipFile(archive_path) as archive:
         entries = archive.infolist()
         names = {entry.filename for entry in entries}
-        if len(names) != len(entries) or len(names) > 100000 or sum(item.file_size for item in entries) > 2 * MAX_RESTORE:
-            raise Problem('备份内容过大或包含重复文件')
+        if len(names) != len(entries):
+            raise Problem('备份包含重复文件')
+        if sum(item.file_size for item in entries) > shutil.disk_usage(directory).free:
+            raise Problem('服务器剩余空间不足，无法解压备份', 507)
         if 'plm.sqlite3' not in names or any(
             name not in ('plm.sqlite3', 'uploads/') and
             (not name.startswith('uploads/') or not UPLOAD_ID.fullmatch(name[8:]))
@@ -1108,10 +1117,25 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('X-Frame-Options','DENY')
         self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'")
+    def body_size(self):
+        size = int(self.headers.get('Content-Length', '0'))
+        if size < 0:
+            raise Problem('请求长度无效')
+        return size
+
+    def stream_body(self, size, target):
+        while size:
+            chunk = self.rfile.read(min(size, UPLOAD_CHUNK))
+            if not chunk:
+                raise Problem('上传不完整')
+            target.write(chunk)
+            size -= len(chunk)
+
     def body(self):
-        size = int(self.headers.get('Content-Length','0'))
-        if size < 0 or size > MAX_UPLOAD: raise Problem('单次上传不能超过 20 MB',413)
+        size = self.body_size()
         raw = self.rfile.read(size)
+        if len(raw) != size:
+            raise Problem('上传不完整')
         if 'multipart/form-data' in self.headers.get('Content-Type',''): return raw
         try: return json.loads(raw or b'{}')
         except (ValueError, UnicodeError): raise Problem('请求数据格式错误')
@@ -1225,8 +1249,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.require_admin()
                 kind, asset_id = asset_path.groups()
                 if kind == 'file':
-                    with FILE_LOCK:
-                        return self.serve_file(asset_id, admin_assets=True)
+                    return self.serve_file(asset_id, admin_assets=True)
                 if kind == 'cover':
                     return self.project_cover(asset_id, 'GET', admin_assets=True)
                 return self.serve_avatar(asset_id)
@@ -1241,11 +1264,7 @@ class Handler(BaseHTTPRequestHandler):
                         raise Problem('需要管理员权限', 403)
                     return self.backup()
             if path.startswith('/files/') and method == 'GET':
-                with FILE_LOCK:
-                    with connect() as db:
-                        if not self.authorized(db):
-                            raise Problem('请先登录', 401)
-                    return self.serve_file(path.split('/')[-1])
+                return self.serve_file(path.split('/')[-1])
             if segments[:2] in (['api', 'users'], ['api', 'account'], ['api', 'reset-password']) and method != 'GET':
                 data = self.body()
                 with FILE_LOCK:
@@ -1395,8 +1414,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/electronic-import/preview' and method == 'POST':
             return self.electronic_preview(project_id)
         if path == '/api/files' and method == 'POST':
-            with FILE_LOCK:
-                return self.upload(project_id)
+            return self.upload(project_id)
         data = self.body()
         with FILE_LOCK:
             with transaction() as db:
@@ -1773,8 +1791,6 @@ class Handler(BaseHTTPRequestHandler):
                 project = enter_project(db, project_id, self.user, write=True)
                 if self.user['role'] != 'admin' and project['owner_id'] != self.user['id']:
                     raise Problem('无权修改项目封面', 403)
-            if int(self.headers.get('Content-Length', '0')) > MAX_COVER + 65536:
-                raise Problem('项目封面不能超过 4 MB', 413)
             _, uploads = self.multipart()
             if len(uploads) != 1:
                 raise Problem('请选择一张封面图片')
@@ -1782,8 +1798,6 @@ class Handler(BaseHTTPRequestHandler):
             mime = image_mime(image[:12])
             if mime not in ('image/jpeg', 'image/png', 'image/webp'):
                 raise Problem('请选择 JPG、PNG 或 WebP 图片')
-            if len(image) > MAX_COVER:
-                raise Problem('项目封面不能超过 4 MB', 413)
         with FILE_LOCK, transaction() as db:
             user = self.authorized(db)
             if not user or user['must_change']:
@@ -1840,8 +1854,8 @@ class Handler(BaseHTTPRequestHandler):
             raise Problem('请选择一张头像图片')
         _, _, blob = files[0]
         mime = image_mime(blob[:12])
-        if not mime or len(blob) > 2 * 1024 * 1024:
-            raise Problem('请选择 2 MB 以内的图片')
+        if not mime:
+            raise Problem('请选择有效的头像图片')
         with FILE_LOCK, transaction() as db:
             if not self.authorized(db):
                 raise Problem('请先登录', 401)
@@ -2296,26 +2310,76 @@ class Handler(BaseHTTPRequestHandler):
             if part.get_filename(): uploads.append((part.get_filename(),part.get_content_type(),part.get_payload(decode=True)))
             else: fields[key]=part.get_payload(decode=True).decode('utf-8')
         return fields,uploads
+    def receive_file_batch(self, directory):
+        size = self.body_size()
+        header = self.rfile.readline(min(size, 4 * UPLOAD_CHUNK) + 1)
+        if not header.endswith(b'\n') or len(header) > size or len(header) > 4 * UPLOAD_CHUNK:
+            raise Problem('文件清单格式错误')
+        manifest = json.loads(header)
+        if not isinstance(manifest, dict) or not isinstance(manifest.get('files'), list):
+            raise Problem('文件清单格式错误')
+        entries = manifest['files']
+        if not entries or any(
+            not isinstance(item, dict) or type(item.get('size')) is not int
+            or item['size'] <= 0 or not isinstance(item.get('name'), str)
+            for item in entries
+        ):
+            raise Problem('请选择非空文件')
+        payload_size = size - len(header)
+        if sum(item['size'] for item in entries) != payload_size:
+            raise Problem('文件长度与清单不一致')
+        if payload_size > shutil.disk_usage(directory).free:
+            raise Problem('服务器剩余空间不足，无法接收文件', 507)
+        uploads = []
+        for index, entry in enumerate(entries):
+            temporary = directory / str(index)
+            with temporary.open('wb') as target:
+                self.stream_body(entry['size'], target)
+            uploads.append((entry['name'], temporary, entry['size']))
+        return manifest, uploads
+
     def upload(self, project_id):
-        fields,uploads=self.multipart()
-        owner=fields.get('owner_type'); owner_id=fields.get('owner_id'); replace_id=fields.get('replace_id')
-        if owner not in ('products','parts') or not uploads: raise Problem('请选择上传文件')
-        if len(uploads)>12 or (replace_id and len(uploads)!=1): raise Problem('单次最多上传 12 个文件；替换请选择一个文件')
-        created=[]
+        with connect() as db:
+            enter_project(db, project_id, self.user, write=True)
+        with tempfile.TemporaryDirectory(dir=DATA) as folder:
+            directory = Path(folder)
+            if self.headers.get_content_type() == FILE_BATCH_TYPE:
+                fields, uploads = self.receive_file_batch(directory)
+            else:
+                fields, legacy = self.multipart()
+                uploads = []
+                for index, (name, _, blob) in enumerate(legacy):
+                    temporary = directory / str(index)
+                    temporary.write_bytes(blob)
+                    uploads.append((name, temporary, len(blob)))
+            with FILE_LOCK:
+                ids = self.save_uploads(project_id, fields, uploads)
+        self.send({'ids': ids})
+
+    def save_uploads(self, project_id, fields, uploads):
+        owner = fields.get('owner_type')
+        owner_id = fields.get('owner_id')
+        replace_id = fields.get('replace_id')
+        if owner not in ('products', 'parts') or not uploads:
+            raise Problem('请选择上传文件')
+        if replace_id and len(uploads) != 1:
+            raise Problem('替换请选择一个文件')
+        created = []
         try:
             with transaction() as db:
                 user = self.authorized(db)
                 if not user or user['must_change']:
                     raise Problem('请先登录', 401)
                 enter_project(db, project_id, user, write=True)
-                exists(db,owner,owner_id)
-                db.execute(f'UPDATE {owner} SET updated_at=? WHERE id=?',(now(),owner_id))
-                old=None
+                exists(db, owner, owner_id)
+                db.execute(f'UPDATE {owner} SET updated_at=? WHERE id=?', (now(), owner_id))
+                old = None
                 if replace_id:
-                    old=exists(db,'files',replace_id)
-                    if old['owner_type']!=owner or old['owner_id']!=owner_id: raise Problem('不能替换其他记录的附件')
-                for filename, _, blob in uploads:
-                    if not blob:
+                    old = exists(db, 'files', replace_id)
+                    if old['owner_type'] != owner or old['owner_id'] != owner_id:
+                        raise Problem('不能替换其他记录的附件')
+                for filename, temporary, size in uploads:
+                    if not size:
                         raise Problem('不能上传空文件')
                     fid = uid()
                     name = Path(filename.replace('\\', '/')).name[:200]
@@ -2323,19 +2387,18 @@ class Handler(BaseHTTPRequestHandler):
                     image_type = IMAGE_MIMES.get(ext)
                     mime = image_type or ('application/pdf' if ext == '.pdf' else 'application/octet-stream')
                     kind = 'image' if image_type else 'attachment'
-                    if image_type and image_mime(blob[:12]) != image_type:
-                        raise Problem('图片格式与文件内容不匹配')
+                    if image_type:
+                        with temporary.open('rb') as source:
+                            if image_mime(source.read(12)) != image_type:
+                                raise Problem('图片格式与文件内容不匹配')
+                    temporary.replace(DATA / 'uploads' / fid)
                     created.append(fid)
-                    (DATA / 'uploads' / fid).write_bytes(blob)
                     if old:
-                        # Replacing an image keeps its position and changes the
-                        # URL so a previously cached image is not reused.
                         db.execute('UPDATE files SET id=?,name=?,mime=?,size=?,kind=?,created_at=? WHERE id=?',
-                                   (fid, name, mime, len(blob), kind, now(), old['id']))
+                                   (fid, name, mime, size, kind, now(), old['id']))
                     else:
                         insert_scoped(db, 'files', dict(id=fid, owner_type=owner, owner_id=owner_id,
-                                                       name=name, mime=mime, size=len(blob),
-                                                       kind=kind, created_at=now()))
+                                                       name=name, mime=mime, size=size, kind=kind, created_at=now()))
                 touch_project(db)
         except Exception:
             for fid in created:
@@ -2343,7 +2406,7 @@ class Handler(BaseHTTPRequestHandler):
             raise
         if replace_id:
             remove_upload(replace_id)
-        self.send({'ids': created})
+        return created
 
     def list_assets(self):
         query = parse_qs(urlparse(self.path).query)
@@ -2394,36 +2457,46 @@ class Handler(BaseHTTPRequestHandler):
         return self.send({'items': [dict(row) for row in rows[:page_size]], 'more': len(rows) > page_size})
 
     def serve_file(self, id, *, admin_assets=False):
-        with connect() as db:
-            db.execute('BEGIN')
-            f = exists(db, 'files', id)
-            if not admin_assets:
-                enter_project(db, f['project_id'], self.user)
-            name = f['name']
-            owner = f['owner_type']
-            record = db.execute(f'SELECT code,name FROM {owner} WHERE id=?', (f['owner_id'],)).fetchone()
-            if record:
-                position = db.execute(
-                    """SELECT COUNT(*) FROM files WHERE owner_type=? AND owner_id=?
-                       AND rowid <= (SELECT rowid FROM files WHERE id=?)""",
-                    (owner, f['owner_id'], id),
-                ).fetchone()[0]
-                name = owner_file_name(name, record['code'], record['name'], position)
-        path = DATA / 'uploads' / id
-        if not path.is_file():
-            raise Problem('文件未找到', 404)
-        b = path.read_bytes()
-        self.send_response(200)
-        image_type = image_mime(b[:12]) if f['kind'] == 'image' else None
-        content_type = image_type or ('application/pdf' if f['mime'] == 'application/pdf' else 'application/octet-stream')
-        self.send_header('Content-Type', content_type)
-        self.send_header('Content-Length', str(len(b)))
-        disposition = 'inline' if image_type else 'attachment'
-        self.send_header('Content-Disposition', f"{disposition}; filename*=UTF-8''{quote(name, safe='')}")
-        self.security_headers()
-        self.send_header('Cache-Control', 'private, no-cache')
-        self.end_headers()
-        self.wfile.write(b)
+        with FILE_LOCK:
+            with connect() as db:
+                db.execute('BEGIN')
+                user = self.authorized(db)
+                if not user or user['must_change']:
+                    raise Problem('请先登录', 401)
+                f = exists(db, 'files', id)
+                if admin_assets:
+                    if user['role'] != 'admin':
+                        raise Problem('需要管理员权限', 403)
+                else:
+                    enter_project(db, f['project_id'], user)
+                name = f['name']
+                owner = f['owner_type']
+                record = db.execute(f'SELECT code,name FROM {owner} WHERE id=?', (f['owner_id'],)).fetchone()
+                if record:
+                    position = db.execute(
+                        """SELECT COUNT(*) FROM files WHERE owner_type=? AND owner_id=?
+                           AND rowid <= (SELECT rowid FROM files WHERE id=?)""",
+                        (owner, f['owner_id'], id),
+                    ).fetchone()[0]
+                    name = owner_file_name(name, record['code'], record['name'], position)
+            try:
+                source = (DATA / 'uploads' / id).open('rb')
+            except FileNotFoundError as exc:
+                raise Problem('文件未找到', 404) from exc
+        with source:
+            image_type = image_mime(source.read(12)) if f['kind'] == 'image' else None
+            source.seek(0)
+            content_type = image_type or ('application/pdf' if f['mime'] == 'application/pdf' else 'application/octet-stream')
+            self.send_response(200)
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(os.fstat(source.fileno()).st_size))
+            disposition = 'inline' if image_type else 'attachment'
+            self.send_header('Content-Disposition', f"{disposition}; filename*=UTF-8''{quote(name, safe='')}")
+            self.security_headers()
+            self.send_header('Cache-Control', 'private, no-cache')
+            self.end_headers()
+            shutil.copyfileobj(source, self.wfile, UPLOAD_CHUNK)
+
     def backup(self):
         with tempfile.TemporaryDirectory(dir=DATA) as folder:
             output = Path(folder) / 'backup.zip'
@@ -2439,22 +2512,18 @@ class Handler(BaseHTTPRequestHandler):
                 shutil.copyfileobj(source, self.wfile, 1024 * 1024)
 
     def restore(self):
-        size = int(self.headers.get('Content-Length', '0'))
-        if size <= 0 or size > MAX_RESTORE:
-            raise Problem('请选择不超过 1 GB 的 ZIP 备份', 413)
+        size = self.body_size()
+        if not size:
+            raise Problem('请选择 ZIP 备份')
         if self.headers.get('X-PLM-Restore') != 'replace':
             raise Problem('请确认覆盖当前数据')
         with tempfile.TemporaryDirectory(dir=DATA) as folder:
             directory = Path(folder)
             archive = directory / 'restore.zip'
+            if size > shutil.disk_usage(directory).free:
+                raise Problem('服务器剩余空间不足，无法接收备份', 507)
             with archive.open('wb') as target:
-                remaining = size
-                while remaining:
-                    chunk = self.rfile.read(min(remaining, 1024 * 1024))
-                    if not chunk:
-                        raise Problem('备份上传不完整')
-                    target.write(chunk)
-                    remaining -= len(chunk)
+                self.stream_body(size, target)
             try:
                 staged, version = stage_restore(archive, directory)
             except (zipfile.BadZipFile, sqlite3.Error, RuntimeError, NotImplementedError, ValueError) as exc:
