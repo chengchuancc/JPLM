@@ -86,6 +86,7 @@ import type { LabelMaterial } from "./material-labels";
 
 const ShippingManagement = lazy(() => import("./shipping"));
 const GlobalShipping = lazy(() => import("./global-shipping"));
+const WarehouseRegistration = lazy(() => import("./warehouse-registration"));
 const MaterialLabelsDialog = lazy(() => import("./material-labels"));
 const money = (n: number) =>
   new Intl.NumberFormat("zh-CN", {
@@ -112,6 +113,14 @@ const localDateTime = (value?: string) => {
 };
 const appBase = new URL(".", document.baseURI).pathname;
 const fileUrl = (id: string) => appBase + "files/" + encodeURIComponent(id);
+const connectionLabels = {
+  checking: "检测连接中",
+  local: "本地缓存",
+  cloud: "云端直连",
+  unavailable: "连接异常",
+};
+type ConnectionRoute = keyof typeof connectionLabels;
+
 async function api(path: string, method = "GET", data?: unknown) {
   const r = await fetch(appBase + "api/" + path, {
     method,
@@ -1051,6 +1060,88 @@ function ActivityPanel({
   );
 }
 
+type ShopifySettings = { shop: string; client_id: string; has_secret: boolean; configured: boolean };
+
+function ShopifySettingsPanel() {
+  const [saved, setSaved] = useState<ShopifySettings>();
+  const [shop, setShop] = useState("");
+  const [clientId, setClientId] = useState("");
+  const [secret, setSecret] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [attempt, setAttempt] = useState(0);
+
+  function accept(settings: ShopifySettings) {
+    setSaved(settings);
+    setShop(settings.shop);
+    setClientId(settings.client_id);
+    setSecret("");
+  }
+
+  useEffect(() => {
+    let active = true;
+    setError("");
+    api("settings/shopify").then((settings: ShopifySettings) => {
+      if (active) accept(settings);
+    }, (failure: Error) => {
+      if (active) setError(failure.message);
+    });
+    return () => { active = false; };
+  }, [attempt]);
+
+  const keepSecret = saved?.has_secret && shop.trim().toLowerCase() === saved.shop
+    && clientId.trim() === saved.client_id;
+  return <div className="settings-grid">
+    <section className="panel">
+      <div className="panel-heading">
+        <h3>Shopify 订单导入</h3>
+        {saved && <span className="muted">{saved.configured ? "已配置" : "待配置"}</span>}
+      </div>
+      <p>在 Shopify Dev Dashboard 打开「JPLM 订单导入 → Settings → Credentials」获取应用凭据。</p>
+      {saved ? <form autoComplete="off" onSubmit={async (event) => {
+        event.preventDefault();
+        if (saving) return;
+        setSaving(true);
+        setError("");
+        setNotice("");
+        try {
+          accept(await api("settings/shopify", "PUT", {
+            shop, client_id: clientId, client_secret: secret,
+          }));
+          setNotice("已验证 Shopify 订单读取授权。可在「全局发货 → 导入订单」查看。");
+        } catch (failure) {
+          setError((failure as Error).message);
+        } finally {
+          setSaving(false);
+        }
+      }}>
+        <div className="form-grid">
+          <label className="wide">店铺域名
+            <input value={shop} onChange={(event) => setShop(event.target.value)} required
+              maxLength={80} placeholder="xxx.myshopify.com" autoCapitalize="none" spellCheck={false} disabled={saving} />
+          </label>
+          <label className="wide">Client ID
+            <input value={clientId} onChange={(event) => setClientId(event.target.value)} required
+              maxLength={256} autoCapitalize="none" spellCheck={false} disabled={saving} />
+          </label>
+          <label className="wide">Client secret
+            <input type="password" value={secret} onChange={(event) => setSecret(event.target.value)}
+              required={!keepSecret} maxLength={512} autoComplete="new-password" disabled={saving}
+              placeholder={keepSecret ? "已设置，留空保留" : undefined} />
+          </label>
+        </div>
+        <div className="dialog-actions">
+          <Button primary type="submit" disabled={saving}>{saving ? "正在验证…" : "保存并验证"}</Button>
+        </div>
+      </form> : error ? <Button small onClick={() => setAttempt((value) => value + 1)}>重新加载</Button>
+        : <p role="status" className="muted">正在读取配置…</p>}
+      {error && <p role="alert" className="form-error">{error}</p>}
+      {notice && <p role="status" className="shipping-notice">{notice}</p>}
+    </section>
+  </div>;
+}
+
 function BackupPanel({ onRestored }: { onRestored: () => void }) {
   const [file, setFile] = useState<File | null>(null);
   const [confirmed, setConfirmed] = useState(false);
@@ -1271,6 +1362,7 @@ const projectHome: WorkspaceRoute = { projectId: "", view: "projects", detail: "
 function readWorkspaceRoute(hash = location.hash): WorkspaceRoute {
   const [top, id, view, detail] = hash.slice(1).split("/");
   if (top === "settings") return { ...projectHome, view: "settings" };
+  if (top === "warehouse") return { ...projectHome, view: "warehouse" };
   if (top === "global-shipping") return { ...projectHome, view: "global-shipping", detail: /^[a-f0-9]{24}$/.test(id || "") ? id : "" };
   if (top === "projects" && id) {
     const valid = navs.some((nav) => nav.id === view) || view === "project-settings";
@@ -1292,6 +1384,8 @@ function App() {
   const [restored, setRestored] = useState(false);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [connection, setConnection] = useState<ConnectionRoute>("checking");
+  const signedIn = !!auth?.authenticated && !!auth.user && !auth.user.must_change;
   const draftOpen = useRef(false);
   const { route, entry, navigate, back } = useNavigationHistory({
     readRoute: readWorkspaceRoute,
@@ -1334,6 +1428,49 @@ function App() {
     };
   }, []);
   useEffect(() => {
+    if (!signedIn) return;
+    let active = true;
+    let probe: AbortController | null = null;
+    setConnection("checking");
+
+    async function checkConnection() {
+      if (probe || document.visibilityState === "hidden") return;
+      const controller = new AbortController();
+      probe = controller;
+      const timeout = window.setTimeout(() => controller.abort(), 5000);
+      try {
+        const response = await fetch(appBase + "api/health", {
+          cache: "no-store",
+          credentials: "omit",
+          signal: controller.signal,
+        });
+        if (!response.ok || (await response.json()).ok !== true) throw Error("健康检查未通过");
+        if (active) {
+          setConnection(response.headers.get("X-JPLM-Edge") === "up" ? "local" : "cloud");
+        }
+      } catch {
+        if (active) setConnection("unavailable");
+      } finally {
+        window.clearTimeout(timeout);
+        probe = null;
+      }
+    }
+
+    void checkConnection();
+    const timer = window.setInterval(checkConnection, 30000);
+    window.addEventListener("focus", checkConnection);
+    window.addEventListener("online", checkConnection);
+    document.addEventListener("visibilitychange", checkConnection);
+    return () => {
+      active = false;
+      probe?.abort();
+      window.clearInterval(timer);
+      window.removeEventListener("focus", checkConnection);
+      window.removeEventListener("online", checkConnection);
+      document.removeEventListener("visibilitychange", checkConnection);
+    };
+  }, [signedIn]);
+  useEffect(() => {
     if (route.projectId || route.view === "global-shipping" || !route.detail || !auth?.authenticated || auth.user?.must_change) return;
     let active = true;
     api("resolve/" + route.view + "/" + encodeURIComponent(route.detail)).then(
@@ -1358,6 +1495,10 @@ function App() {
         </div>
       </div>
     );
+  if (route.view === "warehouse")
+    return <Suspense fallback={<div className="loading-page">正在打开出入库登记…</div>}>
+      <WarehouseRegistration request={api} />
+    </Suspense>;
   if (!route.projectId && route.detail && route.view !== "global-shipping")
     return <div className="loading-page"><BrandMark /><span>正在打开记录…</span></div>;
   const project = projects.find((item) => item.id === route.projectId);
@@ -1375,6 +1516,7 @@ function App() {
         project={project}
         projects={projects}
         currentUser={auth.user}
+        connection={connection}
         navigate={navigate}
         back={back}
         canGoBack={!!entry.previous}
@@ -1768,12 +1910,13 @@ function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }:
 
 function Workspace({
   route, project, projects, currentUser, navigate, back, canGoBack, draftOpen, reloadProjects,
-  updateUser, onLogout, onRestore,
+  updateUser, onLogout, onRestore, connection,
 }: {
   route: WorkspaceRoute;
   project?: ProjectSummary;
   projects: ProjectSummary[];
   currentUser: User;
+  connection: ConnectionRoute;
   navigate: (route: WorkspaceRoute, replace?: boolean, initial?: Record<string, unknown>) => void;
   back: (fallback: WorkspaceRoute) => void;
   canGoBack: boolean;
@@ -1784,6 +1927,7 @@ function Workspace({
   onRestore: () => void;
 }) {
   const [state, setState] = useState<State>(emptyState);
+  const materialPhotos = React.useMemo(() => firstMaterialPhotos(state.files), [state.files]);
   const [avatarVersion, setAvatarVersion] = useState(0);
   const [accountView, setAccountView] = usePageState("workspace.accountView", "profile");
   const { view, detail } = route;
@@ -2003,9 +2147,8 @@ function Workspace({
   const purchase = state.purchases.find((p) => p.id === detail);
   function purchaseMaterialLabel(line: PurchaseLine) {
     const item = findPart(line.part_id);
-    return <div className="purchase-material-cell">
-      <MaterialThumbnail className="purchase-material-photo"
-        imageId={files("parts", line.part_id).find((file) => file.kind === "image")?.id} />
+    return <div className="table-material-label">
+      <MaterialThumbnail className="material-thumbnail-small" imageId={materialPhotos.get(line.part_id)} />
       <div>
         <button type="button" className="text-link" onClick={() => go("parts", line.part_id)}>{item?.name}</button>
         <small className="mono">{item?.code}</small>
@@ -2096,6 +2239,7 @@ function Workspace({
         (filter === "低库存" && p.stock < p.min_stock) ||
         (filter === "无库存" && p.stock === 0)),
   );
+  const selectedVisibleParts = visibleParts.filter(({ id }) => selectedLabels.has(id));
   async function savePart(id: string, key: string, value: string) {
     await businessApi("material-cells/" + id, "PUT", { [key]: value });
     await refresh();
@@ -2516,16 +2660,21 @@ function Workspace({
                       <small className="mono">{m.code}</small>
                     </td>
                     <td>
-                      <button
-                        className="text-link"
-                        onClick={() => {
-                          if (view === "inventory") openInventoryPart(m.part_id);
-                          else go("parts", m.part_id);
-                        }}
-                      >
-                        {p?.name}
-                      </button>
-                      <small className="mono">{p?.code}</small>
+                      <div className="table-material-label">
+                        <MaterialThumbnail className="material-thumbnail-small" imageId={materialPhotos.get(m.part_id)} />
+                        <div>
+                          <button
+                            className="text-link"
+                            onClick={() => {
+                              if (view === "inventory") openInventoryPart(m.part_id);
+                              else go("parts", m.part_id);
+                            }}
+                          >
+                            {p?.name}
+                          </button>
+                          <small className="mono">{p?.code}</small>
+                        </div>
+                      </div>
                     </td>
                     <td className="num">
                       <QuantityHighlight value={m.qty}
@@ -2632,6 +2781,9 @@ function Workspace({
           <button className={view === "global-shipping" ? "active" : ""} onClick={() => go("global-shipping")}>
             <Truck size={19} strokeWidth={1.7} /><span>全局发货</span>
           </button>
+          <button onClick={() => window.open(appBase + "#warehouse", "_blank", "noopener")}>
+            <ScanLine size={19} strokeWidth={1.7} /><span>出入库登记</span>
+          </button>
           {project && navs.map((n) => (
             <button
               key={n.id}
@@ -2661,6 +2813,10 @@ function Workspace({
             <Settings size={18} />
             系统设置
           </button>
+          <div className="sidebar-connection" data-route={connection} role="status">
+            <span className="connection-dot" aria-hidden="true" />
+            {connectionLabels[connection]}
+          </div>
           <div className="user-row">
             <Avatar user={currentUser} version={avatarVersion} />
             <div>
@@ -2783,7 +2939,7 @@ function Workspace({
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}
           {view === "global-shipping" && <Suspense fallback={<p className="muted">正在加载全局发货…</p>}>
-            <GlobalShipping key={detail} initialRecord={detail} request={api}
+            <GlobalShipping key={detail} initialRecord={detail} request={api} admin={currentUser.role === "admin"}
               projectRequest={(id) => (path, method, data) => projectRequest(id, path, method, data)}
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}
@@ -3403,6 +3559,7 @@ function Workspace({
                       </select>
                     </>
                   )}
+                  {batchLabelButton(selectedVisibleParts)}
                   <Button small onClick={() => setModal({ kind: "scan" })}>
                     <ScanLine size={16} />
                   </Button>
@@ -3431,11 +3588,13 @@ function Workspace({
               <MaterialTable
                 key={view}
                 tableId={view}
+                selection={labelSelection}
                 {...categoryProps(view)}
                 columns={libraryColumns}
                 hiddenColumns={hiddenColumns[view] || []}
                 rows={visibleParts.map((material) => ({
                   id: material.id,
+                  selectionLabel: material.code,
                   cells: {
                     ...baseMaterialCells(material, view === "inventory" ? openInventoryPart : openMaterial),
                     stock: view === "inventory" ? <InventoryQuantity part={material} /> : amount(material.stock),
@@ -3448,6 +3607,7 @@ function Workspace({
                     ]),
                     actions: (
                       <div className="row-actions">
+                        {labelPrintButton(material)}
                         {view === "inventory" ? (
                           inventoryRowActions(material)
                         ) : (
@@ -4642,6 +4802,7 @@ function Workspace({
                         ["users", "用户管理"],
                         ["system-activity", "系统操作记录"],
                         ["assets", "素材库"],
+                        ["shopify", "Shopify"],
                         ["backup", "备份与恢复"],
                       ]
                     : []),
@@ -4679,6 +4840,7 @@ function Workspace({
                 />
               )}
               {currentUser.role === "admin" && accountView === "assets" && <AssetLibrary onChanged={reloadProjects} />}
+              {currentUser.role === "admin" && accountView === "shopify" && <ShopifySettingsPanel />}
               {currentUser?.role === "admin" && accountView === "backup" && (
                 <div className="settings-grid">
                   <BackupPanel onRestored={onRestore} />
@@ -5931,7 +6093,7 @@ function MaterialPicker({
               key={part.id}
               onClick={() => onToggle(part.id)}
             >
-              <MaterialThumbnail imageId={photos.get(part.id)} className="purchase-material-photo" />
+              <MaterialThumbnail imageId={photos.get(part.id)} className="material-thumbnail-small" />
               <span className="purchase-material-name">
                 <strong>{part.name}</strong>
                 <small>{[part.code, part.spec, part.external_code].filter(Boolean).join(" · ")}</small>
@@ -6112,7 +6274,7 @@ function PurchaseForm({
             return (
               <div className="purchase-form-line" key={line.partId}>
                 <div className="purchase-selected-material">
-                  <MaterialThumbnail imageId={photos.get(part.id)} className="purchase-material-photo" />
+                  <MaterialThumbnail imageId={photos.get(part.id)} className="material-thumbnail-small" />
                   <span className="purchase-material-name">
                     <strong>{part.name}</strong>
                     <small>

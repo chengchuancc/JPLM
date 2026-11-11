@@ -33,16 +33,16 @@ type RowSelection = { selected: ReadonlySet<string>; change: (ids: string[], che
 const selectionWidth = 38;
 type Widths = Partial<Record<Column, number>>;
 const maximumWidth = 640;
-function minimumWidth(id: Column) {
+function minimumWidth(id: Column, actionsWidth: number) {
   if (id === "code") return 100;
-  if (id === "actions") return 112;
+  if (id === "actions") return actionsWidth;
   if (id === "photo") return 62;
   if (id === "unit") return 68;
   if (id === "category" || id === "parents") return 112;
   return 80;
 }
-function clampWidth(id: Column, width: number) {
-  return Math.max(minimumWidth(id), Math.min(maximumWidth, Math.round(width)));
+function clampWidth(id: Column, width: number, actionsWidth: number) {
+  return Math.max(minimumWidth(id, actionsWidth), Math.min(maximumWidth, Math.round(width)));
 }
 const numeric = new Set<Column>([
   "qty",
@@ -156,6 +156,7 @@ export function MaterialTable({
   selection?: RowSelection;
   empty: ReactNode;
 }) {
+  const actionsWidth = tableId === "inventory" ? 136 : fields.actions[1];
   const storageKey = "plm-columns-" + tableId;
   const [order, setOrder] = useState<Column[]>(() => {
     try {
@@ -181,14 +182,14 @@ export function MaterialTable({
       const values: Widths = {};
       for (const id of Object.keys(fields) as Column[]) {
         if (typeof saved?.[id] === "number" && Number.isFinite(saved[id]))
-          values[id] = clampWidth(id, saved[id]);
+          values[id] = clampWidth(id, saved[id], actionsWidth);
       }
       return values;
     } catch {
       return {};
     }
   });
-  const widthOf = (id: Column) => widths[id] ?? fields[id][1];
+  const widthOf = (id: Column) => widths[id] ?? (id === "actions" ? actionsWidth : fields[id][1]);
   const resize = useRef<{
     id: Column;
     pointer: number;
@@ -199,7 +200,7 @@ export function MaterialTable({
   function setWidth(id: Column, width: number | null, persist = false) {
     const next = { ...widths };
     if (width === null) delete next[id];
-    else next[id] = clampWidth(id, width);
+    else next[id] = clampWidth(id, width, actionsWidth);
     setWidths(next);
     if (persist) {
       try {
@@ -261,11 +262,10 @@ export function MaterialTable({
   return (
     <div className="table-wrap" ref={wrap}>
       <table
-        className={"editable-table configurable-table" + (selection ? " has-row-selection" : "")}
+        className="editable-table configurable-table"
         style={{
           width: visible.reduce((sum, id) => sum + widthOf(id), selection ? selectionWidth : 0),
-          "--row-selection-width": selectionWidth + "px",
-        } as React.CSSProperties}
+        }}
       >
         <colgroup>
           {selection && <col style={{ width: selectionWidth }} />}
@@ -275,7 +275,7 @@ export function MaterialTable({
         </colgroup>
         <thead>
           <tr>
-            {selection && <th scope="col" className="fixed-selection">
+            {selection && <th scope="col" className="row-selection">
               <input
                 type="checkbox"
                 aria-label="全选当前表格"
@@ -387,6 +387,7 @@ export function MaterialTable({
                     active.next = clampWidth(
                       id,
                       active.start + e.clientX - active.x,
+                      actionsWidth,
                     );
                     setWidth(id, active.next);
                   }}
@@ -427,7 +428,7 @@ export function MaterialTable({
         <tbody>
           {rows.map(({ id, cells, selectionLabel }) => (
             <tr key={id}>
-              {selection && <td className="fixed-selection">
+              {selection && <td className="row-selection">
                 <input
                   type="checkbox"
                   aria-label={selectionLabel ? "选择 " + selectionLabel : "选择该行"}

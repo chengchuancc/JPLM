@@ -19,6 +19,10 @@ CARRIER_TABLES = (*LEGACY_TABLES, 'shipping_carriers')
 SOURCE_TABLES = (*CARRIER_TABLES, 'shipping_sources')
 PRODUCT_TABLES = (*SOURCE_TABLES, 'shipping_items')
 TABLES = (*PRODUCT_TABLES, 'shipping_handling_projects')
+PENDING_SHOPIFY_SCHEMA = """CREATE TABLE IF NOT EXISTS shipping_pending_shopify (
+    id TEXT PRIMARY KEY, source_id TEXT NOT NULL UNIQUE, reference TEXT NOT NULL,
+    details TEXT NOT NULL, created_at TEXT NOT NULL
+)"""
 SCHEMA = (
     """CREATE TABLE IF NOT EXISTS shipping_ks_orders (
         project_id TEXT NOT NULL REFERENCES projects(id), id TEXT NOT NULL,
@@ -248,9 +252,14 @@ def save_handling_projects(db, owner, shipment_id, value, writable):
                    ((owner, shipment_id, item) for item in (previous - selected) & writable))
 
 
-def check_order_reference(db, reference, projects, previous=''):
+def check_order_reference(db, reference, projects, previous='', *, pending_id=''):
     reference = string(reference, 150).lstrip('#').strip().lower()
-    if not reference or reference == previous.lstrip('#').strip().lower() or not projects:
+    if not reference or reference == previous.lstrip('#').strip().lower():
+        return
+    if db.execute("""SELECT 1 FROM shipping_pending_shopify
+        WHERE id<>? AND lower(trim(ltrim(trim(reference),'#')))=? LIMIT 1""", (pending_id, reference)).fetchone():
+        raise ShippingError('订单号已存在，请编辑该订单或登记补发子订单', 409)
+    if not projects:
         return
     marks = ','.join('?' for _ in projects)
     if db.execute(f"""SELECT 1 FROM shipping_records s JOIN projects j ON j.id=s.project_id
@@ -363,7 +372,9 @@ def list_global_orders(db, user, query):
     page = page_number(query)
     if project and project not in allowed:
         raise ShippingError('项目不存在或无权访问', 404)
-    params = (user['role']=='admin', user['id'], project, project, project, project, term, term, term, term, term)
+    admin = user['role'] == 'admin'
+    params = (admin, user['id'], project, project, project, project, term, term, term, term, term,
+              term, term, term, admin, project)
     cte = f"""WITH RECURSIVE allowed AS (
         SELECT id FROM projects j WHERE j.deleted_at IS NULL AND (? OR EXISTS (
             SELECT 1 FROM project_members m WHERE m.project_id=j.id AND m.user_id=?
@@ -395,6 +406,12 @@ def list_global_orders(db, user, query):
         JOIN projects j ON j.id=s.project_id AND j.deleted_at IS NULL
         WHERE s.deleted_at IS NULL AND (s.project_id IN (SELECT id FROM allowed)
             OR {has_related_project('s', 'IN (SELECT id FROM allowed)')})
+        UNION ALL
+        SELECT NULL,p.id,p.reference,NULL,'','',p.created_at,p.created_at,1,
+            p.reference,0,'Shopify','',p.details,'{{}}',
+            'pending-shopify:'||p.id,1,
+            (?='' OR instr(lower(p.reference),?)>0 OR instr(lower(coalesce(json_extract(p.details,'$.name'),'')),?)>0)
+        FROM shipping_pending_shopify p WHERE ? AND ?=''
     ), orders AS (
         SELECT order_key, max(order_number) AS order_number,max(created_at) AS created_at,
             count(*) AS package_count,sum(shipped) AS shipped_count
@@ -426,6 +443,11 @@ def list_global_orders(db, user, query):
             ORDER BY created_at DESC,id DESC''', (*params, *by_key)):
             package = {key: row[key] for key in ('id','project_id','reference','parent_id','tracking','shipped_on','shipped',
                                                  'source','carrier','created_at','updated_at','items_configured')}
+            if row['project_id'] is None:
+                package.update(project_name=None, can_open=True, can_edit=True, details=json.loads(row['full_details']),
+                               devices=[], shipment_items=[], handling_project_ids=[])
+                by_key[row['order_key']]['packages'].append(package)
+                continue
             owner = projects.get(row['project_id'])
             package.update(project_name=owner['name'] if owner else None, can_open=bool(owner),
                            can_edit=bool(owner and not owner['archived_at']))
@@ -463,7 +485,7 @@ def clean_details(values, keys):
         raise ShippingError('资料格式无效')
     details = {}
     for key in keys:
-        value = string(values.get(key), 3000 if key == 'notes' else 1000)
+        value = string(values.get(key), 3000 if key in ('notes', 'address') else 1000)
         if not value:
             continue
         if key in (*ITEMS, *COSTS):
@@ -789,7 +811,7 @@ def for_device(db, project, serial):
 
 
 def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=None, imported=False,
-                  writable=None, cross_project=False):
+                  writable=None, cross_project=False, created_at=None):
     old = db.execute('SELECT * FROM shipping_records WHERE project_id=? AND id=?',
                      (project, shipment_id)).fetchone()
     if data.get('version') is not None and (not old or data['version'] != old['updated_at']):
@@ -856,7 +878,7 @@ def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=Non
                       (project_id,id,channel,reference,ks_order_id,shipped_on,tracking,details,source_id,
                        created_at,updated_at,operator_id,parent_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                    (project, shipment_id, channel, reference, order, shipped_on, tracking,
-                    json_data(details), source_id, stamp, stamp, actor, parent_id))
+                    json_data(details), source_id, created_at or stamp, stamp, actor, parent_id))
     db.executemany('DELETE FROM shipping_devices WHERE project_id=? AND shipment_id=? AND serial=?',
                    ((project, shipment_id, serial) for serial in previous - set(serials)))
     db.executemany('INSERT INTO shipping_devices VALUES(?,?,?)',

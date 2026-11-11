@@ -8,6 +8,7 @@ import { type Request, type Channel, type Order, type Shipment, type Page,
   path, contactFields, otherContactFields, orderFields, items, costs, isOrder, isShipped, CarrierTags, CountryTag, SourceTag,
   Status, Tracking, shipmentLabel, shipmentStatuses } from "./shipping-data";
 import { ShippingPicker } from "./shipping-options";
+import { ShippingTextCell } from "./shipping-text-cell";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
 import { ShippingTableHeader } from "./shipping-table-header";
@@ -281,6 +282,7 @@ function ShipmentCell({ row, column, edit, editItems, saving, orderLocked, open,
   if (key === "tracking") return <Tracking shipment={row} />;
   if (key === "source") return <SourceTag value={row.details.source} />;
   if (key === "country") return <CountryTag value={value} />;
+  if (key === "address") return <ShippingTextCell value={value} label="地址" />;
   if (row.id && row.channel === "ks" && items.some(([field]) => field === key) && Number(value) > 0) {
     return <button type="button" className="text-link shipping-quantity" aria-label={"查看发货商品 " + column.label}
       onClick={openGoods}>{value}</button>;

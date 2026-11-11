@@ -1,6 +1,7 @@
 """真实 HTTP + 临时 SQLite 的业务集成测试，不写入正式 data 目录。"""
 import sys, base64, concurrent.futures, importlib.util, io, json, tempfile, threading, unittest, urllib.request, urllib.error, zipfile, os
 from pathlib import Path
+from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'server'))
 os.environ['PLM_QUIET']='1'
 spec=importlib.util.spec_from_file_location('plm_app',Path(__file__).resolve().parents[1]/'server/app.py')
@@ -18,6 +19,7 @@ class IntegrationTests(unittest.TestCase):
         cls.server.shutdown();cls.server.server_close();cls.thread.join();cls.tmp.cleanup()
     def setUp(self):
         with app.transaction() as db:
+            db.execute('DELETE FROM shipping_pending_shopify')
             for table in reversed(app.shipping.TABLES): db.execute('DELETE FROM '+table)
             for table in reversed(app.inspection.TABLES): db.execute('DELETE FROM '+table)
             for t in reversed(app.TABLES): db.execute('DELETE FROM '+t)
@@ -52,6 +54,67 @@ class IntegrationTests(unittest.TestCase):
     def test_stock_lifecycle_and_history(self):
         self.move('入库',10);out=self.move('出库',4)['id'];self.move('退库',2,original_id=out);self.move('报废',1,reason='损坏')
         self.assertEqual(self.stock(),7);self.assertEqual([m['balance'] for m in self.state()['movements']],[10,6,8,7])
+
+    def test_warehouse_scans_and_retries_stock_registration_without_duplication(self):
+        from urllib.parse import urlencode
+
+        def lookup(value, status=200, fuzzy=False):
+            return self.request('warehouse/material?' + urlencode({'q': value, 'fuzzy': int(fuzzy)}),
+                                status=status, project=False)
+
+        qr = f'https://work.makagic.com/JPLM/#projects/{self.project_id}/parts/{self.part}'
+        self.assertEqual(lookup(qr)['id'], self.part)
+        self.assertEqual(lookup(self.code.lower())['project_id'], self.project_id)
+        self.assertEqual(lookup('https://old.example.test/#parts/' + self.part)['id'], self.part)
+        with app.transaction() as db:
+            db.execute('INSERT INTO material_code_aliases(project_id,code,part_id) VALUES(?,?,?)',
+                       (self.project_id, 'LEGACY-WAREHOUSE', self.part))
+        self.assertEqual(lookup('legacy-warehouse')['code'], self.code)
+        self.assertEqual(lookup('https://wrong.example.test/#settings', 400)['error'],
+                         '请扫描 PLM 物料二维码或输入物料编号')
+        image = self.upload('仓库物料.png', b'\x89PNG\r\n\x1a\n' + b'picture')['ids'][0]
+        other_part = self.request('parts', 'POST', {'name': '测试物料配件'})['id']
+        self.assertEqual({row['id'] for row in lookup('测试物料', fuzzy=True)['rows']}, {self.part, other_part})
+        self.assertEqual(lookup(self.code, fuzzy=True)['rows'][0]['image_id'], image)
+
+        path = 'warehouse/movements'
+        payload = {'project_id': self.project_id, 'part_id': self.part}
+        received = {**payload, 'type': '入库', 'qty': 10, 'request_id': 'a' * 32}
+        result = self.request(path, 'POST', received, project=False)
+        self.assertEqual(self.request(path, 'POST', received, project=False), result)
+        self.request(path, 'POST', {**received, 'qty': 12}, 409, project=False)
+        self.request(path, 'POST', {**payload, 'type': '出库', 'qty': 3, 'request_id': 'b' * 32}, project=False)
+        self.request(path, 'POST', {**payload, 'type': '报废', 'qty': 2, 'request_id': 'c' * 32}, project=False)
+        self.request(path, 'POST', {**payload, 'type': '出库', 'qty': 6, 'request_id': 'd' * 32}, 400, project=False)
+        self.assertEqual(self.stock(), 5)
+        movements = self.state()['movements']
+        self.assertEqual(len(movements), 3)
+        self.assertEqual(next(row['reason'] for row in movements if row['type'] == '报废'), '仓库快速登记报废')
+        history = self.request(path, project=False)
+        self.assertEqual([row['type'] for row in history], ['报废', '出库', '入库'])
+        outbound = next(row for row in history if row['type'] == '出库')
+        delete_path = path + '/' + outbound['id']
+        delete_body = {'project_id': self.project_id, 'expected': outbound['expected']}
+        inbound = next(row for row in history if row['type'] == '入库')
+        self.request(path + '/' + inbound['id'], 'DELETE',
+                     {'project_id': self.project_id, 'expected': inbound['expected']}, 409, project=False)
+        self.assertEqual(self.request(delete_path, 'DELETE', delete_body, project=False)['stock'], 8)
+        self.assertEqual(self.request(delete_path, 'DELETE', delete_body, project=False)['stock'], 8)
+        self.assertEqual([row['type'] for row in self.request(path, project=False)], ['报废', '入库'])
+
+        account = {'name': '其他项目成员', 'email': 'warehouse-member@example.test', 'password': 'member'}
+        member = self.request('users', 'POST', account)['id']
+        admin_cookie = self.cookie
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+        lookup(qr, 404)
+        self.request(path, 'POST', received, 404, project=False)
+        member_cookie = self.cookie
+        self.cookie = admin_cookie
+        self.request('projects/' + self.project_id, 'PUT', {'members': [member]})
+        self.cookie = member_cookie
+        self.assertEqual(self.request(path, project=False), [])
+        self.request(delete_path, 'DELETE', delete_body, 403, project=False)
 
     def test_custom_material_categories_are_reused_and_preserve_material_serial(self):
         category = '包装耗材'
@@ -338,6 +401,149 @@ class IntegrationTests(unittest.TestCase):
         child_path = path + '/' + self.project_id + '/' + child['id']
         self.request(child_path, 'DELETE', {'version': child['updated_at']}, project=False)
         self.assertEqual(self.request('shipping/records?channel=other&deleted=1')['rows'][0]['id'], child['id'])
+
+    def test_shopify_admin_settings_verify_before_saving_and_hide_secret(self):
+        path = 'settings/shopify'
+        config_file = app.DATA / 'shopify-credentials.json'
+        self.addCleanup(config_file.unlink, missing_ok=True)
+        config = {'PLM_SHOPIFY_SHOP': 'test-shop.myshopify.com', 'PLM_SHOPIFY_CLIENT_ID': '',
+                  'PLM_SHOPIFY_CLIENT_SECRET': ''}
+        payload = {'shop': 'test-shop.myshopify.com', 'client_id': 'fixture-id', 'client_secret': 'fixture-secret'}
+        with patch.dict(os.environ, config), patch.object(app.shopify_orders, 'cached_token', None), \
+                patch.object(app.shopify_orders, 'post', return_value={
+                    'access_token': 'fixture-token', 'expires_in': 86400, 'scope': 'read_orders',
+                }) as upstream:
+            self.assertEqual(self.request(path, project=False), {
+                'shop': payload['shop'], 'client_id': '', 'has_secret': False, 'configured': False,
+            })
+            saved = self.request(path, 'PUT', payload, project=False)
+            self.assertEqual(saved, {
+                'shop': payload['shop'], 'client_id': payload['client_id'], 'has_secret': True, 'configured': True,
+            })
+            self.assertEqual(config_file.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.request(path, project=False), saved)
+            self.assertEqual(app.shopify_orders.configuration(app.DATA), tuple(payload.values()))
+            upstream.return_value = {'access_token': 'fixture-token', 'expires_in': 86400, 'scope': ''}
+            self.request(path, 'PUT', {**payload, 'client_secret': 'invalid'}, 502, project=False)
+            self.assertEqual(app.shopify_orders.configuration(app.DATA), tuple(payload.values()))
+            self.request(path, 'PUT', {**payload, 'client_id': 'new-id', 'client_secret': ''}, 400, project=False)
+            with zipfile.ZipFile(io.BytesIO(self.request('backup', raw=True))) as archive:
+                self.assertNotIn(config_file.name, archive.namelist())
+            account = {'name': '配置测试成员', 'email': 'settings-member@example.test', 'password': 'member'}
+            self.request('users', 'POST', account)
+            self.request('auth/login', 'POST', account)
+            self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+            self.request(path, status=403, project=False)
+            self.request(path, 'PUT', payload, 403, project=False)
+
+    def test_shopify_order_import_previews_and_deduplicates_without_creating_items(self):
+        path = 'global-shipping/shopify/orders'
+        first_id, existing_id = ('gid://shopify/Order/' + str(id) for id in (123, 124))
+        self.request('global-shipping/orders', 'POST', {
+            'project_id': self.project_id, 'reference': 'SHOP-124',
+        }, project=False)
+        address = {'name': '测试收件人', 'address1': 'Test Street', 'address2': 'Apt 2',
+                   'country': 'United States', 'countryCodeV2': 'US', 'city': 'Seattle',
+                   'province': 'Washington', 'zip': '98101', 'phone': '+15555550100'}
+        orders = [{
+            'id': id, 'name': reference, 'createdAt': '2026-11-01T12:00:00Z',
+            'displayFulfillmentStatus': 'UNFULFILLED', 'cancelledAt': None,
+            'shippingAddress': address, 'email': 'recipient@example.test',
+            'lineItems': {'nodes': [{'title': '示例主机', 'variantTitle': '蓝色',
+                                    'sku': 'DEMO-BLUE', 'currentQuantity': 2, 'requiresShipping': True}],
+                          'pageInfo': {'hasNextPage': True, 'endCursor': 'line-cursor'}},
+        } for id, reference in ((first_id, '#SHOP-123'), (existing_id, '#SHOP-124'))]
+
+        def shopify_response(url, body, headers, *, authentication=False):
+            if authentication:
+                self.assertTrue(url.endswith('/admin/oauth/access_token'))
+                self.assertIn(b'grant_type=client_credentials', body)
+                return {'access_token': 'fake-token', 'expires_in': 86400, 'scope': 'read_orders'}
+            self.assertEqual(headers['X-Shopify-Access-Token'], 'fake-token')
+            request = json.loads(body)
+            if 'JplmRecentOrders' in request['query']:
+                return {'data': {'orders': {'nodes': orders, 'pageInfo': {'hasNextPage': False}}}}
+            if 'JplmSelectedOrders' in request['query']:
+                return {'data': {'nodes': [order for order in orders if order['id'] in request['variables']['ids']]}}
+            self.assertEqual(request['variables']['after'], 'line-cursor')
+            return {'data': {'order': {'lineItems': {
+                'nodes': [{'title': '配件', 'currentQuantity': 1, 'requiresShipping': True}],
+                'pageInfo': {'hasNextPage': False},
+            }}}}
+
+        config = {'PLM_SHOPIFY_SHOP': 'test-shop.myshopify.com', 'PLM_SHOPIFY_CLIENT_ID': 'fake-id',
+                  'PLM_SHOPIFY_CLIENT_SECRET': 'fake-secret'}
+        with patch.dict(os.environ, config), patch.object(app.shopify_orders, 'cached_token', None), \
+                patch.object(app.shopify_orders, 'post', side_effect=shopify_response) as upstream:
+            preview = self.request(path, project=False)
+            self.assertEqual([row['reason'] for row in preview['rows']], ['', 'PLM 已有同订单号'])
+            self.assertNotIn('shippingAddress', preview['rows'][0])
+            self.assertEqual(self.request('global-shipping/orders', project=False)['total'], 1)
+            payload = {'ids': [first_id, existing_id]}
+            result = self.request(path, 'POST', payload, project=False)
+            self.assertEqual(result['skipped'], [{'id': existing_id, 'reason': 'PLM 已有同订单号'}])
+            record_id = result['created'][0]['record_id']
+            global_orders = 'global-shipping/orders'
+            row = self.request(global_orders + '?q=SHOP-123', project=False)['rows'][0]
+            record = row['packages'][0]
+            self.assertIsNone(record['project_id'])
+            self.assertEqual(record['reference'], '#SHOP-123')
+            self.assertEqual(record['details']['source'], 'Shopify')
+            self.assertEqual(record['details']['postcode'], '98101')
+            full_address = 'Test Street, Apt 2, Seattle, Washington, 98101, United States'
+            self.assertEqual(record['details']['address'], full_address)
+            self.assertEqual(app.shopify_orders.complete_address(record['details'], existing=True), full_address)
+            self.assertEqual(record['details']['notes'], '示例主机 / 蓝色（SKU DEMO-BLUE） × 2\n配件 × 1')
+            self.assertEqual(record['shipment_items'], [])
+            self.assertFalse(record['shipped_on'])
+            self.assertEqual(self.request(path, 'POST', {'ids': [first_id]}, project=False),
+                             {'created': [], 'skipped': [{'id': first_id, 'reason': '已导入'}]})
+            with app.connect() as db:
+                visible = app.shipping.list_global_orders(db, {'id': 'member', 'role': 'member'}, {})
+                self.assertEqual(visible['total'], 0)
+            other = self.request('projects', 'POST', {'name': '其他导入项目'})['id']
+            self.assertEqual(self.request(global_orders + '?project=' + other, project=False)['total'], 0)
+            with tempfile.TemporaryDirectory() as folder:
+                directory = Path(folder)
+                backup = directory / 'backup.zip'
+                with app.transaction() as db:
+                    legacy = {**record['details'], 'address': 'Test Street'}
+                    db.execute('UPDATE shipping_pending_shopify SET details=? WHERE id=?',
+                               (json.dumps(legacy), record_id))
+                backup.write_bytes(self.request('backup', raw=True))
+                staged, _ = app.stage_restore(backup, directory)
+                with app.connect(staged) as db:
+                    restored = db.execute('SELECT reference,details FROM shipping_pending_shopify WHERE id=?',
+                                          (record_id,)).fetchone()
+                    self.assertEqual(restored['reference'], '#SHOP-123')
+                    self.assertEqual(json.loads(restored['details'])['address'], full_address)
+                with app.transaction() as db:
+                    app.shopify_orders.backfill_addresses(db, app.now())
+            editor = 'global-shipping/shopify/pending/' + record_id
+            product = self.request('products', 'POST', {'name': '测试发货商品'}, project=other)['id']
+            extra = self.request('products', 'POST', {'name': '跨项目配件'})['id']
+            items = [{'project_id': other, 'product_id': product, 'quantity': 2},
+                     {'project_id': self.project_id, 'product_id': extra, 'quantity': 1}]
+            self.request(editor, 'PUT', {'version': record['updated_at'], 'shipment_items': []}, 400, project=False)
+            self.request(editor, 'PUT', {'version': record['updated_at'], 'shipment_items': items}, project=False)
+            assigned = self.request('shipping/records/' + record_id + '?scope=global', project=other)
+            self.assertEqual(assigned['created_at'], record['created_at'])
+            self.assertEqual(assigned['details'], record['details'])
+            self.assertEqual({item['project_id'] for item in assigned['shipment_items']}, {other, self.project_id})
+            self.assertEqual(self.request(global_orders + '?project=' + other, project=False)['total'], 1)
+            self.request(editor, 'PUT', {'version': record['updated_at'], 'shipment_items': items}, 409, project=False)
+            retry = self.request(path, 'POST', {'project_id': other, 'ids': [first_id]}, project=False)
+            self.assertEqual(retry, {'created': [], 'skipped': [{'id': first_id, 'reason': '已导入'}]})
+            self.assertEqual(self.request(global_orders, project=False)['total'], 2)
+            account = {'name': '普通成员', 'email': 'shopify-member@example.test', 'password': 'member'}
+            user = self.request('users', 'POST', account)['id']
+            self.request('projects/' + other, 'PUT', {'members': [user]})
+            self.request('auth/login', 'POST', account)
+            self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+            call_count = upstream.call_count
+            self.request(path, status=403, project=False)
+            self.request(path, 'POST', payload, 403, project=False)
+            self.assertEqual(upstream.call_count, call_count)
 
     def test_global_order_handling_projects_are_shared_without_product_lines(self):
         other = self.request('projects', 'POST', {'name': '协办项目'})['id']
@@ -1073,6 +1279,34 @@ class IntegrationTests(unittest.TestCase):
         else:self.fail('Private image exposed without authentication')
         self.request('files/'+fid,'DELETE',{})
         self.assertFalse((app.DATA/'uploads'/fid).exists())
+
+    def test_attachment_head_requires_access_and_matches_download(self):
+        blob = b'Private attachment'
+        file_id = self.upload('attachment.txt', blob)['ids'][0]
+        url = self.base + '/files/' + file_id
+        headers = {'Cookie': self.cookie}
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers)) as response:
+            etag = response.headers['ETag']
+            self.assertEqual(response.read(), blob)
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers, method='HEAD')) as response:
+            self.assertEqual(response.headers['ETag'], etag)
+            self.assertEqual(response.headers['Content-Length'], str(len(blob)))
+            self.assertEqual(response.read(), b'')
+        for request, expected in (
+            (urllib.request.Request(url, method='HEAD'), 401),
+            (urllib.request.Request(self.base + '/api/auth/status', headers=headers, method='HEAD'), 404),
+        ):
+            with self.assertRaises(urllib.error.HTTPError) as result:
+                urllib.request.urlopen(request)
+            with result.exception as response:
+                self.assertEqual(response.code, expected)
+                self.assertEqual(response.read(), b'')
+        self.request('files/' + file_id, 'DELETE', {})
+        with self.assertRaises(urllib.error.HTTPError) as deleted:
+            urllib.request.urlopen(urllib.request.Request(url, headers=headers, method='HEAD'))
+        with deleted.exception as response:
+            self.assertEqual(response.code, 404)
+
     def test_file_names_follow_material_and_keep_replacement_order(self):
         from urllib.parse import unquote
         png = b'\x89PNG\r\n\x1a\n' + b'picture'
@@ -1198,6 +1432,11 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual([project['id'] for project in self.request('projects')], [other])
         self.request('state', status=404)
         self.request('activity', status=404)
+        activity = self.request('activity?kind=user', project=False)['items']
+        self.assertTrue(any(row['project_id'] == other and row['action'] == '新增物料' for row in activity))
+        self.assertFalse(any(row['project_id'] == self.project_id for row in activity))
+        self.assertTrue(any(row['action'] == '登录' and row['actor_name'] != account['name'] for row in activity))
+        self.assertFalse(any(row['action'] == '新增用户' for row in activity))
         self.request('resolve/parts/' + self.part, status=404)
         self.request('projects/' + other, 'PUT', {'members': [member]}, 403)
         def fetch_file(status):
@@ -1211,6 +1450,7 @@ class IntegrationTests(unittest.TestCase):
                 self.assertEqual(caught.exception.code, status)
                 caught.exception.close()
         fetch_file(404)
+
         self.cookie = admin_cookie
         self.request('projects/' + self.project_id, 'PUT', {'members': [member]})
         self.cookie = member_cookie
@@ -1222,6 +1462,36 @@ class IntegrationTests(unittest.TestCase):
         self.assertIn({'id': member, 'name': account['name']}, self.state()['former_users'])
         self.cookie = member_cookie
         fetch_file(404)
+
+    def test_asset_library_cache_revalidates_access(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'picture'
+        file_id = self.upload('cached.png', png)['ids'][0]
+        url = self.base + '/api/assets/file/' + file_id
+
+        def asset(method='GET', etag='', status=200):
+            request = urllib.request.Request(url, headers={'Cookie': self.cookie, 'If-None-Match': etag},
+                                             method=method)
+            try:
+                response = urllib.request.urlopen(request)
+            except urllib.error.HTTPError as exc:
+                response = exc
+            with response:
+                self.assertEqual(response.code, status)
+                return response.headers, response.read()
+
+        headers, data = asset()
+        self.assertEqual(data, png)
+        etag = headers['ETag']
+        self.assertTrue(etag)
+        self.assertEqual(headers['Cache-Control'], 'private, no-cache')
+        head, data = asset('HEAD')
+        self.assertEqual((head['ETag'], data), (etag, b''))
+        self.assertEqual(asset(etag=etag, status=304)[1], b'')
+        account = {'name': '素材测试成员', 'email': 'cache-member@example.test', 'password': 'member'}
+        self.request('users', 'POST', account)
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': 'member', 'password': 'member'})
+        asset(etag=etag, status=403)
 
     def test_project_cover_permissions_and_backup(self):
         png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j0i8AAAAASUVORK5CYII=')

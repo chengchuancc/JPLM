@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
 import inspection
 import shipping
+import shopify_orders
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
@@ -104,6 +105,7 @@ def init_db(directory=None, bootstrap=None):
         if version > VERSION:
             raise RuntimeError('数据库版本高于当前程序版本')
         if version == VERSION:
+            db.execute(shipping.PENDING_SHOPIFY_SCHEMA)
             if bootstrap:
                 if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
                     raise Problem('管理员已初始化')
@@ -134,6 +136,7 @@ def init_db(directory=None, bootstrap=None):
         for statement in inspection.SCHEMA:
             db.execute(statement)
         shipping.initialize(db, version)
+        db.execute(shipping.PENDING_SHOPIFY_SCHEMA)
         for table in ('inspection_records', 'movements', 'purchases', 'purchase_lines'):
             if 'deleted_at' not in {row['name'] for row in db.execute(f'PRAGMA table_info({table})')}:
                 db.execute(f'ALTER TABLE {table} ADD COLUMN deleted_at TEXT')
@@ -1073,6 +1076,8 @@ def stage_restore(archive_path, directory):
                 required_tables |= {'users', 'activity'}
             if not required_tables <= source_tables:
                 raise Problem('备份缺少业务数据表')
+            if project_tables and 'shipping_pending_shopify' in source_tables:
+                shipping_tables += ('shipping_pending_shopify',)
             (init_db if project_tables else init_legacy_db)(staged)
             with connect(staged) as db:
                 db.execute('BEGIN')
@@ -1147,6 +1152,9 @@ def stage_restore(archive_path, directory):
                         shutil.copyfileobj(payload, target, 1024 * 1024)
     if version < PROJECT_VERSION:
         init_db(staged)
+    with connect(staged) as db:
+        db.execute('BEGIN IMMEDIATE')
+        shopify_orders.backfill_addresses(db, now())
     return staged, version
 
 class ThreadingHTTPServer(BaseThreadingHTTPServer):
@@ -1169,12 +1177,29 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header('Cache-Control','no-store')
         self.security_headers()
         for k,v in (extra or {}).items(): self.send_header(k,v)
-        self.end_headers(); self.wfile.write(b)
+        self.end_headers()
+        if self.command != 'HEAD':
+            self.wfile.write(b)
     def security_headers(self):
         self.send_header('X-Content-Type-Options','nosniff')
         self.send_header('X-Frame-Options','DENY')
         self.send_header('Referrer-Policy','same-origin')
         self.send_header('Content-Security-Policy',"default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'")
+    def send_asset_headers(self, content_type, length, revision, disposition=None):
+        etag = f'"{revision}"'
+        tags = self.headers.get('If-None-Match', '').split(',')
+        unchanged = any(tag.strip().removeprefix('W/') in (etag, '*') for tag in tags)
+        self.send_response(304 if unchanged else 200)
+        self.send_header('ETag', etag)
+        self.send_header('Cache-Control', 'private, no-cache')
+        if not unchanged:
+            self.send_header('Content-Type', content_type)
+            self.send_header('Content-Length', str(length))
+            if disposition:
+                self.send_header('Content-Disposition', disposition)
+        self.security_headers()
+        self.end_headers()
+        return not unchanged and self.command != 'HEAD'
     def body_size(self):
         size = int(self.headers.get('Content-Length', '0'))
         if size < 0:
@@ -1237,6 +1262,7 @@ class Handler(BaseHTTPRequestHandler):
         return f'{SESSION_COOKIE}={token}; HttpOnly; SameSite=Strict; Path={BASE_PATH or "/" }; Max-Age={age}{secure}'
 
     def do_GET(self): self.handle_request('GET')
+    def do_HEAD(self): self.handle_request('HEAD')
     def do_POST(self): self.handle_request('POST')
     def do_PUT(self): self.handle_request('PUT')
     def do_DELETE(self): self.handle_request('DELETE')
@@ -1247,7 +1273,10 @@ class Handler(BaseHTTPRequestHandler):
                 if not path.startswith(BASE_PATH + '/'):
                     raise Problem('路径不存在', 404)
                 path = path[len(BASE_PATH):]
-            if method != 'GET':
+            asset_path = re.fullmatch(r'/api/assets/(file|cover|avatar)/([0-9a-f]{24}|legacy)', path)
+            if method == 'HEAD' and not asset_path and not re.fullmatch(r'/files/[0-9a-f]{24}', path):
+                raise Problem('接口不存在', 404)
+            if method not in ('GET', 'HEAD'):
                 origin = self.headers.get('Origin')
                 if origin and urlparse(origin).netloc != self.headers.get('Host'): raise Problem('请求来源不被允许',403)
                 if self.headers.get('Sec-Fetch-Site') == 'cross-site': raise Problem('请求来源不被允许',403)
@@ -1268,6 +1297,19 @@ class Handler(BaseHTTPRequestHandler):
                 if self.user['must_change'] and path not in ('/api/auth/logout', '/api/account/password'):
                     raise Problem('请先修改初始密码', 403)
             segments = path.strip('/').split('/')
+            if path == '/api/warehouse/material' and method == 'GET':
+                return self.warehouse_material()
+            if path == '/api/warehouse/movements' and method == 'POST':
+                return self.warehouse_movement()
+            if path == '/api/warehouse/movements' and method == 'GET':
+                return self.warehouse_history()
+            if method == 'DELETE' and (match := re.fullmatch(r'/api/warehouse/movements/([a-f0-9]{24})', path)):
+                return self.delete_warehouse_movement(match[1])
+            if path == '/api/settings/shopify' and method in ('GET', 'PUT'):
+                self.require_admin()
+                if method == 'PUT':
+                    return self.send(shopify_orders.save_settings(DATA, self.body()))
+                return self.send(shopify_orders.public_settings(shopify_orders.credentials(DATA)))
             if path.startswith('/api/global-shipping/'):
                 return self.global_shipping_request(path.removeprefix('/api/global-shipping/'), method)
             if segments[:2] == ['api', 'projects']:
@@ -1304,11 +1346,10 @@ class Handler(BaseHTTPRequestHandler):
             if path == '/api/assets' and method == 'GET':
                 self.require_admin()
                 return self.list_assets()
-            asset_path = re.fullmatch(r'/api/assets/(file|cover|avatar)/([0-9a-f]{24}|legacy)', path)
             if asset_path and method == 'DELETE':
                 self.require_admin()
                 return self.delete_library_image(*asset_path.groups())
-            if asset_path and method == 'GET':
+            if asset_path and method in ('GET', 'HEAD'):
                 self.require_admin()
                 kind, asset_id = asset_path.groups()
                 if kind == 'file':
@@ -1326,7 +1367,7 @@ class Handler(BaseHTTPRequestHandler):
                     if not user or user['role'] != 'admin' or user['must_change']:
                         raise Problem('需要管理员权限', 403)
                     return self.backup()
-            if path.startswith('/files/') and method == 'GET':
+            if path.startswith('/files/') and method in ('GET', 'HEAD'):
                 return self.serve_file(path.split('/')[-1])
             if segments[:2] in (['api', 'users'], ['api', 'account'], ['api', 'reset-password']) and method != 'GET':
                 data = self.body()
@@ -1494,7 +1535,129 @@ class Handler(BaseHTTPRequestHandler):
                 remove_upload(fid)
         self.send(result)
 
+    def warehouse_material(self):
+        query = parse_qs(urlparse(self.path).query)
+        code = required(query.get('q', [''])[0], '物料编号')
+        fuzzy = query.get('fuzzy', [''])[0] == '1'
+        project_id, part_id = '', ''
+        if code.startswith(('https://', 'http://')):
+            fragment = urlparse(code).fragment
+            match = re.fullmatch(r'(?:projects/([a-zA-Z0-9_-]+)/)?parts/([a-f0-9]{24})', fragment)
+            if not match:
+                raise Problem('请扫描 PLM 物料二维码或输入物料编号')
+            project_id, part_id = match[1] or '', match[2]
+        with connect() as db:
+            rows = db.execute("""
+                WITH matches AS (
+                    SELECT p.id, p.code, p.name, p.spec, p.unit, p.stock, p.location, p.external_code,
+                           p.project_id, j.name AS project_name,
+                           (SELECT f.id FROM files f WHERE f.project_id=p.project_id
+                            AND f.owner_type='parts' AND f.owner_id=p.id AND f.kind='image'
+                            ORDER BY f.rowid LIMIT 1) AS image_id,
+                           (p.code=:code COLLATE NOCASE OR EXISTS (
+                               SELECT 1 FROM material_code_aliases a WHERE a.project_id=p.project_id
+                               AND a.part_id=p.id AND a.code=:code COLLATE NOCASE)) AS exact_code
+                    FROM parts p JOIN projects j ON j.id=p.project_id
+                    WHERE p.deleted_at IS NULL AND j.deleted_at IS NULL AND j.archived_at IS NULL
+                      AND (:admin OR EXISTS (SELECT 1 FROM project_members m
+                                            WHERE m.project_id=j.id AND m.user_id=:user))
+                )
+                SELECT * FROM matches
+                WHERE (:part<>'' AND id=:part AND (:project='' OR project_id=:project))
+                   OR (:part='' AND (exact_code OR (:fuzzy AND (
+                      instr(lower(code),lower(:code))>0 OR instr(lower(name),lower(:code))>0
+                      OR instr(lower(spec),lower(:code))>0 OR instr(lower(external_code),lower(:code))>0))))
+                ORDER BY exact_code DESC, code, id LIMIT :limit
+            """, {'admin': self.user['role'] == 'admin', 'user': self.user['id'],
+                  'part': part_id, 'project': project_id, 'code': code,
+                  'fuzzy': fuzzy, 'limit': 20 if fuzzy else 2}).fetchall()
+        if fuzzy:
+            if rows and rows[0]['exact_code']:
+                rows = [row for row in rows if row['exact_code']]
+            return self.send({'rows': [dict(row) for row in rows]})
+        if not rows:
+            raise Problem('没有找到可登记的物料，请核对编号或项目权限', 404)
+        if len(rows) > 1:
+            raise Problem('编号匹配到多条物料，请扫描物料二维码', 409)
+        return self.send(dict(rows[0]))
+
+    def warehouse_history(self):
+        with connect() as db:
+            rows = db.execute("""
+                SELECT m.*, p.code AS part_code, p.name AS part_name, p.unit, j.name AS project_name,
+                       (j.archived_at IS NULL AND p.deleted_at IS NULL) AS can_delete
+                FROM movements m JOIN parts p ON p.id=m.part_id AND p.project_id=m.project_id
+                JOIN projects j ON j.id=m.project_id
+                WHERE m.handler_id=? AND m.deleted_at IS NULL AND j.deleted_at IS NULL
+                  AND m.type IN ('入库','出库','报废')
+                  AND (? OR EXISTS (SELECT 1 FROM project_members pm
+                                   WHERE pm.project_id=m.project_id AND pm.user_id=?))
+                ORDER BY m.created_at DESC, m.id DESC LIMIT 30
+            """, (self.user['id'], self.user['role'] == 'admin', self.user['id'])).fetchall()
+        fields = ('id', 'type', 'project_id', 'project_name', 'part_code', 'part_name',
+                  'qty', 'unit', 'created_at', 'can_delete')
+        return self.send([{
+            **{key: row[key] for key in fields},
+            'expected': {key: row[key] for key in (*MOVEMENT_FIELDS, 'occurred_at')},
+        } for row in rows])
+
+    def delete_warehouse_movement(self, movement_id):
+        data = self.body()
+        if not isinstance(data, dict) or not isinstance(data.get('expected'), dict):
+            raise Problem('请刷新流水记录后重试')
+        with FILE_LOCK, transaction() as db:
+            self.inspection_writer(db, required(data.get('project_id'), '项目'))
+            row = exists(db, 'movements', movement_id)
+            if row['handler_id'] != self.user['id'] or row['type'] not in ('入库', '出库', '报废'):
+                raise Problem('只能删除当前账户的出入库或报废记录', 403)
+            delete_movement(db, movement_id, data['expected'], self.user)
+            touch_project(db)
+            part = exists(db, 'parts', row['part_id'])
+        return self.send({'id': movement_id, 'part_id': part['id'], 'stock': part['stock']})
+
+    def warehouse_movement(self):
+        data = self.body()
+        if not isinstance(data, dict):
+            raise Problem('库存登记格式无效')
+        request_id = data.get('request_id')
+        part_id = data.get('part_id')
+        kind = data.get('type')
+        if (not isinstance(request_id, str) or not re.fullmatch(r'[a-f0-9]{32}', request_id)
+                or not isinstance(part_id, str) or not re.fullmatch(r'[a-f0-9]{24}', part_id)
+                or kind not in ('出库', '入库', '报废')):
+            raise Problem('库存登记格式无效')
+        qty = num(data.get('qty'), True)
+        with FILE_LOCK, transaction() as db:
+            self.user = self.authorized(db)
+            if not self.user or self.user['must_change']:
+                raise Problem('请先登录', 401)
+            project = required(data.get('project_id'), '项目')
+            enter_project(db, project, self.user, write=True)
+            key = 'warehouse-' + request_id
+            fingerprint = hashlib.sha256(json.dumps([self.user['id'], part_id, kind, qty]).encode()).hexdigest()
+            saved = db.execute('SELECT fingerprint,result FROM import_runs WHERE project_id=? AND id=?',
+                               (project, key)).fetchone()
+            if saved:
+                if saved['fingerprint'] != fingerprint:
+                    raise Problem('这笔登记已处理，请重新扫码', 409)
+                result = json.loads(saved['result'])
+            else:
+                movement = record_movement(db, {
+                    'type': kind, 'part_id': part_id, 'qty': qty,
+                    'reason': '仓库快速登记报废' if kind == '报废' else '',
+                }, self.user)
+                result = {'id': movement, 'stock': active_part(db, part_id)['stock']}
+                insert_scoped(db, 'import_runs', dict(id=key, fingerprint=fingerprint,
+                                                     result=json.dumps(result), created_at=now()))
+                touch_project(db)
+        return self.send(result)
+
     def global_shipping_request(self, resource, method):
+        if resource == 'shopify/orders' and method in ('GET', 'POST'):
+            return self.shopify_order_import(method)
+        pending = re.fullmatch(r'shopify/pending/([a-f0-9]{24})', resource)
+        if pending and method in ('PUT', 'DELETE'):
+            return self.shopify_pending_shipment(pending[1], method)
         if method == 'GET' and resource in ('orders', 'products'):
             query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
             with connect() as db:
@@ -1553,6 +1716,131 @@ class Handler(BaseHTTPRequestHandler):
                 result = shipping.get_shipment(db, project, record_id, allowed)
             return self.send(result)
         raise Problem('接口不存在', 404)
+
+    def shopify_pending_shipment(self, record_id, method):
+        self.require_admin()
+        payload = self.body()
+        if not isinstance(payload, dict):
+            raise Problem('发货记录格式无效')
+        with FILE_LOCK, transaction() as db:
+            self.user = self.authorized(db)
+            if not self.user or self.user['must_change']:
+                raise Problem('请先登录', 401)
+            self.require_admin()
+            pending = db.execute('SELECT * FROM shipping_pending_shopify WHERE id=?', (record_id,)).fetchone()
+            if not pending or payload.get('version') != pending['created_at']:
+                raise Problem('订单已更新，请刷新后重试', 409)
+            stamp = now()
+            if method == 'PUT':
+                items = payload.get('shipment_items')
+                if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+                    raise Problem('请先选择发货商品')
+                project = shipping.string(items[0].get('project_id'), 100)
+                self.inspection_writer(db, project)
+                projects = shipping.accessible_projects(db, self.user)
+                writable = {id for id, entry in projects.items() if not entry['archived_at']}
+                reference = shipping.string(payload.get('reference', pending['reference']), 150)
+                shipping.check_order_reference(db, reference, projects, pending_id=record_id)
+                details = payload.get('details', json.loads(pending['details']))
+                if not isinstance(details, dict):
+                    raise Problem('发货资料格式无效')
+                shipping.save_shipment(db, project, record_id, {
+                    'channel': 'other', 'reference': reference, 'details': {**details, 'source': 'Shopify'},
+                    'shipment_items': items, 'tracking': payload.get('tracking'),
+                    'shipped_on': payload.get('shipped_on'), 'devices': payload.get('devices', []),
+                }, stamp, self.user['id'], source_id=pending['source_id'], created_at=pending['created_at'],
+                    writable=writable, cross_project=True)
+                touch_project(db)
+            db.execute('DELETE FROM shipping_pending_shopify WHERE id=?', (record_id,))
+            action = '登记 Shopify 发货商品' if method == 'PUT' else '移除待补充的 Shopify 订单'
+            log_activity(db, self.user, action, record_id, pending['reference'])
+        return self.send({'id': record_id})
+
+    def shopify_order_import(self, method):
+        if self.user['role'] != 'admin':
+            raise Problem('需要管理员权限', 403)
+        config = shopify_orders.configuration(DATA)
+        if method == 'GET':
+            query = parse_qs(urlparse(self.path).query)
+            cursor = shipping.string(query.get('cursor', [''])[0], 2048)
+            orders, next_cursor = shopify_orders.list_orders(config, cursor)
+            with connect() as db:
+                projects = shipping.accessible_projects(db, self.user)
+                existing = shopify_orders.existing_sources(db, config, [order['id'] for order in orders])
+                rows = [{
+                    'id': order['id'],
+                    'reference': order['name'],
+                    'created_at': order['createdAt'],
+                    'recipient': (order.get('shippingAddress') or {}).get('name'),
+                    'fulfillment_status': order['displayFulfillmentStatus'],
+                    'reason': shopify_orders.duplicate_reason(db, config, order, existing, projects)
+                              or shopify_orders.unavailable(order),
+                } for order in orders]
+            return self.send({'rows': rows, 'cursor': next_cursor})
+
+        payload = self.body()
+        if not isinstance(payload, dict):
+            raise Problem('导入订单格式无效')
+        project = shipping.string(payload.get('project_id'), 100)
+        ids = payload.get('ids')
+        if (not isinstance(ids, list) or not 1 <= len(ids) <= shopify_orders.MAX_IMPORT
+                or any(not isinstance(id, str) or not shopify_orders.ORDER_ID.fullmatch(id) for id in ids)):
+            raise Problem(f'请选择 1 至 {shopify_orders.MAX_IMPORT} 笔 Shopify 订单')
+        ids = list(dict.fromkeys(ids))
+        with connect() as db:
+            if project:
+                self.inspection_writer(db, project)
+            existing = shopify_orders.existing_sources(db, config, ids)
+        pending = [id for id in ids if shopify_orders.source_id(config, id) not in existing]
+        orders = shopify_orders.get_orders(config, pending) if pending else {}
+        details = {}
+        rejected = {}
+        for id in pending:
+            order = orders.get(id)
+            reason = shopify_orders.unavailable(order) if order else 'Shopify 订单已不可用'
+            if reason:
+                rejected[id] = reason
+                continue
+            try:
+                details[id] = shopify_orders.shipment_details(config, order)
+            except shipping.ShippingError as error:
+                if error.status >= 500:
+                    raise
+                rejected[id] = str(error)
+
+        with FILE_LOCK, transaction() as db:
+            self.user = self.authorized(db)
+            if not self.user or self.user['must_change']:
+                raise Problem('请先登录', 401)
+            self.require_admin()
+            if project:
+                enter_project(db, project, self.user, write=True)
+            projects = shipping.accessible_projects(db, self.user)
+            existing = shopify_orders.existing_sources(db, config, ids)
+            stamp = now()
+            created, skipped = [], []
+            for id in ids:
+                order = orders.get(id)
+                source = shopify_orders.source_id(config, id)
+                reason = '已导入' if source in existing else rejected.get(id)
+                if not reason and order:
+                    reason = shopify_orders.duplicate_reason(db, config, order, existing, projects)
+                if reason or id not in details:
+                    skipped.append({'id': id, 'reason': reason or 'Shopify 订单已不可用'})
+                    continue
+                record_id = uid()
+                if project:
+                    shipping.save_shipment(db, project, record_id, {
+                        'channel': 'other', 'reference': order['name'], 'details': details[id], 'shipment_items': [],
+                    }, stamp, self.user['id'], source_id=source)
+                else:
+                    db.execute('INSERT INTO shipping_pending_shopify VALUES(?,?,?,?,?)',
+                               (record_id, source, order['name'], json.dumps(details[id], ensure_ascii=False), stamp))
+                log_activity(db, self.user, '导入 Shopify 订单', record_id, order['name'])
+                created.append({'id': id, 'record_id': record_id})
+            if created and project:
+                touch_project(db)
+        return self.send({'created': created, 'skipped': skipped})
 
     def shipping_request(self, project_id, resource, method):
         query = {key: values[0] for key, values in parse_qs(urlparse(self.path).query).items()}
@@ -1843,13 +2131,9 @@ class Handler(BaseHTTPRequestHandler):
                                  (project_id,)).fetchone()
                 if not row:
                     raise Problem('未设置项目封面', 404)
-            self.send_response(200)
-            self.send_header('Content-Type', row['mime'])
-            self.send_header('Content-Length', str(len(row['image'])))
-            self.send_header('Cache-Control', 'private, no-cache')
-            self.security_headers()
-            self.end_headers()
-            self.wfile.write(row['image'])
+            image = row['image']
+            if self.send_asset_headers(row['mime'], len(image), hashlib.sha256(image).hexdigest()):
+                self.wfile.write(image)
             return
         if method == 'POST':
             with connect() as db:
@@ -1939,13 +2223,10 @@ class Handler(BaseHTTPRequestHandler):
             row = db.execute('SELECT avatar,avatar_mime FROM users WHERE id=?', (id,)).fetchone()
         if not row or not row['avatar']:
             raise Problem('头像不存在', 404)
-        self.send_response(200)
-        self.send_header('Content-Type', image_mime(row['avatar'][:12]) or 'application/octet-stream')
-        self.send_header('Content-Length', str(len(row['avatar'])))
-        self.send_header('Cache-Control', 'private, no-cache')
-        self.security_headers()
-        self.end_headers()
-        self.wfile.write(row['avatar'])
+        image = row['avatar']
+        content_type = image_mime(image[:12]) or 'application/octet-stream'
+        if self.send_asset_headers(content_type, len(image), hashlib.sha256(image).hexdigest()):
+            self.wfile.write(image)
 
     def list_activity(self, project_id=None):
         query = parse_qs(urlparse(self.path).query)
@@ -1964,7 +2245,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.require_admin()
             if kind == 'user':
                 if self.user['role'] != 'admin':
-                    conditions.append("""a.actor_id=? AND (a.project_id IS NULL OR
+                    conditions.append("""((a.project_id IS NULL AND
+                        (a.actor_id=? OR a.action IN ('登录','退出登录'))) OR
                         (p.deleted_at IS NULL AND EXISTS (
                             SELECT 1 FROM project_members m WHERE m.project_id=a.project_id AND m.user_id=?
                         )))""")
@@ -2659,15 +2941,13 @@ class Handler(BaseHTTPRequestHandler):
             image_type = image_mime(source.read(12)) if f['kind'] == 'image' else None
             source.seek(0)
             content_type = image_type or ('application/pdf' if f['mime'] == 'application/pdf' else 'application/octet-stream')
-            self.send_response(200)
-            self.send_header('Content-Type', content_type)
-            self.send_header('Content-Length', str(os.fstat(source.fileno()).st_size))
+            stat = os.fstat(source.fileno())
+            revision = json.dumps([id, stat.st_mtime_ns, stat.st_size, name, content_type, image_type])
+            etag = hashlib.sha256(revision.encode()).hexdigest()
             disposition = 'inline' if image_type else 'attachment'
-            self.send_header('Content-Disposition', f"{disposition}; filename*=UTF-8''{quote(name, safe='')}")
-            self.security_headers()
-            self.send_header('Cache-Control', 'private, no-cache')
-            self.end_headers()
-            shutil.copyfileobj(source, self.wfile, UPLOAD_CHUNK)
+            filename = f"{disposition}; filename*=UTF-8''{quote(name, safe='')}"
+            if self.send_asset_headers(content_type, stat.st_size, etag, filename):
+                shutil.copyfileobj(source, self.wfile, UPLOAD_CHUNK)
 
     def backup(self):
         with tempfile.TemporaryDirectory(dir=DATA) as folder:
@@ -2825,6 +3105,8 @@ if __name__=='__main__':
         print('管理员已初始化，首次登录须修改密码。')
         raise SystemExit(0)
     init_db()
+    with transaction() as db:
+        shopify_orders.backfill_addresses(db, now())
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(f'捷程未来PLM  http://{args.host}:{args.port}  数据目录：{DATA}',flush=True)
     stop_cleanup = threading.Event()
