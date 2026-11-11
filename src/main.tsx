@@ -77,7 +77,7 @@ import {
   type Column,
 } from "./material-table";
 import { MaterialCategory, TableOptionPicker } from "./material-category";
-import { materialCategoryTone, OptionTag } from "./option-tag";
+import { materialCategoryTone, OptionTag, type OptionTone } from "./option-tag";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
 import { Dialog } from "./dialog";
@@ -1882,9 +1882,14 @@ function Workspace({
     </div>;
   }
   function receivedQuantity(line: PurchaseLine) {
-    return <>{amount(line.received)}
-      {line.received > line.qty && <small className="purchase-overage">超收 {amount(line.received - line.qty)}</small>}
+    return <><QuantityHighlight value={line.received} tone={line.received > line.qty ? "amber" : "green"} />
+      {line.received > line.qty && <small className="purchase-overage">超收 <QuantityHighlight
+        value={line.received - line.qty} tone="amber" /></small>}
     </>;
+  }
+  function pendingQuantity(line: PurchaseLine) {
+    const pending = Math.max(0, line.qty - line.received);
+    return <QuantityHighlight value={pending} tone={pending ? "amber" : "slate"} />;
   }
   const supplier = findSupplier(detail);
   const suppliedMaterials = supplier
@@ -2376,10 +2381,11 @@ function Workspace({
                       <small className="mono">{p?.code}</small>
                     </td>
                     <td className="num">
-                      {["入库", "退库"].includes(m.type) ? "+" : "−"}
-                      {amount(m.qty)} {p?.unit}
+                      <QuantityHighlight value={m.qty}
+                        prefix={["入库", "退库"].includes(m.type) ? "+" : "−"}
+                        tone={["入库", "退库"].includes(m.type) ? "green" : "rose"} /> {p?.unit}
                     </td>
-                    <td className="num">{amount(m.balance)}</td>
+                    <td className="num"><QuantityHighlight value={m.balance} tone={m.balance === 0 ? "slate" : "blue"} /></td>
                     <td>
                       {po ? (
                         <button
@@ -3282,6 +3288,7 @@ function Workspace({
                   id: material.id,
                   cells: {
                     ...baseMaterialCells(material, view === "inventory" ? openInventoryPart : openMaterial),
+                    stock: view === "inventory" ? <InventoryQuantity part={material} /> : amount(material.stock),
                     min_stock: materialCell(material, "min_stock", "最低库存"),
                     location: materialCell(material, "location", "仓库位置"),
                     notes: materialCell(material, "notes", "备注"),
@@ -3845,10 +3852,10 @@ function Workspace({
                                 </button>
                               </td>
                               <td>{findSupplier(po.supplier_id)?.name}</td>
-                              <td className="num">{amount(l.qty)}</td>
+                              <td className="num"><QuantityHighlight value={l.qty} /></td>
                               <td className="num">{receivedQuantity(l)}</td>
                               <td className="num">
-                                {amount(Math.max(0, l.qty - l.received))}
+                                {pendingQuantity(l)}
                               </td>
                               <td>{po.date}</td>
                             </tr>
@@ -4210,11 +4217,11 @@ function Workspace({
                                   </td>
                                   <td className="muted">{part?.spec}</td>
                                   <td className="num">
-                                    {amount(l.qty)} {part?.unit}
+                                    <QuantityHighlight value={l.qty} /> {part?.unit}
                                   </td>
                                   <td className="num">{receivedQuantity(l)}</td>
                                   <td className="num">
-                                    {amount(Math.max(0, l.qty - l.received))}
+                                    {pendingQuantity(l)}
                                   </td>
                                   <td className="num">
                                     {money(l.price * l.qty)}
@@ -4334,13 +4341,13 @@ function Workspace({
                               {purchaseMaterialLabel(l)}
                             </td>
                             <td className="num">
-                              {amount(l.qty)} {p?.unit}
+                              <QuantityHighlight value={l.qty} /> {p?.unit}
                             </td>
                             <td className="num">{money(l.price)}</td>
                             <td className="num">{money(l.price * l.qty)}</td>
                             <td className="num">{receivedQuantity(l)}</td>
                             <td className="num">
-                              {amount(Math.max(0, l.qty - l.received))}
+                              {pendingQuantity(l)}
                             </td>
                             <td>
                               {p?.deleted_at ? (
@@ -4901,7 +4908,7 @@ function Workspace({
                 </div>
               </div>
               <dl className="info-list inventory-detail-info">
-                <dt>当前库存</dt><dd>{amount(inventoryPart.stock)} {inventoryPart.unit}</dd>
+                <dt>当前库存</dt><dd><InventoryQuantity part={inventoryPart} /> {inventoryPart.unit}</dd>
                 <dt>规格 / 封装</dt><dd>{inventoryPart.spec || "—"}</dd>
                 <dt>最低库存</dt><dd>{amount(inventoryPart.min_stock)} {inventoryPart.unit}</dd>
                 <dt>仓库位置</dt><dd>{materialCell(inventoryPart, "location", "仓库位置")}</dd>
@@ -5605,6 +5612,18 @@ function firstMaterialPhotos(files: FileRecord[]) {
       photos.set(file.owner_id, file.id);
   }
   return photos;
+}
+
+function QuantityHighlight({ value, tone = "blue", prefix = "", title }: {
+  value: number; tone?: OptionTone; prefix?: string; title?: string;
+}) {
+  return <strong className={"option-tag quantity-highlight " + tone} title={title}>{prefix}{amount(value)}</strong>;
+}
+
+function InventoryQuantity({ part }: { part: Part }) {
+  const status = part.stock === 0 ? "无库存" : part.stock < part.min_stock ? "低库存" : "库存";
+  const tone = status === "无库存" ? "rose" : status === "低库存" ? "amber" : "blue";
+  return <QuantityHighlight value={part.stock} tone={tone} title={status} />;
 }
 
 function MaterialThumbnail({ imageId, alt = "", className }: { imageId?: string; alt?: string; className: string }) {

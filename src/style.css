@@ -3860,6 +3860,13 @@ button.material-photo {
 .option-tag.pink { background: #f5d8ec; color: #74295b; }
 .option-tag.indigo { background: #dddcff; color: #373480; }
 .option-tag.olive { background: #e5edba; color: #4b541d; }
+.quantity-highlight {
+  min-width: 2.5em;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+}
 .material-category-trigger span, .material-category-options button span {
   overflow: hidden; white-space: nowrap; text-overflow: ellipsis;
 }
