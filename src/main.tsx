@@ -1129,6 +1129,116 @@ function BackupPanel({ onRestored }: { onRestored: () => void }) {
     </section>
   );
 }
+type LibraryAsset = {
+  source: "file" | "cover" | "avatar";
+  id: string;
+  name: string;
+  kind: "image" | "attachment";
+  size: number;
+  project: string;
+  owner: string;
+  reference_count: number;
+  fallback_cover: number;
+};
+type AssetPage = { items: LibraryAsset[]; more: boolean };
+
+function assetUrl(asset: LibraryAsset) {
+  return appBase + "api/assets/" + asset.source + "/" + encodeURIComponent(asset.id);
+}
+
+function assetSize(bytes: number) {
+  if (bytes >= 1024 ** 2) return (bytes / 1024 ** 2).toFixed(2) + " MB";
+  if (bytes >= 1024) return (bytes / 1024).toFixed(1) + " KB";
+  return bytes + " B";
+}
+
+function AssetLibrary() {
+  const [draft, setDraft] = usePageState("assets.draft", "");
+  const [search, setSearch] = usePageState("assets.search", "");
+  const [kind, setKind] = usePageState("assets.kind", "");
+  const [page, setPage] = usePageState("assets.page", 1);
+  const [data, setData] = useState<AssetPage | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  const [preview, setPreview] = useState<LibraryAsset | null>(null);
+  useEffect(() => {
+    let active = true;
+    setBusy(true);
+    setError("");
+    const query = new URLSearchParams({ q: search, kind, page: String(page) });
+    api("assets?" + query).then((result: AssetPage) => {
+      if (active) setData(result);
+    }, (failure: Error) => {
+      if (active) {
+        setData(null);
+        setError(failure.message);
+      }
+    }).finally(() => { if (active) setBusy(false); });
+    return () => { active = false; };
+  }, [search, kind, page]);
+
+  return <section className="asset-library">
+    <form className="toolbar-controls asset-library-toolbar" onSubmit={(event) => {
+      event.preventDefault();
+      setSearch(draft.trim());
+      setPage(1);
+    }}>
+      <input type="search" aria-label="搜索素材" placeholder="搜索文件名、项目或引用对象"
+        value={draft} onChange={(event) => setDraft(event.target.value)} />
+      <select aria-label="素材类型" value={kind} onChange={(event) => {
+        setKind(event.target.value);
+        setPage(1);
+      }}>
+        <option value="">全部类型</option>
+        <option value="image">图片</option>
+        <option value="attachment">附件</option>
+      </select>
+      <Button type="submit" small><Search size={15} />搜索</Button>
+    </form>
+    {error && <p className="form-error" role="alert">{error}</p>}
+    <div className="table-wrap" aria-busy={busy}>
+      <table>
+        <thead><tr>
+          <th>文件</th><th>类型</th><th className="num">大小</th>
+          <th className="num">引用次数</th><th>引用对象</th><th>操作</th>
+        </tr></thead>
+        <tbody>{data?.items.map((asset) => (
+          <tr key={asset.source + "/" + asset.id}>
+            <td><div className="asset-library-file">
+              {asset.kind === "image"
+                ? <button type="button" className="asset-library-thumbnail" aria-label={"预览 " + asset.name}
+                    onClick={() => setPreview(asset)}>
+                    <img src={assetUrl(asset)} alt="" loading="lazy" />
+                  </button>
+                : <FileText size={18} />}
+              <span title={asset.name}>{asset.name}</span>
+            </div></td>
+            <td>{asset.kind === "image" ? "图片" : "附件"}</td>
+            <td className="num" title={asset.size + " B"}>{assetSize(asset.size)}</td>
+            <td className="num"><strong>{asset.reference_count}</strong></td>
+            <td>
+              {asset.owner || "—"}{asset.fallback_cover ? "、项目封面" : ""}
+              {asset.project && <small>{asset.project}</small>}
+            </td>
+            <td><a className="text-link" href={assetUrl(asset)} download={asset.name}>下载</a></td>
+          </tr>
+        ))}</tbody>
+      </table>
+      {!data?.items.length && !error && <p className="asset-library-empty muted">
+        {busy ? "正在加载…" : "暂无素材"}
+      </p>}
+    </div>
+    {(page > 1 || data?.more) && <div className="dialog-actions">
+      <Button type="button" small disabled={busy || page === 1} onClick={() => setPage(page - 1)}>上一页</Button>
+      <span>第 {page} 页</span>
+      <Button type="button" small disabled={busy || !data?.more} onClick={() => setPage(page + 1)}>下一页</Button>
+    </div>}
+    {preview && <Dialog title={preview.name} wide onClose={() => setPreview(null)}>
+      <div className="image-preview"><img src={assetUrl(preview)} alt={preview.name} /></div>
+    </Dialog>}
+  </section>;
+}
+
 type AuthState = {
   initialized: boolean;
   authenticated: boolean;
@@ -4510,6 +4620,7 @@ function Workspace({
                     ? [
                         ["users", "用户管理"],
                         ["system-activity", "系统操作记录"],
+                        ["assets", "素材库"],
                         ["backup", "备份与恢复"],
                       ]
                     : []),
@@ -4546,6 +4657,7 @@ function Workspace({
                   }}
                 />
               )}
+              {currentUser.role === "admin" && accountView === "assets" && <AssetLibrary />}
               {currentUser?.role === "admin" && accountView === "backup" && (
                 <div className="settings-grid">
                   <BackupPanel onRestored={onRestore} />

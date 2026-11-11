@@ -4388,3 +4388,42 @@ button.material-photo {
   border: 0;
   pointer-events: none;
 }
+
+.asset-library-toolbar {
+  margin-bottom: 12px;
+}
+.asset-library-toolbar input {
+  width: min(270px, 100%);
+}
+.asset-library-toolbar select {
+  width: auto;
+}
+.asset-library table {
+  min-width: 660px;
+}
+.asset-library-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.asset-library-file > span {
+  overflow-wrap: anywhere;
+}
+.asset-library-thumbnail {
+  display: grid;
+  place-items: center;
+  flex: 0 0 38px;
+  width: 38px;
+  height: 38px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.asset-library-thumbnail img {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+.asset-library-empty {
+  padding: 16px;
+}

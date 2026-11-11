@@ -1217,6 +1217,19 @@ class Handler(BaseHTTPRequestHandler):
                 return self.update_avatar()
             if path == '/api/activity' and method == 'GET':
                 return self.list_activity()
+            if path == '/api/assets' and method == 'GET':
+                self.require_admin()
+                return self.list_assets()
+            asset_path = re.fullmatch(r'/api/assets/(file|cover|avatar)/([0-9a-f]{24}|legacy)', path)
+            if asset_path and method == 'GET':
+                self.require_admin()
+                kind, asset_id = asset_path.groups()
+                if kind == 'file':
+                    with FILE_LOCK:
+                        return self.serve_file(asset_id, admin_assets=True)
+                if kind == 'cover':
+                    return self.project_cover(asset_id, 'GET', admin_assets=True)
+                return self.serve_avatar(asset_id)
             if path == '/api/restore' and method == 'POST':
                 self.require_admin()
                 return self.restore()
@@ -1736,11 +1749,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
-    def project_cover(self, project_id, method):
+    def project_cover(self, project_id, method, *, admin_assets=False):
         if method == 'GET':
             with connect() as db:
                 db.execute('BEGIN')
-                enter_project(db, project_id, self.user)
+                if not admin_assets:
+                    enter_project(db, project_id, self.user)
                 row = db.execute('SELECT mime,image FROM project_covers WHERE project_id=?',
                                  (project_id,)).fetchone()
                 if not row:
@@ -2331,11 +2345,60 @@ class Handler(BaseHTTPRequestHandler):
             remove_upload(replace_id)
         self.send({'ids': created})
 
-    def serve_file(self, id):
+    def list_assets(self):
+        query = parse_qs(urlparse(self.path).query)
+        term = query.get('q', [''])[0].strip()[:200].lower()
+        kind = query.get('kind', [''])[0]
+        try:
+            page = max(1, min(100000, int(query.get('page', ['1'])[0])))
+        except ValueError:
+            raise Problem('页码无效')
+        page_size = 50
+        with connect() as db:
+            rows = db.execute("""
+                WITH fallback_covers AS (
+                    SELECT (
+                        SELECT f.id FROM files f WHERE f.project_id = j.id
+                          AND f.owner_type = 'products' AND f.kind = 'image'
+                        ORDER BY f.rowid DESC LIMIT 1
+                    ) AS file_id
+                    FROM projects j LEFT JOIN project_covers c ON c.project_id = j.id
+                    WHERE j.deleted_at IS NULL AND c.project_id IS NULL
+                ), assets AS (
+                    SELECT 'file' AS source, f.id, f.name, f.kind, f.size, f.created_at,
+                           COALESCE(j.name, '') AS project,
+                           COALESCE(p.code || ' · ' || p.name, m.code || ' · ' || m.name, '') AS owner,
+                           (p.id IS NOT NULL OR m.id IS NOT NULL) + (fc.file_id IS NOT NULL) AS reference_count,
+                           (fc.file_id IS NOT NULL) AS fallback_cover
+                    FROM files f
+                    LEFT JOIN projects j ON j.id = f.project_id
+                    LEFT JOIN products p ON f.owner_type = 'products' AND p.id = f.owner_id AND p.project_id = f.project_id
+                    LEFT JOIN parts m ON f.owner_type = 'parts' AND m.id = f.owner_id AND m.project_id = f.project_id
+                    LEFT JOIN fallback_covers fc ON fc.file_id = f.id
+                    UNION ALL
+                    SELECT 'cover', c.project_id, j.name || ' · 项目封面', 'image', length(c.image),
+                           c.updated_at, j.name, '项目封面', 1, 0
+                    FROM project_covers c JOIN projects j ON j.id = c.project_id
+                    UNION ALL
+                    SELECT 'avatar', u.id, u.name || ' · 头像', 'image', length(u.avatar),
+                           u.created_at, '', u.name, 1, 0
+                    FROM users u WHERE length(u.avatar) > 0
+                )
+                SELECT source, id, name, kind, size, project, owner, reference_count, fallback_cover
+                FROM assets
+                WHERE (? = '' OR kind = ?)
+                  AND instr(lower(name || ' ' || project || ' ' || owner), ?) > 0
+                ORDER BY created_at DESC, source, id
+                LIMIT ? OFFSET ?
+            """, (kind, kind, term, page_size + 1, (page - 1) * page_size)).fetchall()
+        return self.send({'items': [dict(row) for row in rows[:page_size]], 'more': len(rows) > page_size})
+
+    def serve_file(self, id, *, admin_assets=False):
         with connect() as db:
             db.execute('BEGIN')
             f = exists(db, 'files', id)
-            enter_project(db, f['project_id'], self.user)
+            if not admin_assets:
+                enter_project(db, f['project_id'], self.user)
             name = f['name']
             owner = f['owner_type']
             record = db.execute(f'SELECT code,name FROM {owner} WHERE id=?', (f['owner_id'],)).fetchone()
