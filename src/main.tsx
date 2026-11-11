@@ -82,9 +82,11 @@ import { materialCategoryTone, OptionTag, type OptionTone } from "./option-tag";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
 import { Dialog } from "./dialog";
+import type { LabelMaterial } from "./material-labels";
 
 const ShippingManagement = lazy(() => import("./shipping"));
 const GlobalShipping = lazy(() => import("./global-shipping"));
+const MaterialLabelsDialog = lazy(() => import("./material-labels"));
 const money = (n: number) =>
   new Intl.NumberFormat("zh-CN", {
     style: "currency",
@@ -1672,6 +1674,19 @@ function Workspace({
   const [locationFilter, setLocationFilter] = usePageState("workspace.locationFilter", "");
   const [expandedPurchases, setExpandedPurchases] = usePageState<Set<string>>("workspace.expandedPurchases", new Set());
   const [materialLevel, setMaterialLevel] = usePageState("workspace.materialLevel", 1);
+  const [selectedLabels, setSelectedLabels] = usePageState<Set<string>>("workspace.selectedLabels", new Set(), false);
+  const [printMaterials, setPrintMaterials] = useState<LabelMaterial[] | null>(null);
+  const labelSelection = {
+    selected: selectedLabels,
+    change: (ids: string[], checked: boolean) => setSelectedLabels((current) => {
+      const next = new Set(current);
+      for (const id of ids) {
+        if (checked) next.add(id);
+        else next.delete(id);
+      }
+      return next;
+    }),
+  };
   const [hiddenColumns, setHiddenColumns] = useState<Record<string, Column[]>>(
     () => {
       try {
@@ -1894,6 +1909,8 @@ function Workspace({
   const displayedBom = bom.filter((line) =>
     matchesCategory("bom", findPart(line.part_id)),
   );
+  const selectedBomLabels = bomAll.filter((line) => selectedLabels.has(line.id))
+    .map((line) => findPart(line.part_id)).filter((item) => item !== undefined);
   const levelName = materialLevel === 1 ? "一级物料" : "二级物料";
   const levelTabs = (
     <div
@@ -1971,6 +1988,8 @@ function Workspace({
   const displayedChildren = childLinks.filter((link) =>
     matchesCategory("children", findPart(link.child_id)),
   );
+  const selectedChildLabels = childLinks.filter((link) => selectedLabels.has(link.id))
+    .map((link) => findPart(link.child_id)).filter((item) => item !== undefined);
   const parentLinks = state.material_links.filter(
     (l) => l.child_id === part?.id,
   );
@@ -2013,6 +2032,19 @@ function Workspace({
   }
   function editMaterial(p: Part) {
     setModal({ kind: "part", item: p });
+  }
+  function labelPrintButton(material: Part) {
+    return <button type="button" title="打印标签" aria-label={"打印标签 " + material.code}
+      onClick={() => setPrintMaterials([{ code: material.code, name: material.name }])}>
+      <Printer size={15} />
+    </button>;
+  }
+  function batchLabelButton(materials: Part[]) {
+    return <Button type="button" small disabled={!materials.length}
+      onClick={() => setPrintMaterials(materials.map(({ code, name }) => ({ code, name })))}>
+      <Printer size={15} />
+      批量打印{materials.length ? `（${materials.length}）` : ""}
+    </Button>;
   }
   function materialEditButton(p: Part) {
     if (p.deleted_at) return null;
@@ -2946,6 +2978,7 @@ function Workspace({
                     {levelTabs}
                     <div className="toolbar-controls">
                       {displayFields("bom", bomColumns)}
+                      {batchLabelButton(selectedBomLabels)}
                       <Button
                         small
                         onClick={() =>
@@ -2996,6 +3029,7 @@ function Workspace({
                   </div>
                   <MaterialTable
                     tableId="bom"
+                    selection={labelSelection}
                     {...categoryProps("bom")}
                     columns={bomColumns}
                     hiddenColumns={hiddenColumns["bom"] || []}
@@ -3003,6 +3037,7 @@ function Workspace({
                       const material = findPart(line.part_id)!;
                       return {
                         id: line.id,
+                        selectionLabel: material.code,
                         cells: {
                           ...baseMaterialCells(material),
                           qty: material.deleted_at ? (
@@ -3042,6 +3077,7 @@ function Workspace({
                           actions: (
                             <div className="row-actions">
                               {materialEditButton(material)}
+                              {labelPrintButton(material)}
                               <button
                                 title="查看物料"
                                 onClick={() => openMaterial(material.id)}
@@ -3447,6 +3483,7 @@ function Workspace({
                     </h3>
                     <div className="toolbar-controls">
                       {displayFields("children", childrenColumns)}
+                      {batchLabelButton(selectedChildLabels)}
                       <Button
                         small
                         onClick={() =>
@@ -3487,6 +3524,7 @@ function Workspace({
                   </div>
                   <MaterialTable
                     tableId="children"
+                    selection={labelSelection}
                     {...categoryProps("children")}
                     columns={childrenColumns}
                     hiddenColumns={hiddenColumns["children"] || []}
@@ -3503,6 +3541,7 @@ function Workspace({
                       };
                       return {
                         id: link.id,
+                        selectionLabel: child.code,
                         cells: {
                           ...baseMaterialCells(child),
                           qty: child.deleted_at ? (
@@ -3538,6 +3577,7 @@ function Workspace({
                           actions: (
                             <div className="row-actions">
                               {materialEditButton(child)}
+                              {labelPrintButton(child)}
                               <button
                                 title={"解除" + child.name + "关联"}
                                 onClick={() =>
@@ -4542,6 +4582,9 @@ function Workspace({
           </button>
         </div>
       )}
+      {printMaterials && <Suspense fallback={null}>
+        <MaterialLabelsDialog materials={printMaterials} close={() => setPrintMaterials(null)} />
+      </Suspense>}
       {!fatal && modal && (!archived || readOnlyModal) && (
         <ChoiceContext.Provider value={archived ? null : setChoice}>
           {((["product", "part", "supplier"].includes(modal.kind) &&

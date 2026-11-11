@@ -28,7 +28,9 @@ const fields = {
 } as const;
 
 export type Column = keyof typeof fields;
-type Row = { id: string; cells: Partial<Record<Column, ReactNode>> };
+type Row = { id: string; cells: Partial<Record<Column, ReactNode>>; selectionLabel?: string };
+type RowSelection = { selected: ReadonlySet<string>; change: (ids: string[], checked: boolean) => void };
+const selectionWidth = 38;
 type Widths = Partial<Record<Column, number>>;
 const maximumWidth = 640;
 function minimumWidth(id: Column) {
@@ -141,6 +143,7 @@ export function MaterialTable({
   category,
   categoryOptions,
   setCategory,
+  selection,
   empty,
 }: {
   tableId: string;
@@ -150,6 +153,7 @@ export function MaterialTable({
   category: string;
   categoryOptions: string[];
   setCategory: (value: string) => void;
+  selection?: RowSelection;
   empty: ReactNode;
 }) {
   const storageKey = "plm-columns-" + tableId;
@@ -214,6 +218,8 @@ export function MaterialTable({
   ];
   const movable = ordered.filter((id) => !hiddenColumns.includes(id));
   const visible: Column[] = ["code", ...movable, "actions"];
+  const selectedCount = selection ? rows.filter(({ id }) => selection.selected.has(id)).length : 0;
+  const partialSelection = selectedCount > 0 && selectedCount < rows.length;
   const wrap = useRef<HTMLDivElement>(null);
   const drag = useRef<{ id: Column; pointer: number; x: number } | null>(null);
   const [target, setTarget] = useState<Column | null>(null);
@@ -255,18 +261,30 @@ export function MaterialTable({
   return (
     <div className="table-wrap" ref={wrap}>
       <table
-        className="editable-table configurable-table"
+        className={"editable-table configurable-table" + (selection ? " has-row-selection" : "")}
         style={{
-          width: visible.reduce((sum, id) => sum + widthOf(id), 0),
-        }}
+          width: visible.reduce((sum, id) => sum + widthOf(id), selection ? selectionWidth : 0),
+          "--row-selection-width": selectionWidth + "px",
+        } as React.CSSProperties}
       >
         <colgroup>
+          {selection && <col style={{ width: selectionWidth }} />}
           {visible.map((id) => (
             <col key={id} style={{ width: widthOf(id) }} />
           ))}
         </colgroup>
         <thead>
           <tr>
+            {selection && <th scope="col" className="fixed-selection">
+              <input
+                type="checkbox"
+                aria-label="全选当前表格"
+                disabled={!rows.length}
+                checked={rows.length > 0 && selectedCount === rows.length}
+                ref={(input) => { if (input) input.indeterminate = partialSelection; }}
+                onChange={(event) => selection.change(rows.map(({ id }) => id), event.target.checked)}
+              />
+            </th>}
             {visible.map((id) => (
               <th
                 key={id}
@@ -407,8 +425,16 @@ export function MaterialTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map(({ id, cells }) => (
+          {rows.map(({ id, cells, selectionLabel }) => (
             <tr key={id}>
+              {selection && <td className="fixed-selection">
+                <input
+                  type="checkbox"
+                  aria-label={selectionLabel ? "选择 " + selectionLabel : "选择该行"}
+                  checked={selection.selected.has(id)}
+                  onChange={(event) => selection.change([id], event.target.checked)}
+                />
+              </td>}
               {visible.map((column) => (
                 <td key={column} className={cellClass(column)}>
                   {cells[column]}

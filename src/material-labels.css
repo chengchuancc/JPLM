@@ -1,0 +1,35 @@
+.material-barcode-label {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 1mm;
+  width: var(--label-width);
+  height: calc(var(--label-height) - .3mm);
+  overflow: hidden;
+  padding: 2mm;
+  background: #fff;
+  color: #000;
+  font-family: system-ui, "PingFang SC", "Microsoft YaHei", sans-serif;
+  text-align: center;
+}
+.material-barcode-label svg {
+  display: block;
+  flex: none;
+  width: 100%;
+  height: var(--barcode-height);
+}
+.material-label-code {
+  flex: none;
+  font: bold 9pt/1.2 ui-monospace, monospace;
+  overflow-wrap: anywhere;
+}
+.material-label-name {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  font-size: 9pt;
+  font-weight: 600;
+  line-height: 1.2;
+}

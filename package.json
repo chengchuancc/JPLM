@@ -1,6 +1,6 @@
 {
   "name": "jiecheng-plm",
-  "version": "1.9.13",
+  "version": "1.9.14",
   "private": true,
   "type": "module",
   "scripts": {
@@ -12,6 +12,7 @@
   "dependencies": {
     "@zxing/browser": "0.1.5",
     "@zxing/library": "0.21.3",
+    "jsbarcode": "3.12.3",
     "jsqr": "^1.4.0",
     "lucide-react": "^0.468.0",
     "papaparse": "^5.5.0",

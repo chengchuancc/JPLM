@@ -4331,3 +4331,53 @@ button.material-photo {
 .project-deleted-loading {
   padding: 18px;
 }
+
+.configurable-table .fixed-selection {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  padding: 0;
+  text-align: center;
+}
+.configurable-table.has-row-selection .fixed-code {
+  left: var(--row-selection-width);
+}
+.configurable-table .fixed-selection input {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  vertical-align: middle;
+  accent-color: var(--accent);
+}
+.material-label-options {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+}
+.material-label-options label {
+  display: grid;
+  gap: 5px;
+}
+.material-label-preview {
+  display: grid;
+  place-items: center;
+  min-height: 175px;
+  margin-top: 14px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #f4f6fa;
+}
+.material-label-preview article {
+  outline: 1px solid var(--border);
+}
+.material-label-print-frame {
+  position: fixed;
+  left: -1000px;
+  top: 0;
+  width: 240px;
+  height: 220px;
+  border: 0;
+  pointer-events: none;
+}
