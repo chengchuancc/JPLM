@@ -1343,6 +1343,18 @@ class IntegrationTests(unittest.TestCase):
             self.assertEqual(unquote(response.headers['Content-Disposition'].split("''", 1)[1]), files[attachment]['name'])
             self.assertEqual(response.read(), b'%PDF-1.4')
 
+    def test_new_image_after_rename_and_delete_does_not_reuse_position(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'picture'
+        first, second, third = (self.upload(f'{n}.png', png)['ids'][0] for n in 'abc')
+        self.request('files/' + second, 'DELETE', {})
+        self.request('parts/' + self.part, 'PUT', {'name': '新名称', 'category': '结构物料'})
+        fourth = self.upload('d.png', png)['ids'][0]
+        code = self.state()['parts'][0]['code']
+        files = {f['id']: f['name'] for f in self.state()['files']}
+        self.assertEqual(files[first], f'{code} 新名称（01）.png')
+        self.assertEqual(files[third], f'{code} 新名称（03）.png')
+        self.assertEqual(files[fourth], f'{code} 新名称（04）.png')
+
     def test_automatic_cleanup_limits_removal_to_old_unreferenced_images(self):
         png = b'\x89PNG\r\n\x1a\n' + b'picture'
         upload_dir = app.DATA / 'uploads'

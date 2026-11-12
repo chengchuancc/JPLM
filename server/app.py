@@ -378,6 +378,16 @@ def owner_file_name(original, owner_code, owner_name, position):
     stem = f'{owner_code} {label}' if label else owner_code
     return f'{stem}（{position:02d}）{extension.lower()}'
 
+STORED_POSITION = re.compile(r'（(\d+)）(?:\.[A-Za-z0-9]{1,15})?$')
+
+def current_file_name(file, owner_code, owner_name, fallback_position):
+    # display_name pins an image's position (kept across replacements); the code and
+    # name always follow the owner's current values so renames are reflected.
+    stored = file['display_name']
+    match = STORED_POSITION.search(stored) if stored else None
+    position = int(match.group(1)) if match else fallback_position
+    return owner_file_name(file['name'], owner_code, owner_name, position)
+
 def assign_existing_image_names(db):
     owners = {(table, row['id']): (row['code'], row['name'])
               for table in ('products', 'parts')
@@ -958,7 +968,7 @@ def get_state(db):
         record = owners.get(owner)
         if record:
             file['original_name'] = file['name']
-            file['name'] = file['display_name'] or owner_file_name(file['name'], record['code'], record['name'], positions[owner])
+            file['name'] = current_file_name(file, record['code'], record['name'], positions[owner])
     state['deleted_parts'] = [p for p in state['parts'] if p['deleted_at']]
     state['parts'] = [p for p in state['parts'] if not p['deleted_at']]
     state['movements'] = [row for row in state['movements'] if not row['deleted_at']]
@@ -2763,7 +2773,8 @@ class Handler(BaseHTTPRequestHandler):
                         raise Problem('不能替换其他记录的附件')
                 existing = db.execute('SELECT display_name FROM files WHERE owner_type=? AND owner_id=?',
                                       (owner, owner_id)).fetchall()
-                used_names = {row[0] for row in existing}
+                used_positions = {int(m.group(1)) for row in existing
+                                  if row[0] and (m := STORED_POSITION.search(row[0]))}
                 position = len(existing) + 1
                 for filename, temporary, size in uploads:
                     if not size:
@@ -2783,11 +2794,10 @@ class Handler(BaseHTTPRequestHandler):
                         if old and old['display_name']:
                             display_name = Path(old['display_name']).stem + ext
                         else:
-                            display_name = owner_file_name(name, record['code'], record['name'], position)
-                            while display_name in used_names:
+                            while position in used_positions:
                                 position += 1
-                                display_name = owner_file_name(name, record['code'], record['name'], position)
-                            used_names.add(display_name)
+                            display_name = owner_file_name(name, record['code'], record['name'], position)
+                            used_positions.add(position)
                             position += 1
                     temporary.replace(DATA / 'uploads' / fid)
                     created.append(fid)
@@ -2933,13 +2943,13 @@ class Handler(BaseHTTPRequestHandler):
                 name = f['display_name'] or f['name']
                 owner = f['owner_type']
                 record = db.execute(f'SELECT code,name FROM {owner} WHERE id=?', (f['owner_id'],)).fetchone()
-                if record and not f['display_name']:
+                if record:
                     position = db.execute(
                         """SELECT COUNT(*) FROM files WHERE owner_type=? AND owner_id=?
                            AND rowid <= (SELECT rowid FROM files WHERE id=?)""",
                         (owner, f['owner_id'], id),
                     ).fetchone()[0]
-                    name = owner_file_name(name, record['code'], record['name'], position)
+                    name = current_file_name(f, record['code'], record['name'], position)
             try:
                 source = (DATA / 'uploads' / id).open('rb')
             except FileNotFoundError as exc:
