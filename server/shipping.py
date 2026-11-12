@@ -792,22 +792,46 @@ def find_devices(db, project, query):
         ORDER BY (lower(d.serial)=?) DESC,d.serial LIMIT 20''', (project, term, term))]
 
 
-def for_device(db, project, serial):
-    return [dict(row) for row in db.execute('''WITH RECURSIVE linked AS (
-        SELECT s.id,s.reference,s.parent_id,s.channel,s.shipped_on,s.tracking,s.created_at,o.backer
+def device_shipments(db, project, serials, *, shipped_only=False):
+    if not serials:
+        return {}
+    marks = ','.join('?' for _ in serials)
+    shipped = shipped_condition('s')
+    rows = db.execute(f'''WITH RECURSIVE linked AS (
+        SELECT d.serial,s.id,s.reference,s.parent_id,s.channel,s.shipped_on,s.tracking,s.created_at,
+            o.backer,{shipped} AS shipped,
+            nullif(trim(json_extract(s.details,'$.name')),'') AS recipient,
+            nullif(trim(json_extract(o.details,'$.name')),'') AS order_recipient
         FROM shipping_devices d JOIN shipping_records s ON s.project_id=d.project_id AND s.id=d.shipment_id
         LEFT JOIN shipping_ks_orders o ON o.project_id=s.project_id AND o.id=s.ks_order_id
-        WHERE d.project_id=? AND d.serial=? AND s.deleted_at IS NULL
-    ), lineage(shipment_id,id,parent_id,reference) AS (
-        SELECT id,id,parent_id,reference FROM linked WHERE channel='other'
+        WHERE d.project_id=? AND d.serial IN ({marks}) AND s.deleted_at IS NULL
+          AND (NOT ? OR {shipped})
+    ), lineage(shipment_id,id,parent_id,reference,recipient,depth) AS (
+        SELECT DISTINCT id,id,parent_id,reference,recipient,0 FROM linked
         UNION ALL
-        SELECT l.shipment_id,p.id,p.parent_id,p.reference FROM lineage l
+        SELECT l.shipment_id,p.id,p.parent_id,p.reference,
+            nullif(trim(json_extract(p.details,'$.name')),''),l.depth+1
+        FROM lineage l
         JOIN shipping_records p ON p.project_id=? AND p.id=l.parent_id
     )
-    SELECT s.id,s.reference,s.parent_id,s.channel,s.shipped_on,s.tracking,s.backer,
-        coalesce(nullif(l.reference,''),s.reference) AS order_number
+    SELECT s.serial,s.id,s.reference,s.parent_id,s.channel,s.shipped_on,s.tracking,s.backer,s.shipped,
+        CASE WHEN s.channel='other' THEN coalesce(nullif(l.reference,''),s.reference)
+            ELSE s.reference END AS order_number,
+        coalesce((SELECT recipient FROM lineage parent
+                  WHERE parent.shipment_id=s.id AND recipient IS NOT NULL ORDER BY depth LIMIT 1),
+                 s.order_recipient,'') AS recipient
     FROM linked s LEFT JOIN lineage l ON l.shipment_id=s.id AND l.parent_id IS NULL
-    ORDER BY s.created_at DESC,s.id DESC''', (project, serial, project))]
+    ORDER BY s.created_at DESC,s.id DESC''', (project, *serials, shipped_only, project))
+    shipments = {}
+    for row in rows:
+        data = dict(row)
+        serial = data.pop('serial')
+        shipments.setdefault(serial, []).append(data)
+    return shipments
+
+
+def for_device(db, project, serial):
+    return device_shipments(db, project, [serial]).get(serial, [])
 
 
 def save_shipment(db, project, shipment_id, data, stamp, actor, *, source_id=None, imported=False,

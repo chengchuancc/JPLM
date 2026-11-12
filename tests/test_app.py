@@ -178,6 +178,9 @@ class IntegrationTests(unittest.TestCase):
         links = self.request('shipping/device-records?serial=' + serial)
         self.assertEqual(len(links), 2)
         self.assertIn(ks['id'], [link['id'] for link in links])
+        shipments = self.request('inspection/devices')['devices'][0]['shipments']
+        self.assertEqual([(item['id'], item['recipient']) for item in shipments], [(ks['id'], 'Test Person')])
+        self.assertEqual(self.request('inspection/devices', project=other)['devices'], [])
         self.assertEqual(self.request('inspection/device-inspections?serial=' + serial)['records'], [])
         for label in ('出厂检测', '复检'):
             form = self.request('inspection/templates', 'POST', {'name': label, 'serial_mode': 'text',
@@ -191,6 +194,7 @@ class IntegrationTests(unittest.TestCase):
         self.request('shipping/records/' + ks['id'], 'PUT', {**first, 'version': 'stale'}, 409)
         self.request('shipping/records/' + ks['id'], 'PUT', {**first, 'version': rows[0]['updated_at'], 'devices': []})
         self.assertEqual(len(self.request('shipping/device-records?serial=' + serial)), 1)
+        self.assertEqual(self.request('inspection/devices')['devices'][0]['shipments'], [])
         self.assertEqual(self.request('shipping/records?channel=other&status=pending')['total'], 1)
         archive = self.request('backup', raw=True)
         with tempfile.TemporaryDirectory() as folder:
@@ -205,7 +209,7 @@ class IntegrationTests(unittest.TestCase):
     def test_shipment_children_and_reversible_deletion(self):
         records = 'shipping/records'
         payload = {'channel': 'other', 'reference': '#PARENT'}
-        parent = self.request(records, 'POST', payload)
+        parent = self.request(records, 'POST', {**payload, 'details': {'name': '补发收件人'}})
         serial = '1234562611100001'
         self.request('inspection/devices', 'POST', {'serial': serial})
         child = self.request(records, 'POST', {**payload, 'reference': '#SUPPLEMENT', 'parent_id': parent['id'], 'tracking': 'CHILD-TRACK',
@@ -248,6 +252,8 @@ class IntegrationTests(unittest.TestCase):
         linked = self.request('shipping/device-records?serial=' + serial)[0]
         self.assertEqual((linked['id'], linked['reference'], linked['order_number']),
                          (child['id'], '#SUPPLEMENT', '#PARENT'))
+        shipment = self.request('inspection/devices')['devices'][0]['shipments'][0]
+        self.assertEqual((shipment['order_number'], shipment['recipient']), ('#PARENT', '补发收件人'))
         self.request(child_path, 'PUT', {**payload, 'parent_id': None, 'version': restored['updated_at']})
         self.assertEqual(self.request(records + '?channel=other&roots=1')['total'], 2)
 
@@ -983,12 +989,19 @@ class IntegrationTests(unittest.TestCase):
         admin_cookie = self.cookie
         account = {'name': '经办测试', 'email': 'operator@example.test', 'password': 'temporary-1234'}
         member = self.request('users', 'POST', account)['id']
+        admin_directory = self.request('users')
+        self.assertEqual(next(row for row in admin_directory if row['id'] == member)['role'], 'member')
+        self.request('users', status=401, headers={'Cookie': ''})
         self.request('projects/' + self.project_id, 'PUT', {'members': [member]})
         self.request('users', 'POST', {**account, 'email': 'OPERATOR@example.test'}, 409)
         self.request('auth/login', 'POST', account)
         self.request('state', status=403)
+        self.request('users', status=403)
         self.request('account/password', 'POST', {'current_password': account['password'], 'password': 'replacement-1234'})
         member_cookie = self.cookie
+        self.assertEqual(self.request('users'), [
+            {key: row[key] for key in ('id', 'name', 'email')} for row in admin_directory
+        ])
         self.request('users', 'POST', {**account, 'email': 'other@example.test'}, 403)
         self.request('account/profile', 'PUT', {'email': 'modified@example.test'}, 403)
         self.request('account/profile', 'PUT', {'phone': '13500000000'})

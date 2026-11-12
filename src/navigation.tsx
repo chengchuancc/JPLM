@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from "react";
+import { randomUuid } from "./random-uuid";
 
 type Entry = { id: string; previous: string | null; index: number; hash: string };
 type Snapshot = { values: Record<string, unknown>; scroll?: { window: number; tables: [number, number][]; dialog?: number } };
@@ -51,7 +52,7 @@ function persist(id: string) {
 function currentEntry(): Entry {
   const saved = history.state?.[entryKey] as Entry | undefined;
   if (saved?.id && saved.hash === location.hash) return saved;
-  const entry = { id: crypto.randomUUID(), previous: null, index: 0, hash: location.hash };
+  const entry = { id: randomUuid(), previous: null, index: 0, hash: location.hash };
   history.replaceState({ ...history.state, [entryKey]: entry }, "", location.href);
   return entry;
 }
@@ -61,7 +62,8 @@ function scrollContainers() {
 }
 
 function activeDialog() {
-  return [...document.querySelectorAll<HTMLElement>('.dialog[aria-modal="true"]')].at(-1);
+  const dialogs = document.querySelectorAll<HTMLElement>('.dialog[aria-modal="true"]');
+  return dialogs[dialogs.length - 1];
 }
 
 function captureScroll(id: string) {
@@ -93,7 +95,7 @@ export function useNavigationHistory<Route>({
     if (!allow.current(previous.route, route)) return;
     captureScroll(previous.entry.id);
     const entry = {
-      id: crypto.randomUUID(), hash,
+      id: randomUuid(), hash,
       previous: replace ? previous.entry.previous : previous.entry.id,
       index: replace ? previous.entry.index : previous.entry.index + 1,
     };
@@ -132,7 +134,7 @@ export function useNavigationHistory<Route>({
       }
       captureScroll(previous.entry.id);
       const entry = saved?.hash === location.hash ? saved : {
-        id: crypto.randomUUID(), hash: location.hash,
+        id: randomUuid(), hash: location.hash,
         previous: previous.entry.id, index: previous.entry.index + 1,
       };
       history.replaceState({ ...history.state, [entryKey]: entry }, "", entry.hash);
@@ -218,7 +220,7 @@ export function usePageState<T>(key: string, initial: T | (() => T), persistent 
   const id = useContext(PageContext);
   const [value, setValue] = useState<T>(() => {
     const values = persistent ? snapshot(id).values : transient.get(id) || {};
-    return Object.hasOwn(values, key) ? values[key] as T : typeof initial === "function" ? (initial as () => T)() : initial;
+    return Object.prototype.hasOwnProperty.call(values, key) ? values[key] as T : typeof initial === "function" ? (initial as () => T)() : initial;
   });
   const latest = useRef(value);
   latest.current = value;

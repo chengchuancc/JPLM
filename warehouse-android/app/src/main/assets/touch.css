@@ -1,0 +1,40 @@
+.warehouse-page {
+  gap: 10px !important;
+  padding: 12px 10px !important;
+}
+.warehouse-page .warehouse-card {
+  gap: 12px !important;
+  padding: 12px !important;
+}
+.warehouse-page .warehouse-number-keyboard {
+  width: 100% !important;
+}
+.warehouse-page .warehouse-number-keyboard button {
+  min-height: 68px !important;
+  font-size: 29px !important;
+}
+.warehouse-page .warehouse-search input,
+.warehouse-page .warehouse-quantity input,
+.warehouse-page .warehouse-camera-button,
+.warehouse-page .warehouse-confirm button,
+.warehouse-page .warehouse-search button {
+  min-height: 60px !important;
+  font-size: 18px !important;
+}
+.warehouse-page .warehouse-action {
+  min-height: 105px !important;
+  font-size: 22px !important;
+}
+.warehouse-page .warehouse-history summary {
+  min-height: 52px !important;
+}
+.warehouse-page .warehouse-matches button,
+.warehouse-page .warehouse-camera-actions button,
+.warehouse-page .warehouse-delete {
+  min-height: 54px !important;
+}
+@media (max-height: 530px) {
+  .warehouse-page .warehouse-number-keyboard button {
+    min-height: 60px !important;
+  }
+}

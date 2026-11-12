@@ -151,6 +151,11 @@
 .inspection-detail-group h3 { margin: 0 0 7px; font-size: 14px; }
 .inspection-device-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
 .inspection-device-tools input { width: min(100%, 260px); }
+.inspection-device-shipments { list-style: none; margin: 0; padding: 0; }
+.inspection-device-shipments li + li { border-top: 1px solid var(--border); margin-top: 4px; padding-top: 4px; }
+.inspection-device-shipments li > div { display: flex; align-items: center; flex-wrap: wrap; gap: 4px 8px; }
+.inspection-device-shipments :is(a, button) { display: inline-flex; align-items: center; gap: 4px; }
+.inspection-device-shipments small { display: inline; }
 .inspection-paging { flex-wrap: wrap; }
 .inspection-paging select { width: auto; min-height: 30px; padding: 4px 7px; }
 @media (max-width: 600px) {

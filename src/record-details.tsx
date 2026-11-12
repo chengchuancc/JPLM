@@ -38,7 +38,17 @@ export type RelatedTarget =
 
 type Open = (target: RelatedTarget) => void;
 type ShipmentLink = Pick<Shipment, "id" | "reference" | "channel" | "shipped_on" | "tracking" | "backer">;
-type DeviceOrderLink = ShipmentLink & { order_number: string; parent_id: string | null };
+export type DeviceShipment = ShipmentLink & {
+  order_number: string; parent_id: string | null; recipient: string; shipped: 0 | 1;
+};
+
+export function DeviceShipmentLink({ item, open }: { item: DeviceShipment; open: Open }) {
+  const orderNumber = item.order_number || item.reference || (item.backer ? "Backer #" + item.backer : "无订单号");
+  return item.channel === "other" ? <a className="text-link mono" href={"#global-shipping/" + item.id}
+    title="在全局发货中定位">{orderNumber}<ExternalLink size={13} aria-hidden="true" /></a>
+    : <button type="button" className="text-link mono"
+      onClick={() => open({ kind: "shipment", id: item.id, reference: shipmentLabel(item) })}>{orderNumber}</button>;
+}
 
 function useDetail<T>(request: Request, path: string) {
   const [value, setValue] = useState<T>();
@@ -70,7 +80,7 @@ function ShipmentLinks({ rows, open }: { rows: ShipmentLink[]; open: Open }) {
 }
 
 function DeviceOrders({ serial, request, open }: { serial: string; request: Request; open: Open }) {
-  const { value, error } = useDetail<DeviceOrderLink[]>(request,
+  const { value, error } = useDetail<DeviceShipment[]>(request,
     "shipping/device-records?" + new URLSearchParams({ serial }));
   return <section className="inspection-detail-group inspection-order-links">
     <h3>关联订单号</h3>
@@ -78,13 +88,10 @@ function DeviceOrders({ serial, request, open }: { serial: string; request: Requ
       <ul className="shipping-device-detail">{value.map((item) => {
         const child = item.parent_id && item.channel === "other"
           ? "子订单" + (item.reference && item.reference !== item.order_number ? " " + item.reference : "") : "";
-        const orderNumber = item.order_number || item.reference || (item.backer ? "Backer #" + item.backer : "无订单号");
         return <li key={item.id}>
-          {item.channel === "other" ? <a className="text-link mono" href={"#global-shipping/" + item.id}
-            title="在全局发货中定位">{orderNumber}<ExternalLink size={13} aria-hidden="true" /></a>
-            : <button type="button" className="text-link mono"
-              onClick={() => open({ kind: "shipment", id: item.id, reference: shipmentLabel(item) })}>{orderNumber}</button>}
-          <small>{[item.channel === "ks" ? "KS" : child, item.shipped_on, item.tracking].filter(Boolean).join(" · ")}</small>
+          <DeviceShipmentLink item={item} open={open} />
+          <small>{[item.recipient, item.channel === "ks" ? "KS" : child, item.shipped ? "已发货" : "待发货",
+            item.shipped_on, item.tracking].filter(Boolean).join(" · ")}</small>
         </li>;
       })}</ul>}
   </section>;

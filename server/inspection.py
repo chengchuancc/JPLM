@@ -83,7 +83,7 @@ L7_HEADERS = {
     'quality_grade': ('等级',), 'other_note': ('其他', '备注'),
 }
 BASE_ALIASES = {normalized(label): key for key, labels in BASE_HEADERS.items() for label in labels}
-RESERVED_HEADERS = set(BASE_ALIASES) | {normalized(x) for x in ('前6位', 'L7编号', '生产日期', '尾号')}
+RESERVED_HEADERS = set(BASE_ALIASES) | {normalized(x) for x in ('产品编号', '前6位', 'L7编号', '生产日期', '尾号')}
 
 
 def text(value, limit=500):
@@ -550,7 +550,7 @@ def export_rows(config, records):
     for record in records:
         for field in record['form']['fields']:
             fields.setdefault(field['key'], field['label'])
-    headers = ['S/N', '前6位', '生产日期', '检测结果', '检测员', '创建时间', '更新时间', '原记录 ID']
+    headers = ['S/N', '产品编号', '生产日期', '检测结果', '检测员', '创建时间', '更新时间', '原记录 ID']
     used = set(map(normalized, headers))
     for key, label in fields.items():
         display = label
@@ -665,7 +665,7 @@ def list_devices(db, project_id, query):
 
 def latest_record(db, project_id, template_id, prefix):
     if len(text(prefix, 6)) != 6:
-        raise InspectionError('请输入编号前 6 位')
+        raise InspectionError('请输入 6 位产品编号')
     row = db.execute('''SELECT * FROM inspection_records WHERE project_id=? AND template_id=?
                        AND prefix=? AND deleted_at IS NULL ORDER BY updated_at DESC,id DESC LIMIT 1''',
                      (project_id, template_id, prefix)).fetchone()

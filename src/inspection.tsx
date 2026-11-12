@@ -1,8 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { randomUuid } from "./random-uuid";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { usePageState } from "./navigation";
 import { ArrowDown, ArrowUp, Camera, ChevronDown, Download, Plus, Search, Upload, X } from "lucide-react";
 import type { IScannerControls } from "@zxing/browser";
-import { RelatedRecordDialog, formatTime, ResultLabel, sections } from "./record-details";
+import { DeviceShipmentLink, RelatedRecordDialog, formatTime, ResultLabel, sections,
+  type DeviceShipment, type RelatedTarget } from "./record-details";
 import "./inspection.css";
 
 type Value = string | number | string[];
@@ -57,7 +59,7 @@ type Device = {
   records: number;
   result: string | null;
 };
-type DevicePage = { devices: Device[]; total: number; page: number };
+type DevicePage = { devices: (Device & { shipments: DeviceShipment[] })[]; total: number; page: number };
 type SavedOption = { field_key: string; value: string; hidden_at: string | null };
 type ImportReport = {
   ready: number;
@@ -401,7 +403,7 @@ function withValue(values: Values, key: string, value: Value | undefined) {
 
 function newField(group: string, label = "", type: FieldType = "choice"): InspectionField {
   return {
-    key: "field_" + crypto.randomUUID().replaceAll("-", ""), label, group, type,
+    key: "field_" + randomUuid().replaceAll("-", ""), label, group, type,
     options: type === "choice" ? ["OK", "NG"] : [], fail: type === "choice" ? ["NG"] : [],
     minimum: null, maximum: null, unit: "", custom: false, required: type !== "text",
     display: type === "multi" ? "dropdown" : "buttons", block: "", auto_from: "",
@@ -572,7 +574,7 @@ function TemplateEditor({ template, copy, save, cancel, onDirty }: {
       <label>检测表名称<input required maxLength={80} value={name} onChange={(e) => { setName(e.target.value); onDirty(); }} /></label>
       <label>编号规则<select value={mode} onChange={(e) => { setMode(e.target.value as SerialMode); onDirty(); }}>
         <option value="text">通用 S/N</option>
-        <option value="dated">16 位数字（前 6 位＋日期＋尾号）</option>
+        <option value="dated">16 位数字（产品编号＋日期＋尾号）</option>
       </select></label>
     </section>
     <div className="inspection-editor-tools">
@@ -785,9 +787,9 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
       }}>
         <label>关键词<input value={draft.keyword} onChange={(e) => change("keyword", e.target.value)} /></label>
         <label>S/N<input value={draft.serial} onChange={(e) => change("serial", e.target.value)} /></label>
-        <label>前 6 位<input maxLength={6} value={draft.prefix} onChange={(e) => change("prefix", e.target.value)} /></label>
-        <label>起始前缀<input maxLength={6} value={draft.prefix_from} onChange={(e) => change("prefix_from", e.target.value)} /></label>
-        <label>结束前缀<input maxLength={6} value={draft.prefix_to} onChange={(e) => change("prefix_to", e.target.value)} /></label>
+        <label>产品编号<input maxLength={6} value={draft.prefix} onChange={(e) => change("prefix", e.target.value)} /></label>
+        <label>起始产品编号<input maxLength={6} value={draft.prefix_from} onChange={(e) => change("prefix_from", e.target.value)} /></label>
+        <label>结束产品编号<input maxLength={6} value={draft.prefix_to} onChange={(e) => change("prefix_to", e.target.value)} /></label>
         <label>检测结果<select value={draft.result} onChange={(e) => change("result", e.target.value)}>
           <option value="">全部</option>{results.map((item) => <option key={item}>{item}</option>)}
         </select></label>
@@ -806,7 +808,7 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
       <div className="table-wrap inspection-record-table" aria-busy={busy}>
         <table>
           <thead><tr>
-            {sortHeader("serial", "S/N")}{sortHeader("prefix", "前 6 位")}{sortHeader("production_date", "生产日期")}
+            {sortHeader("serial", "S/N")}{sortHeader("prefix", "产品编号")}{sortHeader("production_date", "生产日期")}
             {sortHeader("result", "检测结果")}<th>检测员</th>
             {Array.from(columns, ([key, label]) => <th key={key}>{label}</th>)}
             {sortHeader("updated_at", "更新时间")}
@@ -859,6 +861,7 @@ function DeviceRegistry({ request, prefix, refresh, readOnly, open, register }: 
   const [data, setData] = useState<DevicePage | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+  const [shipment, setShipment] = useState<RelatedTarget>();
   useEffect(() => {
     let active = true;
     setLoading(true);
@@ -884,17 +887,24 @@ function DeviceRegistry({ request, prefix, refresh, readOnly, open, register }: 
         <button type="submit" className={action}><Search size={15} />查询</button>
         {!readOnly && <button type="button" className={primary} onClick={register}><Plus size={16} />登记设备</button>}
       </form>
-      {activePrefix && <p className="muted">前 6 位：{activePrefix}</p>}
+      {activePrefix && <p className="muted">产品编号 {activePrefix}</p>}
       {error && <p className="form-error" role="alert">{error}</p>}
       <div className="table-wrap" aria-busy={loading}>
         <table>
-          <thead><tr><th>S/N</th><th>前 6 位</th><th>生产日期</th><th>检测状态</th><th>检测记录</th>
-            <th>登记人</th><th>登记时间</th><th>操作</th></tr></thead>
+          <thead><tr><th>S/N</th><th>产品编号</th><th>生产日期</th><th>检测状态</th><th>检测记录</th>
+            <th>发货收件人 / 订单</th><th>登记人</th><th>登记时间</th><th>操作</th></tr></thead>
           <tbody>{data?.devices.map((device) => (
             <tr key={device.serial}>
               <td className="mono">{device.serial}</td><td>{device.prefix}</td>
               <td>{device.production_date || "—"}</td><td><ResultLabel value={device.result || "待检测"} /></td>
-              <td>{device.records}</td><td>{device.operator_name || "—"}</td>
+              <td>{device.records}</td>
+              <td>{device.shipments.length ? <ul className="inspection-device-shipments">
+                {device.shipments.map((item) => <li key={item.id}>
+                  <strong>{item.recipient || "未填写收件人"}</strong>
+                  <div><DeviceShipmentLink item={item} open={setShipment} />{item.shipped_on && <small>{item.shipped_on}</small>}</div>
+                </li>)}
+              </ul> : "—"}</td>
+              <td>{device.operator_name || "—"}</td>
               <td>{formatTime(device.registered_at)}</td>
               <td><button type="button" className="text-link" onClick={() => open(device)}>打开设备</button></td>
             </tr>
@@ -907,8 +917,74 @@ function DeviceRegistry({ request, prefix, refresh, readOnly, open, register }: 
         <span>{page} / {pages}</span>
         <button type="button" className="btn small" disabled={page >= pages || loading} onClick={() => setPage(page + 1)}>下一页</button>
       </div>}
+      {shipment && <RelatedRecordDialog target={shipment} request={request} close={() => setShipment(undefined)} />}
     </section>
   );
+}
+
+function useDeviceScanner(enabled: boolean, dated: boolean, input: RefObject<HTMLInputElement | null>,
+  onScan: (serial: string) => void) {
+  const callback = useRef(onScan);
+  callback.current = onScan;
+  useEffect(() => {
+    if (!enabled) return;
+    let buffer = "";
+    let last = 0;
+    let timer = 0;
+    let completedAt = -Infinity;
+    function reset() {
+      buffer = "";
+      window.clearTimeout(timer);
+    }
+    function read() {
+      const serial = buffer.trim();
+      reset();
+      callback.current(serial);
+    }
+    function keydown(event: KeyboardEvent) {
+      const target = event.target;
+      const editingOtherField = target instanceof HTMLElement && target !== input.current &&
+        (target.isContentEditable || target.matches("input:not([type=checkbox]):not([type=radio]), textarea, select"));
+      if (editingOtherField || event.isComposing || event.ctrlKey || event.altKey || event.metaKey ||
+          document.querySelector('[role="dialog"]')) {
+        reset();
+        return;
+      }
+      if (event.repeat || event.key === "Shift") return;
+      const now = performance.now();
+      if (event.key === "Enter" || (event.key === "Tab" && !event.shiftKey)) {
+        const complete = dated ? /(?:^|\D)\d{16}(?:$|\D)/.test(buffer) : buffer.trim().length >= 4;
+        const suffix = now - completedAt < 250;
+        if (suffix || (complete && now - last < 200)) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          if (!suffix) read();
+          completedAt = -Infinity;
+        }
+        reset();
+        return;
+      }
+      completedAt = -Infinity;
+      if (!/^[ -~]$/.test(event.key)) { reset(); return; }
+      if (now - last > 100 || buffer.length >= 100) reset();
+      buffer += event.key;
+      last = now;
+      window.clearTimeout(timer);
+      if (target !== input.current && dated && /^\d{16}$/.test(buffer)) {
+        timer = window.setTimeout(() => {
+          read();
+          completedAt = performance.now();
+        }, 110);
+      }
+    }
+    window.addEventListener("keydown", keydown, true);
+    window.addEventListener("focusin", reset);
+    return () => {
+      window.removeEventListener("keydown", keydown, true);
+      window.removeEventListener("focusin", reset);
+      reset();
+    };
+  }, [enabled, dated, input]);
 }
 
 export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraftChange }: {
@@ -943,6 +1019,8 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
   const serialInput = useRef<HTMLInputElement>(null);
   const template = templates.find((item) => item.id === templateId);
   const form = record?.form || template;
+  useDeviceScanner(tab === "entry" && !loading && !camera, template?.serial_mode === "dated", serialInput,
+    (value) => void lookup(value, true));
   const visibleOptions = savedOptions.filter((item) => {
     const label = template?.fields.find((field) => field.key === item.field_key)?.label || "";
     return (label + " " + item.value).toLowerCase().includes(optionSearch.trim().toLowerCase());
@@ -1075,8 +1153,8 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
       if (result.record) {
         setDevice(null);
         chooseRecord(result.record);
-        setNotice("已载入前缀 " + value + " 的最近检测记录");
-      } else setNotice("未找到该前缀的检测记录");
+        setNotice("已载入产品编号 " + value + " 的最近检测记录");
+      } else setNotice("未找到该产品编号的检测记录");
     } catch (e) { setError((e as Error).message); }
     finally { setBusy(false); }
   }
@@ -1241,6 +1319,9 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
                   readOnly={!!record} disabled={busy} value={serial}
                   onChange={(event) => { setSerial(event.target.value); setDevice(null); setNotice(""); setLastResult(""); }} />
               </label>
+              <button type="button" className={action} disabled={busy || (!serial && !dirty)} onClick={() => {
+                if (discard()) clearEntry(true);
+              }}><X size={15} />清除输入</button>
               <button type="submit" className={action} disabled={busy || !serial.trim()}>读取记录</button>
               <button type="button" className={action} disabled={busy} onClick={() => setCamera("live")}>
                 <Camera size={16} />摄像头扫码
@@ -1252,7 +1333,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
                 onClick={() => void registerDevice()}>登记设备</button>}
             </div>
             <div className="inspection-serial-info">
-              <span>前 6 位 <b>{serial.slice(0, 6) || "—"}</b></span>
+              <span>产品编号 <b>{serial.slice(0, 6) || "—"}</b></span>
               {(form?.serial_mode === "dated" || device?.production_date) && <>
                 <span>生产日期 <b>{record?.production_date || device?.production_date || (serial.length === 16
                   ? (Number(serial.slice(6, 8)) >= 69 ? "19" : "20") + serial.slice(6, 8) + "-" + serial.slice(8, 10) + "-" + serial.slice(10, 12)
@@ -1267,7 +1348,7 @@ export function ProductionInspection({ request, baseUrl, admin, readOnly, onDraf
             event.preventDefault();
             void queryLatest();
           }}>
-            <input aria-label="按前 6 位查询" placeholder="按前 6 位查询历史记录" maxLength={6} value={prefix}
+            <input aria-label="按产品编号查询" placeholder="按产品编号查询历史记录" maxLength={6} value={prefix}
               onChange={(event) => setPrefix(event.target.value)} />
             <button className={action} type="submit" disabled={busy || prefix.trim().length !== 6}>
               <Search size={15} />{template ? "查最近一条" : "查设备"}

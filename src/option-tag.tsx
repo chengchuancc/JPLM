@@ -12,8 +12,8 @@ const fixedTones: Record<string, OptionTone> = {
 };
 
 export function materialCategoryTone(name: string, categories: string[]): OptionTone {
-  if (Object.hasOwn(categoryTones, name)) return categoryTones[name];
-  const custom = categories.filter((category) => !Object.hasOwn(categoryTones, category));
+  if (Object.prototype.hasOwnProperty.call(categoryTones, name)) return categoryTones[name];
+  const custom = categories.filter((category) => !Object.prototype.hasOwnProperty.call(categoryTones, category));
   return customTones[Math.max(0, custom.indexOf(name)) % customTones.length];
 }
 
@@ -24,6 +24,6 @@ export function OptionTag({ label, tone, colorKey, children }: {
   for (const char of (colorKey || label).normalize("NFKC").toLowerCase()) {
     hash = (Math.imul(hash, 31) + char.codePointAt(0)!) >>> 0;
   }
-  const color = tone || (Object.hasOwn(fixedTones, label) ? fixedTones[label] : tones[hash % tones.length]);
+  const color = tone || (Object.prototype.hasOwnProperty.call(fixedTones, label) ? fixedTones[label] : tones[hash % tones.length]);
   return <span className={"option-tag " + color} title={label}>{children ?? label}</span>;
 }

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, type KeyboardEvent } from "react";
-import { ArrowDownToLine, ArrowUpFromLine, Camera, CheckCircle2, ChevronDown, Delete, ImageOff, ScanLine, Search, Trash2 } from "lucide-react";
+import { ArrowDownToLine, ArrowUpFromLine, Camera, CheckCircle2, ChevronDown, Delete, ImageOff, Search, Trash2 } from "lucide-react";
 import type { IScannerControls } from "@zxing/browser";
 import { Dialog } from "./dialog";
 import "./warehouse-registration.css";
@@ -214,6 +214,7 @@ export default function WarehouseRegistration({ request }: { request: Request })
   const [touch] = useState(() => matchMedia("(pointer: coarse)").matches);
   const input = useRef<HTMLInputElement>(null);
   const quantityInput = useRef<HTMLInputElement>(null);
+  const quantityControls = useRef<HTMLDivElement>(null);
   const inFlight = useRef(false);
   const retry = useRef<{ quantity: number; id: string } | undefined>(undefined);
 
@@ -230,7 +231,10 @@ export default function WarehouseRegistration({ request }: { request: Request })
 
   useEffect(() => {
     if (busy || camera) return;
-    if (movement) quantityInput.current?.focus();
+    if (movement) {
+      quantityInput.current?.focus({ preventScroll: true });
+      quantityControls.current?.scrollIntoView({ block: "nearest" });
+    }
     else if (!material) input.current?.focus();
   }, [busy, camera, material, movement]);
 
@@ -284,7 +288,7 @@ export default function WarehouseRegistration({ request }: { request: Request })
       const next = key === "." && !value ? "0." : value + key;
       return /^\d{1,10}(?:\.\d{0,6})?$/.test(next) ? next : value;
     });
-    quantityInput.current?.focus();
+    quantityInput.current?.focus({ preventScroll: true });
   }
 
   function keyboard(event: KeyboardEvent<HTMLInputElement>, append: (key: string) => void, accepted: RegExp) {
@@ -353,8 +357,7 @@ export default function WarehouseRegistration({ request }: { request: Request })
     }
   }
 
-  return <main className="warehouse-page">
-    <header className="warehouse-title"><ScanLine aria-hidden="true" /><h1>出入库登记</h1></header>
+  return <main className="warehouse-page" aria-label="库存操作">
     {receipt && <div className="warehouse-receipt" role="status"><CheckCircle2 size={22} /><span>{receipt}</span></div>}
     {!material ? <section className="warehouse-card">
       <form onSubmit={(event) => { event.preventDefault(); void lookup(code); }}>
@@ -396,7 +399,11 @@ export default function WarehouseRegistration({ request }: { request: Request })
           </button>)}
         </div>
       </>}
-    </section> : <section className="warehouse-card">
+    </section> : <section className={movement ? "warehouse-card warehouse-movement-card" : "warehouse-card"}>
+      <header className="warehouse-stock">
+        <span>当前库存</span>
+        <strong>{formatNumber.format(material.stock)} <small>{material.unit}</small></strong>
+      </header>
       <div className="warehouse-material">
         <MaterialImage key={material.image_id ?? material.id} material={material} />
         <div className="warehouse-material-text">
@@ -404,27 +411,31 @@ export default function WarehouseRegistration({ request }: { request: Request })
           <h2>{material.name}</h2>
           <p>{[material.spec, material.project_name, material.location].filter(Boolean).join(" · ")}</p>
         </div>
-        <div className="warehouse-stock"><span>当前库存</span><strong>{formatNumber.format(material.stock)} <small>{material.unit}</small></strong></div>
       </div>
       {!movement && error && <p className="warehouse-error" role="alert">{error}</p>}
-      {movement ? <form onSubmit={(event) => { event.preventDefault(); void confirm(); }}>
-        <label className="warehouse-label" htmlFor="warehouse-quantity">{movement}数量</label>
-        <div className="warehouse-quantity">
-          <input id="warehouse-quantity" ref={quantityInput} value={quantity} readOnly inputMode="none" placeholder="0" disabled={busy}
-            onKeyDown={(event) => keyboard(event, quantityKey, /^[0-9.]$/)} />
-          <span>{material.unit}</span>
+      {movement ? <form className="warehouse-movement-form" data-movement={movement}
+        onSubmit={(event) => { event.preventDefault(); void confirm(); }}>
+        <div className="warehouse-quantity-controls" ref={quantityControls}>
+          <div className="warehouse-quantity-field">
+            <label className="warehouse-label" htmlFor="warehouse-quantity">{movement}数量</label>
+            <div className="warehouse-quantity">
+              <input id="warehouse-quantity" ref={quantityInput} value={quantity} readOnly inputMode="none" placeholder="0" disabled={busy}
+                onKeyDown={(event) => keyboard(event, quantityKey, /^[0-9.]$/)} />
+              <span>{material.unit}</span>
+            </div>
+          </div>
+          <div className="warehouse-confirm">
+            <button className="warehouse-secondary" type="button" disabled={busy}
+              onClick={() => { retry.current = undefined; setMovement(undefined); setQuantity(""); setError(""); }}>返回</button>
+            <button className="warehouse-primary" type="submit" disabled={!validQty || busy}>{busy ? "登记中…" : "确认" + movement}</button>
+          </div>
         </div>
+        {error && <p className="warehouse-error" role="alert">{error}</p>}
         <div className="warehouse-number-keyboard" role="group" aria-label="数量键盘">
           {numberKeys.map((key) => <button key={key} type="button" disabled={busy}
             aria-label={key === "Backspace" ? "删除最后一位" : undefined} onClick={() => quantityKey(key)}>
             {key === "Backspace" ? <Delete size={25} /> : key}
           </button>)}
-        </div>
-        {error && <p className="warehouse-error" role="alert">{error}</p>}
-        <div className="warehouse-confirm">
-          <button className="warehouse-secondary" type="button" disabled={busy}
-            onClick={() => { retry.current = undefined; setMovement(undefined); setQuantity(""); setError(""); }}>返回</button>
-          <button className="warehouse-primary" type="submit" disabled={!validQty || busy}>{busy ? "登记中…" : "确认" + movement}</button>
         </div>
       </form> : <>
         <div className="warehouse-actions">

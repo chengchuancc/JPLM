@@ -1,0 +1,9 @@
+<resources>
+    <style name="WarehouseTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#1858AB</item>
+        <item name="android:windowBackground">#F0F4F9</item>
+        <item name="android:statusBarColor">#1858AB</item>
+        <item name="android:navigationBarColor">#172539</item>
+    </style>
+</resources>

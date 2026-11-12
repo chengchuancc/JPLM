@@ -1,3 +1,4 @@
+import { randomUuid } from "./random-uuid";
 import React, { Suspense, lazy, useContext, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { clearNavigationSnapshots, NavigationPage, useNavigationHistory, usePageState } from "./navigation";
@@ -1051,7 +1052,7 @@ function ActivityPanel({
         <Button
           small
           disabled={busy}
-          onClick={() => loadActivity(items.at(-1)?.id)}
+          onClick={() => loadActivity(items[items.length - 1]?.id)}
         >
           加载更多
         </Button>
@@ -2525,7 +2526,7 @@ function Workspace({
   const bomCost = (pid: string) => {
     const vs = state.bom_versions.filter((v) => v.product_id === pid);
     return state.bom_lines
-      .filter((l) => l.version_id === vs.at(-1)?.id)
+      .filter((l) => l.version_id === vs[vs.length - 1]?.id)
       .reduce((s, l) => s + (findPart(l.part_id)?.price || 0) * l.qty, 0);
   };
   function costStatus(p: Purchase) {
@@ -3096,7 +3097,7 @@ function Workspace({
                       (v) => v.product_id === p.id,
                     );
                     const lines = state.bom_lines.filter(
-                      (l) => l.version_id === vs.at(-1)?.id,
+                      (l) => l.version_id === vs[vs.length - 1]?.id,
                     );
                     return (
                       <article className="product-card" key={p.id}>
@@ -3135,7 +3136,7 @@ function Workspace({
                           <div className="card-details">
                             <div>
                               <span>BOM 版本</span>
-                              <strong>{vs.at(-1)?.name || "尚无版本"}</strong>
+                              <strong>{vs[vs.length - 1]?.name || "尚无版本"}</strong>
                             </div>
                             <div>
                               <span>物料数量</span>
@@ -7537,10 +7538,10 @@ function ElectronicImportForm({
   const [search, setSearch] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
-  const requestId = useRef(crypto.randomUUID());
+  const requestId = useRef(randomUuid());
   const generation = useRef(0);
   const reset = () => {
-    requestId.current = crypto.randomUUID();
+    requestId.current = randomUuid();
   };
   async function readFile(f: File, sheet = "") {
     const ticket = ++generation.current;

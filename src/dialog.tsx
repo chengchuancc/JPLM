@@ -27,12 +27,8 @@ export function Dialog({
       )?.focus();
     focus();
     const key = (e: KeyboardEvent) => {
-      if (
-        Array.from(document.querySelectorAll('.dialog[aria-modal="true"]')).at(
-          -1,
-        ) !== el.current
-      )
-        return;
+      const dialogs = document.querySelectorAll('.dialog[aria-modal="true"]');
+      if (dialogs[dialogs.length - 1] !== el.current) return;
       if (e.key === "Escape" && !e.defaultPrevented) onClose();
       if (e.key === "Tab") {
         const a = Array.from(

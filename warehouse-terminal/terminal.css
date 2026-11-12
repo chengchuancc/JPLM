@@ -1,0 +1,22 @@
+window { background-color: #edf3f8; color: #162b40; font-size: 17px; }
+.heading { font-size: 27px; font-weight: 800; }
+.subheading { font-size: 21px; font-weight: 700; }
+.status { color: #245477; font-weight: 600; }
+button, entry { min-height: 48px; border-radius: 8px; padding: 0 14px; font-size: 18px; }
+button { font-weight: 700; }
+button.key { min-height: 48px; padding: 0 3px; font-size: 20px; }
+button.large-key { min-height: 84px; font-size: 34px; }
+button.large-key.key-command { font-size: 25px; }
+button.primary-operation { min-height: 72px; font-size: 23px; }
+button.account { min-height: 106px; font-size: 28px; background-image: none; background-color: #fff; border-color: #b6ccdf; }
+button.action { min-height: 105px; font-size: 28px; }
+button.toolbar { min-height: 44px; }
+button.history-toggle { background-image: none; background-color: #fff; border-color: #b6ccdf; color: #23466f; }
+button.blue, button.green, button.warn { background-image: none; color: white; text-shadow: none; }
+button.blue { background-color: #14558f; border-color: #14558f; }
+button.green { background-color: #176954; border-color: #176954; }
+button.warn { background-color: #9b3c33; border-color: #9b3c33; }
+button:active { box-shadow: inset 0 0 0 3px alpha(#132b42, .30); }
+entry { background: white; }
+.card { background-color: #fff; padding: 12px; border-radius: 10px; }
+.stock { font-size: 20px; font-weight: 800; color: #14558f; }

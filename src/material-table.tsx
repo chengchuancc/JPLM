@@ -166,7 +166,7 @@ export function MaterialTable({
           ...new Set(
             saved.filter(
               (id): id is Column =>
-                typeof id === "string" && Object.hasOwn(fields, id),
+                typeof id === "string" && Object.prototype.hasOwnProperty.call(fields, id),
             ),
           ),
         ];

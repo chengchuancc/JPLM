@@ -1334,9 +1334,9 @@ class Handler(BaseHTTPRequestHandler):
                         log_activity(db, self.user, '退出登录', self.user['id'], self.user['name'])
                 return self.send({'ok': True}, extra={'Set-Cookie': self.cookie('', 0)})
             if path == '/api/users' and method == 'GET':
-                self.require_admin()
+                fields = PUBLIC_USER if self.user['role'] == 'admin' else 'id,name,email'
                 with connect() as db:
-                    return self.send([dict(row) for row in db.execute(f'SELECT {PUBLIC_USER} FROM users ORDER BY name,id')])
+                    return self.send([dict(row) for row in db.execute(f'SELECT {fields} FROM users ORDER BY name,id')])
             if path.startswith('/api/avatars/') and method == 'GET':
                 return self.serve_avatar(path.rsplit('/', 1)[1])
             if path == '/api/account/avatar' and method == 'POST':
@@ -1972,7 +1972,14 @@ class Handler(BaseHTTPRequestHandler):
                 if resource == 'templates':
                     return self.send(inspection.templates(db, project_id))
                 if resource == 'devices':
-                    return self.send(inspection.list_devices(db, project_id, query))
+                    page = inspection.list_devices(db, project_id, query)
+                    devices = page['devices']
+                    shipments = shipping.device_shipments(
+                        db, project_id, [device['serial'] for device in devices], shipped_only=True,
+                    )
+                    for device in devices:
+                        device['shipments'] = shipments.get(device['serial'], [])
+                    return self.send(page)
                 if resource == 'device':
                     serial, _, _ = inspection.parse_serial(query.get('serial'), 'text')
                     return self.send({'device': inspection.get_device(db, project_id, serial)})
