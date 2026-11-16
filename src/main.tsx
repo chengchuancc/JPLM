@@ -61,6 +61,7 @@ import {
   Product,
   ProjectSummary,
   ProjectDetails,
+  ProjectRole,
   Part,
   Supplier,
   Quote,
@@ -143,7 +144,7 @@ async function api(path: string, method = "GET", data?: unknown) {
   }
   return j;
 }
-const ProjectContext = React.createContext({ id: "", archived: false });
+const ProjectContext = React.createContext({ id: "", archived: false, canEditFiles: false });
 function projectRequest(projectId: string, path: string, method = "GET", data?: unknown) {
   return api("projects/" + encodeURIComponent(projectId) + "/" + path, method, data);
 }
@@ -884,7 +885,7 @@ function UserAdmin({
                 <td>{user.name}</td>
                 <td>{user.email}</td>
                 <td>{user.phone || "—"}</td>
-                <td>{user.role === "admin" ? "管理员" : "成员"}</td>
+                <td>{user.role === "admin" ? "管理员" : user.shopify_import ? "成员 · Shopify 导入" : "成员"}</td>
                 <td>
                   <div className="row-actions">
                     <Button small onClick={() => setEditor({ user })}>
@@ -919,8 +920,8 @@ function UserAdmin({
           <EntityForm
             initial={
               editor.user
-                ? { name: editor.user.name, email: editor.user.email }
-                : {}
+                ? { name: editor.user.name, email: editor.user.email, shopify_import: editor.user.shopify_import ? "1" : "0" }
+                : { shopify_import: "0" }
             }
             fields={[
               ...(!editor.reset
@@ -936,6 +937,12 @@ function UserAdmin({
                       label: "邮箱",
                       type: "email",
                       required: true,
+                      wide: true,
+                    },
+                    {
+                      name: "shopify_import",
+                      label: "导入和分配 Shopify 订单",
+                      options: [{ value: "0", label: "关闭" }, { value: "1", label: "开启" }],
                       wide: true,
                     },
                   ]
@@ -958,9 +965,11 @@ function UserAdmin({
                 await api("reset-password/" + editor.user!.id, "POST", {
                   password: data.password,
                 });
-              else if (editor.user)
-                await api("users/" + editor.user.id, "PUT", data);
-              else await api("users", "POST", data);
+              else {
+                const payload = { ...data, shopify_import: data.shopify_import === "1" };
+                if (editor.user) await api("users/" + editor.user.id, "PUT", payload);
+                else await api("users", "POST", payload);
+              }
               setEditor(null);
               await Promise.all([loadUsers(), onChange()]);
             }}
@@ -1775,6 +1784,17 @@ function ProjectCoverSettings({ project, editable, onSaved }: {
   );
 }
 
+const projectRoleLabels: Record<ProjectRole, string> = {
+  lead: "项目负责人", engineering: "研发／物料", purchasing: "采购",
+  warehouse: "仓库", inspection: "质检", shipping: "发货",
+};
+
+function hasProjectRole(project: ProjectSummary | undefined, user: User, role: ProjectRole, delegated = false) {
+  const roles = project?.roles || [];
+  return user.role === "admin" || roles.includes("lead") || roles.includes(role) ||
+    (role !== "lead" && !delegated && roles.includes("legacy"));
+}
+
 function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }: {
   project: ProjectSummary;
   user: User;
@@ -1789,27 +1809,30 @@ function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }:
   const [name, setName] = useState(project.name);
   const [owner, setOwner] = useState("");
   const [members, setMembers] = useState<string[]>([]);
+  const [memberRoles, setMemberRoles] = useState<Record<string, ProjectRole[] | null>>({});
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState("");
   const [lifecycle, setLifecycle] = useState<"archive" | "restore" | "delete" | null>(null);
   const admin = user.role === "admin";
-  const canEdit = !project.archived_at && (admin || project.owner_id === user.id);
+  const canManage = hasProjectRole(project, user, "lead");
+  const canEdit = !project.archived_at && canManage;
   const projectPath = "projects/" + project.id;
   useEffect(() => {
     let active = true;
-    Promise.all([api(projectPath), admin ? api("users") : Promise.resolve([])])
+    Promise.all([api(projectPath), canManage ? api("users") : Promise.resolve([])])
       .then(([item, people]) => {
         if (!active) return;
         setDetails(item);
         setName(item.name);
         setOwner(item.owner_id || "");
         setMembers(item.members);
+        setMemberRoles(item.member_roles || {});
         setUsers(people);
       })
       .catch((e) => { if (active) setError(e.message); })
       .finally(() => { if (active) setBusy(false); });
     return () => { active = false; };
-  }, [projectPath, admin]);
+  }, [projectPath, canManage]);
   async function save(data: unknown) {
     setError("");
     setBusy(true);
@@ -1845,7 +1868,10 @@ function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }:
           <ProjectCoverSettings project={project} editable={canEdit} onSaved={onSaved} />
           <form onSubmit={(event) => {
             event.preventDefault();
-            void save(admin ? { name, owner_id: owner, members } : { name });
+            const currentMembers = [...new Set([...members, ...(owner ? [owner] : [])])];
+            const member_roles = Object.fromEntries(currentMembers.flatMap((id) =>
+              memberRoles[id] == null ? [] : [[id, memberRoles[id]]]));
+            void save({ name, members: currentMembers, member_roles, ...(admin ? { owner_id: owner } : {}) });
           }}>
             <div className="form-grid">
               <label>项目名称<input required value={name} disabled={!canEdit || busy}
@@ -1859,18 +1885,37 @@ function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }:
                 </select></label>
               )}
             </div>
-            {admin && details && (
+            {canManage && details && (
               <fieldset className="project-members" disabled={!canEdit || busy}>
-                <legend>项目成员</legend>
-                {users.map((person) => (
-                  <label key={person.id}>
-                    <input type="checkbox" checked={person.id === owner || members.includes(person.id)}
-                      disabled={person.id === owner}
-                      onChange={(event) => setMembers((old) =>
-                        event.target.checked ? [...old, person.id] : old.filter((id) => id !== person.id))} />
-                    {person.name}
-                  </label>
-                ))}
+                <legend>项目成员与角色</legend>
+                <p className="muted">角色可多选。新成员先以只读加入。「沿用原权限」的成员可在这里改为具体岗位。</p>
+                {users.map((person) => {
+                  const selected = person.id === owner || members.includes(person.id);
+                  const roles = memberRoles[person.id];
+                  const protectedLead = person.id === owner || (!admin && roles?.includes("lead"));
+                  return <div className="project-member-roles" key={person.id}>
+                    <label><input type="checkbox" checked={selected} disabled={protectedLead}
+                      onChange={(event) => {
+                        const checked = event.target.checked;
+                        setMembers((old) => checked ? [...old, person.id] : old.filter((id) => id !== person.id));
+                        if (checked) setMemberRoles((old) => ({ ...old, [person.id]: [] }));
+                      }} />{person.name}</label>
+                    {selected && (person.id === owner ? <small>项目负责人</small> : <div className="project-role-options">
+                      {roles === null && <button type="button" className="btn small" disabled={protectedLead}
+                        onClick={() => setMemberRoles((old) => ({ ...old, [person.id]: [] }))}>沿用原权限 · 改用角色</button>}
+                      {roles?.length === 0 && <small>只读</small>}
+                      {(Object.entries(projectRoleLabels) as [ProjectRole, string][]).map(([role, label]) =>
+                        (role !== "lead" || admin || roles?.includes(role)) && <label key={role}>
+                          <input type="checkbox" checked={!!roles?.includes(role)} disabled={protectedLead}
+                            onChange={(event) => {
+                              const checked = event.target.checked;
+                              setMemberRoles((old) => ({ ...old, [person.id]: checked
+                                ? [...(old[person.id] || []), role] : (old[person.id] || []).filter((entry) => entry !== role) }));
+                            }} />{label}
+                        </label>)}
+                    </div>)}
+                  </div>;
+                })}
               </fieldset>
             )}
             {error && <p className="form-error" role="alert">{error}</p>}
@@ -1933,7 +1978,20 @@ function Workspace({
   const [accountView, setAccountView] = usePageState("workspace.accountView", "profile");
   const { view, detail } = route;
   const projectId = project?.id || "";
-  const archived = !!project?.archived_at || !!state.project?.archived_at;
+  const projectArchived = !!project?.archived_at || !!state.project?.archived_at;
+  const effectiveProject = project && { ...project, ...state.project };
+  const can = (role: ProjectRole, delegated = false) => hasProjectRole(effectiveProject, currentUser, role, delegated);
+  const canEditEngineering = !projectArchived && can("engineering");
+  const canEditPurchase = !projectArchived && can("purchasing");
+  const canUseWarehouse = !projectArchived && can("warehouse");
+  const canShopify = currentUser.role === "admin" || !!currentUser.shopify_import;
+  const canGlobalShipping = canShopify || projects.some((item) => hasProjectRole(item, currentUser, "shipping"));
+  const canRegisterStock = projects.some((item) => !item.archived_at && hasProjectRole(item, currentUser, "warehouse"));
+  const editingRole: Record<string, ProjectRole> = {
+    products: "engineering", parts: "engineering", inventory: "warehouse", movements: "warehouse",
+    suppliers: "purchasing", purchases: "purchasing", inspection: "inspection", shipping: "shipping",
+  };
+  const archived = projectArchived || (!!project && !!editingRole[view] && !can(editingRole[view]));
   const userOptions = state.users.map(({ id, name }) => ({ value: id, label: name }));
   const userName = (id: string | null) =>
     state.users.find((user) => user.id === id)?.name ||
@@ -1996,6 +2054,14 @@ function Workspace({
   const [inventoryDetail, setInventoryDetail] = usePageState<Modal>("workspace.inventoryDetail", null, false);
   const [modal, changeModal] = useState<Modal>(inventoryDetail);
   function setModal(next: Modal) {
+    const viewing = next && ["scan", "qr", "preview", "material-files", "deleted-parts", "inventory-part"].includes(next.kind);
+    const purchasing = next && ["purchase", "supplier", "delete-supplier", "quote", "delete-quote"].includes(next.kind);
+    if (next && project && !viewing) {
+      const allowed = next.kind === "movement" ? canUseWarehouse : purchasing ? canEditPurchase
+        : ["demo", "purge-part", "delete-product"].includes(next.kind)
+        ? !projectArchived && currentUser.role === "admin" : canEditEngineering;
+      if (!allowed) { setToast("当前账号没有此项目的操作权限"); return; }
+    }
     setInventoryDetail(next?.kind === "inventory-part" ? next : null);
     changeModal(next);
   }
@@ -2084,11 +2150,11 @@ function Workspace({
     if (view === "projects") void reloadProjects().catch((e) => setFatal(e.message));
   }, [view]);
   useEffect(() => {
-    if (archived && modal && !readOnlyModal) {
+    if (projectArchived && modal && !readOnlyModal) {
       setModal(null);
       notify("项目已归档，只能查看");
     }
-  }, [archived, modal, readOnlyModal]);
+  }, [projectArchived, modal, readOnlyModal]);
   async function mutate(
     path: string,
     method: string,
@@ -2355,6 +2421,7 @@ function Workspace({
       <InlineCell
         label={p.name + " " + label}
         value={p[field]}
+        readOnly={!(canEditEngineering || (field === "location" && canUseWarehouse))}
         type={field === "price" || field === "min_stock" ? "number" : "text"}
         options={field === "location" ? [{ value: "", label: "未设置" }, ...locationChoices] : options}
         categoryOptions={field === "category" ? state.material_categories : undefined}
@@ -2431,6 +2498,7 @@ function Workspace({
     ) : null;
   }
   function inventoryRowActions(p: Part, labeled = false) {
+    if (!canUseWarehouse) return null;
     return [
       { label: "入库", icon: ArrowDownToLine },
       { label: "出库", icon: ArrowUpFromLine },
@@ -2758,7 +2826,7 @@ function Workspace({
     );
   }
   return (
-    <ProjectContext.Provider value={{ id: projectId, archived }}>
+    <ProjectContext.Provider value={{ id: projectId, archived, canEditFiles: canEditEngineering }}>
     <div className="app-shell">
       <aside className={`sidebar ${mobile ? "mobile-open" : ""}`}>
         <a className="brand" href="#projects" onClick={(event) => { event.preventDefault(); go("projects"); }}>
@@ -2779,13 +2847,13 @@ function Workspace({
           <button className={view === "projects" ? "active" : ""} onClick={() => go("projects")}>
             <Layers size={19} strokeWidth={1.7} /><span>项目列表</span>
           </button>
-          <button className={view === "global-shipping" ? "active" : ""} onClick={() => go("global-shipping")}>
+          {canGlobalShipping && <button className={view === "global-shipping" ? "active" : ""} onClick={() => go("global-shipping")}>
             <Truck size={19} strokeWidth={1.7} /><span>全局发货</span>
-          </button>
-          <button onClick={() => window.open(appBase + "#warehouse", "_blank", "noopener")}>
+          </button>}
+          {canRegisterStock && <button onClick={() => window.open(appBase + "#warehouse", "_blank", "noopener")}>
             <ScanLine size={19} strokeWidth={1.7} /><span>出入库登记</span>
-          </button>
-          {project && navs.map((n) => (
+          </button>}
+          {project && navs.filter((n) => n.id !== "shipping" || can("shipping")).map((n) => (
             <button
               key={n.id}
               className={view === n.id ? "active" : ""}
@@ -2911,7 +2979,7 @@ function Workspace({
             </div>
           )}
           {project && !projectReady && <p className="muted">正在加载项目…</p>}
-          {archived && !fatal && <p className="project-archived" role="status">项目已归档，只能查看</p>}
+          {archived && !fatal && <p className="project-archived" role="status">{projectArchived ? "项目已归档，只能查看" : "当前模块为只读"}</p>}
           {projectReady && !fatal && <>
           {view === "projects" && <ProjectDirectory projects={projects}
             open={(id) => navigate({ projectId: id, view: "products", detail: "" })}
@@ -2925,12 +2993,12 @@ function Workspace({
           {view === "inspection" && project && <ProductionInspection
             request={businessApi}
             baseUrl={appBase + "api/projects/" + encodeURIComponent(project.id) + "/"}
-            admin={currentUser.role === "admin"}
+            admin={can("inspection", true)}
             readOnly={archived}
             onDraftChange={(dirty) => { draftOpen.current = dirty; }}
           />}
-          {view === "shipping" && project && <Suspense fallback={<p className="muted">正在加载发货管理…</p>}>
-            <ShippingManagement key={detail} request={businessApi} admin={currentUser.role === "admin"} readOnly={archived}
+          {view === "shipping" && project && can("shipping") && <Suspense fallback={<p className="muted">正在加载发货管理…</p>}>
+            <ShippingManagement key={detail} request={businessApi} admin={can("shipping", true)} readOnly={archived}
               products={state.products.map((product) => ({
                 id: product.id, name: product.name, code: product.code, english_code: product.english_code,
                 project_id: project.id, project_name: project.name,
@@ -2940,7 +3008,7 @@ function Workspace({
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}
           {view === "global-shipping" && <Suspense fallback={<p className="muted">正在加载全局发货…</p>}>
-            <GlobalShipping key={detail} initialRecord={detail} request={api} admin={currentUser.role === "admin"}
+            <GlobalShipping key={detail} initialRecord={detail} request={api} canImportShopify={canShopify}
               projectRequest={(id) => (path, method, data) => projectRequest(id, path, method, data)}
               onDraftChange={(dirty) => { draftOpen.current = dirty; }} />
           </Suspense>}
@@ -2965,7 +3033,7 @@ function Workspace({
                     </span>
                   </h1>
                 </div>
-                <Button
+                {canEditEngineering && <Button
                   primary
                   onClick={() =>
                     setModal({ kind: "product", item: { status: "研发中" } })
@@ -2973,7 +3041,7 @@ function Workspace({
                 >
                   <Plus size={17} />
                   新建产品
-                </Button>
+                </Button>}
               </div>
               <div className="stats-row">
                 <div>
@@ -3452,12 +3520,12 @@ function Workspace({
                         已删除物料
                       </Button>
                     )}
-                    <Button primary onClick={() => setModal({ kind: "part" })}>
+                    {canEditEngineering && <Button primary onClick={() => setModal({ kind: "part" })}>
                       <Plus size={17} />
                       新建物料
-                    </Button>
+                    </Button>}
                   </div>
-                ) : (
+                ) : canUseWarehouse && (
                   <div className="toolbar-controls">
                     <Button onClick={() => startInventory("出库")}>
                       <ArrowUpFromLine size={16} />
@@ -3700,10 +3768,10 @@ function Workspace({
                   <QrCode size={16} />
                   二维码
                 </Button>
-                <Button onClick={() => setModal({ kind: "part", item: part })}>
+                {canEditEngineering && <Button onClick={() => setModal({ kind: "part", item: part })}>
                   <Pencil size={16} />
                   编辑
-                </Button>
+                </Button>}
               </div>
               <div className="part-overview">
                 <div>
@@ -3721,7 +3789,7 @@ function Workspace({
                   <strong>{money(part.price)}</strong>
                   <p>库位：{part.location || "未设置"}</p>
                 </div>
-                <div className="inventory-quick">
+                {canUseWarehouse && <div className="inventory-quick">
                   <span>库存操作</span>
                   <div>
                     {[
@@ -3743,7 +3811,7 @@ function Workspace({
                       );
                     })}
                   </div>
-                </div>
+                </div>}
               </div>
               <div className="tabs page-tabs">
                 {[
@@ -4034,7 +4102,7 @@ function Workspace({
                     <section className="panel">
                       <div className="panel-heading">
                         <h3>供应商与报价</h3>
-                        <Button
+                        {canEditPurchase && <Button
                           small
                           onClick={() =>
                             setModal({
@@ -4045,7 +4113,7 @@ function Workspace({
                         >
                           <Plus size={14} />
                           关联供应商
-                        </Button>
+                        </Button>}
                       </div>
                       {state.quotes
                         .filter((q) => q.part_id === part.id)
@@ -4067,7 +4135,7 @@ function Workspace({
                               )}
                               {purchaseLink(q.url)}
                             </div>
-                            {supplierLinkActions(q)}
+                            {canEditPurchase && supplierLinkActions(q)}
                           </div>
                         ))}
                       {!state.quotes.some((q) => q.part_id === part.id) && (
@@ -4213,10 +4281,10 @@ function Workspace({
                     </span>
                   </h1>
                 </div>
-                <Button primary onClick={() => setModal({ kind: "supplier" })}>
+                {canEditPurchase && <Button primary onClick={() => setModal({ kind: "supplier" })}>
                   <Plus size={17} />
                   新建供应商
-                </Button>
+                </Button>}
               </div>
               <div className="section-toolbar">
                 <span className="muted">所有供应商</span>
@@ -4394,7 +4462,7 @@ function Workspace({
                               : money(link.price) + " / " + material.unit}
                           </td>
                           <td>{purchaseLink(link.url) || "—"}</td>
-                          <td>{supplierLinkActions(link)}</td>
+                          <td>{canEditPurchase && supplierLinkActions(link)}</td>
                         </tr>
                       );
                     })}
@@ -4415,10 +4483,10 @@ function Workspace({
                     </span>
                   </h1>
                 </div>
-                <Button primary onClick={() => setModal({ kind: "purchase" })}>
+                {canEditPurchase && <Button primary onClick={() => setModal({ kind: "purchase" })}>
                   <Plus size={17} />
                   新建采购单
-                </Button>
+                </Button>}
               </div>
               <div className="section-toolbar">
                 <div className="tabs">
@@ -4500,12 +4568,7 @@ function Workspace({
                                 {lines.length} 种物料
                               </td>
                               <td className="num strong">
-                                {money(
-                                  lines.reduce(
-                                    (s, l) => s + l.price * l.qty,
-                                    0,
-                                  ),
-                                )}
+                                {can("purchasing") ? money(lines.reduce((sum, line) => sum + (line.price ?? 0) * line.qty, 0)) : "—"}
                               </td>
                               <td>
                                 <div className="purchase-summary-actions">
@@ -4537,10 +4600,10 @@ function Workspace({
                                     {pendingQuantity(l)}
                                   </td>
                                   <td className="num">
-                                    {money(l.price * l.qty)}
+                                    {l.price === null ? "—" : money(l.price * l.qty)}
                                   </td>
                                   <td>
-                                    {!archived && part && !part.deleted_at && (
+                                    {canUseWarehouse && part && !part.deleted_at && (
                                         <Button
                                           small
                                           onClick={() =>
@@ -4656,8 +4719,8 @@ function Workspace({
                             <td className="num">
                               <QuantityHighlight value={l.qty} /> {p?.unit}
                             </td>
-                            <td className="num">{money(l.price)}</td>
-                            <td className="num">{money(l.price * l.qty)}</td>
+                            <td className="num">{l.price === null ? "—" : money(l.price)}</td>
+                            <td className="num">{l.price === null ? "—" : money(l.price * l.qty)}</td>
                             <td className="num">{receivedQuantity(l)}</td>
                             <td className="num">
                               {pendingQuantity(l)}
@@ -4665,7 +4728,7 @@ function Workspace({
                             <td>
                               {p?.deleted_at ? (
                                 <span className="muted">物料已删除</span>
-                              ) : !archived ? (
+                              ) : canUseWarehouse ? (
                                 <Button
                                   small
                                   onClick={() =>
@@ -4711,10 +4774,10 @@ function Workspace({
                     </span>
                   </h1>
                 </div>
-                <Button primary onClick={() => startInventory("入库")}>
+                {canUseWarehouse && <Button primary onClick={() => startInventory("入库")}>
                   <Plus size={17} />
                   库存操作
-                </Button>
+                </Button>}
               </div>
               <div className="section-toolbar">
                 <div className="tabs">
@@ -4881,8 +4944,8 @@ function Workspace({
       {printMaterials && <Suspense fallback={null}>
         <MaterialLabelsDialog materials={printMaterials} close={() => setPrintMaterials(null)} />
       </Suspense>}
-      {!fatal && modal && (!archived || readOnlyModal) && (
-        <ChoiceContext.Provider value={archived ? null : setChoice}>
+      {!fatal && modal && (!projectArchived || readOnlyModal) && (
+        <ChoiceContext.Provider value={projectArchived ? null : setChoice}>
           {((["product", "part", "supplier"].includes(modal.kind) &&
             !modal.item?.id) ||
             modal.kind === "bom-create" ||
@@ -4903,7 +4966,7 @@ function Workspace({
             >
               <QuickCreateForm
                 images={modal.kind !== "supplier"}
-                suppliers={["part", "bom-create", "child-create"].includes(modal.kind) ? supplierOptions : undefined}
+                suppliers={canEditPurchase && ["part", "bom-create", "child-create"].includes(modal.kind) ? supplierOptions : undefined}
                 fields={
                   modal.kind === "product"
                     ? productFields.filter((f) => f.name !== "name")
@@ -5049,7 +5112,7 @@ function Workspace({
                         : supplierFields
                   }
                   initial={modal.item}
-                  suppliers={modal.kind === "part" ? {
+                  suppliers={canEditPurchase && modal.kind === "part" ? {
                     options: supplierOptions,
                     linked: state.quotes.filter((quote) => quote.part_id === modal.item.id)
                       .map((quote) => quote.supplier_id),
@@ -5222,7 +5285,7 @@ function Workspace({
                 <dt>最低库存</dt><dd>{amount(inventoryPart.min_stock)} {inventoryPart.unit}</dd>
                 <dt>仓库位置</dt><dd>{materialCell(inventoryPart, "location", "仓库位置")}</dd>
               </dl>
-              {!archived && <div className="inventory-detail-actions">{inventoryRowActions(inventoryPart, true)}</div>}
+              {canUseWarehouse && <div className="inventory-detail-actions">{inventoryRowActions(inventoryPart, true)}</div>}
               <h3>库存流水</h3>
               {movementTable(state.movements.filter((row) => row.part_id === inventoryPart.id), 10)}
             </Dialog>
@@ -5507,14 +5570,14 @@ function Workspace({
           )}
         </ChoiceContext.Provider>
       )}
-      {!fatal && !archived && choice && (
+      {!fatal && !projectArchived && choice && (
         <Dialog
           title={"新建" + choiceNames[choice.resource]}
           onClose={() => setChoice(null)}
         >
           <QuickCreateForm
             images={choice.resource !== "suppliers"}
-            suppliers={choice.resource === "parts" ? supplierOptions : undefined}
+            suppliers={canEditPurchase && choice.resource === "parts" ? supplierOptions : undefined}
             fields={(choice.resource === "parts"
               ? partFields
               : choice.resource === "products"
@@ -6542,7 +6605,8 @@ function FileManager({
   onPreview: (f: FileRecord) => void;
   onDelete: (f: FileRecord) => void;
 }) {
-  const { id: projectId, archived } = useContext(ProjectContext);
+  const { id: projectId, canEditFiles } = useContext(ProjectContext);
+  const archived = !canEditFiles;
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const upload = async (fs: FileList | File[] | null, replace?: string) => {
@@ -6902,6 +6966,7 @@ function InlineCell({
   options,
   categoryOptions,
   createOptionLabel,
+  readOnly,
 }: {
   label: string;
   value: string | number;
@@ -6912,6 +6977,7 @@ function InlineCell({
   options?: { value: string; label: string }[];
   categoryOptions?: string[];
   createOptionLabel?: string;
+  readOnly?: boolean;
 }) {
   const { archived } = useContext(ProjectContext);
   const [editing, setEditing] = useState(false);
@@ -6961,7 +7027,7 @@ function InlineCell({
   const content = display && (options || categoryOptions)
     ? <OptionTag label={display} tone={categoryOptions && materialCategoryTone(display, categoryOptions)} />
     : display || "—";
-  if (archived) return <span>{content}</span>;
+  if (readOnly ?? archived) return <span>{content}</span>;
   if (!editing)
     return (
       <button

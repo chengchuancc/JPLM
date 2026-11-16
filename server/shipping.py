@@ -6,6 +6,7 @@ import math
 import secrets
 from datetime import date, datetime, timezone
 
+import permissions
 from electronic_import import ElectronicBomError, normalized, read_csv, read_xlsx
 
 VERSION = 14
@@ -209,14 +210,16 @@ def product_catalog(db, user, project=None):
     return [dict(p) for p in db.execute(f"""SELECT p.id,p.name,p.code,p.english_code,p.project_id,j.name AS project_name,{PRODUCT_IMAGE}
         FROM products p JOIN projects j ON j.id=p.project_id
         WHERE j.deleted_at IS NULL AND j.archived_at IS NULL AND (? IS NULL OR j.id=?)
-          AND (? OR EXISTS (SELECT 1 FROM project_members m WHERE m.project_id=j.id AND m.user_id=?))
+          AND (? OR EXISTS (SELECT 1 FROM project_members m WHERE m.project_id=j.id AND m.user_id=?
+                            AND {permissions.membership_allows('shipping')}))
         ORDER BY j.name,p.name,p.code""", (project, project, user['role']=='admin', user['id']))]
 
 
 def accessible_projects(db, user):
-    return {row['id']: dict(row) for row in db.execute("""SELECT id,name,archived_at FROM projects j
+    return {row['id']: dict(row) for row in db.execute(f"""SELECT id,name,archived_at FROM projects j
         WHERE deleted_at IS NULL AND (? OR EXISTS (
             SELECT 1 FROM project_members m WHERE m.project_id=j.id AND m.user_id=?
+            AND {permissions.membership_allows('shipping')}
         )) ORDER BY name,id""", (user['role']=='admin', user['id']))}
 
 
@@ -373,11 +376,30 @@ def list_global_orders(db, user, query):
     if project and project not in allowed:
         raise ShippingError('项目不存在或无权访问', 404)
     admin = user['role'] == 'admin'
-    params = (admin, user['id'], project, project, project, project, term, term, term, term, term,
-              term, term, term, admin, project)
+    import_shopify = permissions.can_import_shopify(user)
+    if query.get('q_field') == 'reference':
+        package_match = "(?='' OR instr(lower(t.reference),?)>0 OR instr(lower(s.reference),?)>0)"
+        pending_match = "(?='' OR instr(lower(p.reference),?)>0)"
+        package_terms = (term, term, term)
+        pending_terms = (term, term)
+    else:
+        package_match = """(?='' OR instr(lower(t.reference||' '||s.reference),?)>0 OR instr(lower(s.tracking),?)>0
+            OR (s.project_id IN (SELECT id FROM allowed) AND instr(lower(coalesce(json_extract(s.details,'$.name'),'')),?)>0)
+            OR EXISTS (
+                SELECT 1 FROM shipping_items i JOIN allowed a ON a.id=i.product_project_id
+                LEFT JOIN products p ON p.project_id=i.product_project_id AND p.id=i.product_id
+                WHERE i.project_id=s.project_id AND i.shipment_id=s.id
+                AND instr(lower(coalesce(p.name,i.product_name)||' '||coalesce(p.code,i.product_code)),?)>0
+            ))"""
+        pending_match = "(?='' OR instr(lower(p.reference),?)>0 OR instr(lower(coalesce(json_extract(p.details,'$.name'),'')),?)>0)"
+        package_terms = (term,) * 5
+        pending_terms = (term,) * 3
+    params = (admin, user['id'], project, project, project, project, *package_terms, *pending_terms,
+              import_shopify, project)
     cte = f"""WITH RECURSIVE allowed AS (
         SELECT id FROM projects j WHERE j.deleted_at IS NULL AND (? OR EXISTS (
             SELECT 1 FROM project_members m WHERE m.project_id=j.id AND m.user_id=?
+            AND {permissions.membership_allows('shipping')}
         ))
     ), tree(project_id,id,reference,root_id) AS (
         SELECT project_id,id,reference,id FROM shipping_records WHERE channel='other' AND parent_id IS NULL
@@ -394,14 +416,7 @@ def list_global_orders(db, user, query):
             CASE WHEN trim(ltrim(trim(t.reference),'#'))='' THEN 'package:'||s.project_id||':'||t.root_id
                  ELSE 'order:'||lower(trim(ltrim(trim(t.reference),'#'))) END AS order_key,
             (?='' OR s.project_id=? OR {has_related_project('s', '=?')}) AS project_match,
-            (?='' OR instr(lower(t.reference||' '||s.reference),?)>0 OR instr(lower(s.tracking),?)>0
-                OR (s.project_id IN (SELECT id FROM allowed) AND instr(lower(coalesce(json_extract(s.details,'$.name'),'')),?)>0)
-                OR EXISTS (
-                SELECT 1 FROM shipping_items i JOIN allowed a ON a.id=i.product_project_id
-                LEFT JOIN products p ON p.project_id=i.product_project_id AND p.id=i.product_id
-                WHERE i.project_id=s.project_id AND i.shipment_id=s.id
-                AND instr(lower(coalesce(p.name,i.product_name)||' '||coalesce(p.code,i.product_code)),?)>0
-            )) AS term_match
+            {package_match} AS term_match
         FROM shipping_records s JOIN tree t ON t.project_id=s.project_id AND t.id=s.id
         JOIN projects j ON j.id=s.project_id AND j.deleted_at IS NULL
         WHERE s.deleted_at IS NULL AND (s.project_id IN (SELECT id FROM allowed)
@@ -410,7 +425,7 @@ def list_global_orders(db, user, query):
         SELECT NULL,p.id,p.reference,NULL,'','',p.created_at,p.created_at,1,
             p.reference,0,'Shopify','',p.details,'{{}}',
             'pending-shopify:'||p.id,1,
-            (?='' OR instr(lower(p.reference),?)>0 OR instr(lower(coalesce(json_extract(p.details,'$.name'),'')),?)>0)
+            {pending_match}
         FROM shipping_pending_shopify p WHERE ? AND ?=''
     ), orders AS (
         SELECT order_key, max(order_number) AS order_number,max(created_at) AS created_at,
@@ -574,7 +589,23 @@ def list_shipments(db, project, channel, query, allowed=None):
         where.append('o.backer=?')
         params.append(backer)
     term = string(query.get('q'), 150).lower()
-    if term:
+    field = query.get('q_field')
+    if field == 'reference' or (field == 'backer' and channel == 'ks'):
+        term = term.lstrip('#')
+    if term and field == 'backer' and channel == 'ks':
+        where.append('instr(lower(o.backer),?)>0')
+        params.append(term)
+    elif term and field == 'reference':
+        match = 'instr(lower(s.reference),?)>0'
+        params.append(term)
+        if shared:
+            # Shared rows can display the parent order number in the project ledger.
+            match = f"""({match} OR (s.project_id<>? AND EXISTS (
+                SELECT 1 FROM shipping_records parent WHERE parent.project_id=s.project_id
+                AND parent.id=s.parent_id AND instr(lower(parent.reference),?)>0)))"""
+            params.extend([project, term])
+        where.append(match)
+    elif term:
         where.append("""(instr(lower(s.reference||' '||s.tracking||' '||CASE WHEN s.project_id=?
             THEN s.details ELSE '' END||' '||
             coalesce(o.backer,'')||' '||coalesce(o.details,'')),?)>0 OR EXISTS
@@ -741,7 +772,8 @@ def page_number(query):
 def list_orders(db, project, query):
     page = page_number(query)
     term = string(query.get('q'), 150).lower().lstrip('#')
-    where = "o.project_id=? AND instr(lower(o.backer||' '||o.details),?)>0"
+    searchable = 'o.backer' if query.get('q_field') == 'backer' else "o.backer||' '||o.details"
+    where = f"o.project_id=? AND instr(lower({searchable}),?)>0"
     args = [project, term]
     status = query.get('status')
     if status in ('shipped', 'pending'):

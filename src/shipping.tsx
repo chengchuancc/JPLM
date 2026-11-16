@@ -12,6 +12,7 @@ import { ShippingTextCell } from "./shipping-text-cell";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
 import { ShippingTableHeader } from "./shipping-table-header";
+import { ShippingSearchFieldPicker, type ShippingSearchField } from "./shipping-search";
 import { restoreListPages, usePageState } from "./navigation";
 import { useShipmentRowLocation } from "./shipping-location";
 import { TableOptionPicker } from "./material-category";
@@ -302,6 +303,8 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   const [orders, setOrders] = usePageState("shipping.orders", false);
   const [term, setTerm] = usePageState("shipping.term", "");
   const [search, setSearch] = usePageState("shipping.search", "");
+  const [field, setField] = usePageState<ShippingSearchField>("shipping.field", "");
+  const [searchField, setSearchField] = usePageState<ShippingSearchField>("shipping.searchField", "");
   const [status, setStatus] = usePageState("shipping.status", "");
   const [deleted, setDeleted] = usePageState("shipping.deleted", false);
   const [expanded, setExpanded] = usePageState<Record<string, boolean>>("shipping.expanded", {});
@@ -350,7 +353,8 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   const tableWidth = columns.reduce((total, column) => total + column.width, 45 + (readOnly ? 0 : actionWidth));
   const more = !!data && page * data.page_size < data.total;
   const grouped = !orders && !search && !status && !deleted;
-  const expandable = !orders && !status && !deleted;
+  const expandable = !orders && !status && !deleted && !(search && searchField);
+  const referenceLabel = channel === "ks" ? "发货编号" : "订单号";
   const loadedIds = new Set(rows.map((row) => row.id));
   useShipmentRowLocation(grid, focused, !!data && !busy && (!restored || focused !== restoredFocus.current));
 
@@ -358,7 +362,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     let active = true;
     setBusy(true);
     setLoadError("");
-    const query = new URLSearchParams({ channel, q: search, status, page: String(page) });
+    const query = new URLSearchParams({ channel, q: search, q_field: searchField, status, page: String(page) });
     if (locatePending.current && !orders) query.set("locate", locatePending.current);
     if (grouped) query.set("roots", "1");
     if (!orders && deleted) query.set("deleted", "1");
@@ -387,7 +391,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
       (error) => { if (active) setLoadError(error.message); },
     ).finally(() => { if (active) setBusy(false); });
     return () => { active = false; };
-  }, [channel, orders, search, status, page, refresh, retry, grouped, deleted]);
+  }, [channel, orders, search, searchField, status, page, refresh, retry, grouped, deleted]);
 
   useEffect(() => {
     const node = tail.current;
@@ -412,7 +416,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     }, { root: grid.current, rootMargin: "100px 0px 0px 0px" });
     observer.observe(node);
     return () => { requested = true; observer.disconnect(); };
-  }, [firstPage, busy, loadingEarlier, loadError, grouped, channel]);
+  }, [firstPage, busy, loadingEarlier, loadError, grouped, channel, orders, search, searchField, status, deleted]);
   useLayoutEffect(() => {
     const anchor = scrollAnchor.current;
     const container = grid.current;
@@ -459,9 +463,10 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     setLoadingEarlier(true);
     setLoadError("");
     try {
-      const query = new URLSearchParams({ channel, page: String(firstPage - 1) });
+      const query = new URLSearchParams({ channel, q: search, q_field: searchField, status, page: String(firstPage - 1) });
       if (grouped) query.set("roots", "1");
-      const earlier: Page = await request(path + "records?" + query);
+      if (!orders && deleted) query.set("deleted", "1");
+      const earlier: Page = await request(path + (orders ? "orders?" : "records?") + query);
       if (epoch !== listEpoch.current) return;
       if (grid.current) scrollAnchor.current = { height: grid.current.scrollHeight, top: grid.current.scrollTop };
       setData((current) => current && { ...current, rows: [...earlier.rows,
@@ -475,14 +480,19 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     if ((channel === next && orders === showOrders) || !abandon()) return;
     setChannel(next);
     setOrders(showOrders);
-    setSearch("");
-    setTerm("");
+    clearSearch();
     setStatus("");
     setFocused("");
     setDeleted(false);
     setExpanded({});
     setNotice("");
     resetList();
+  }
+  function clearSearch() {
+    setSearch("");
+    setTerm("");
+    setField("");
+    setSearchField("");
   }
   function begin(row: Shipment) {
     if (readOnly || deleted || row.deleted_at || row.shared && !row.can_edit_items || saving || (edit && !abandon())) return;
@@ -502,8 +512,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
   function beginFromOrder(order: Order) {
     if (!abandon()) return;
     setOrders(false);
-    setSearch("");
-    setTerm("");
+    clearSearch();
     setStatus("");
     setDeleted(false);
     resetList();
@@ -547,7 +556,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
         if (expandable && saved.parent_id === draftAnchor) setData((previous) => previous && { ...previous, rows: previous.rows.map((row) =>
           row.id === saved.parent_id && !isOrder(row) ? { ...row, child_count: row.child_count + 1 } : row) });
         else {
-          setSearch(""); setTerm(""); setStatus(""); resetList();
+          clearSearch(); setStatus(""); resetList();
         }
       } else if (edit.id) {
         if (saved.parent_id !== initialParent.current || search ||
@@ -555,8 +564,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
         else setData((previous) => previous && { ...previous, rows: previous.rows.map((row) => row.id === saved.id ? saved : row) });
       } else {
         setStatus("");
-        setSearch("");
-        setTerm("");
+        clearSearch();
         resetList();
       }
       setNotice("发货记录已保存");
@@ -600,8 +608,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
         clipboard, columns: startColumn < 0 ? [] : fields.slice(startColumn), targets,
       });
       if (result.added) {
-        setTerm("");
-        setSearch("");
+        clearSearch();
         setStatus("");
       }
       if (result.added || result.updated) resetList();
@@ -794,11 +801,15 @@ export default function ShippingManagement({ request, products, admin, readOnly,
       </div>
     </div>
     <div className="shipping-toolbar">
-      <form className="shipping-tools" onSubmit={(event) => {
+      <form className="shipping-tools shipping-search" onSubmit={(event) => {
         event.preventDefault();
-        if (abandon()) { setFocused(""); setSearch(term.trim()); resetList(); }
+        if (abandon()) { setFocused(""); setSearch(term.trim()); setSearchField(field); resetList(); }
       }}>
-        <input aria-label="搜索发货" placeholder={orders ? "Backer 编号、收件人或邮箱" : "订单号、运单号或设备 S/N"}
+        <ShippingSearchFieldPicker value={field} onChange={setField} backer={channel === "ks"}
+          reference={orders ? undefined : referenceLabel} />
+        <input aria-label="搜索发货" placeholder={field === "backer" ? "输入部分 Backer 编号" :
+          field === "reference" ? "输入部分" + referenceLabel :
+          orders ? "Backer 编号、收件人或邮箱" : "订单号、运单号或设备 S/N"}
           value={term} onChange={(event) => setTerm(event.target.value)} />
         <TableOptionPicker label="发货状态" value={status}
           choices={[{ value: "", label: "全部状态", tone: "slate" }, ...shipmentStatuses]}
@@ -819,7 +830,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
         </button>}
         {!orders && <button type="button" className="btn" aria-pressed={deleted} onClick={() => {
           if (!abandon()) return;
-          setDeleted(!deleted); setStatus(""); setTerm(""); setSearch(""); setNotice(""); resetList();
+          setDeleted(!deleted); setStatus(""); clearSearch(); setNotice(""); resetList();
         }}>{deleted ? "返回发货台账" : "已删除"}</button>}
         {!readOnly && (orders ? admin && <button className="btn primary" type="button" onClick={() => setImporting(true)}>
           <Upload size={15} />导入 KS 订单

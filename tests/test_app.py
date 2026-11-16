@@ -257,6 +257,132 @@ class IntegrationTests(unittest.TestCase):
         self.request(child_path, 'PUT', {**payload, 'parent_id': None, 'version': restored['updated_at']})
         self.assertEqual(self.request(records + '?channel=other&roots=1')['total'], 2)
 
+    def test_shipping_can_search_a_single_identifier_without_matching_other_fields(self):
+        orders = 'shipping/orders'
+        records = 'shipping/records'
+        self.request(orders + '/paste', 'POST', {
+            'clipboard': 'Backer Number\tName\n78123\t测试收件人\n456\t812 号收件人',
+        })
+        ks_orders = {order['backer']: order for order in self.request(orders)['rows']}
+        ks_matches = []
+        for order in ks_orders.values():
+            row = self.request(records, 'POST', {'channel': 'ks', 'ks_order_id': order['id']})
+            if order['backer'] == '78123':
+                ks_matches.append(row['id'])
+
+        self.assertEqual(self.request(orders + '?q=812')['total'], 2)
+        self.assertEqual([row['backer'] for row in self.request(orders + '?q_field=backer&q=%23812')['rows']], ['78123'])
+        self.assertEqual(self.request(records + '?channel=ks&q=812')['total'], 2)
+        self.assertEqual([row['id'] for row in self.request(
+            records + '?channel=ks&q_field=backer&q=%23812&status=pending')['rows']], ks_matches)
+        self.assertEqual(self.request(records + '?channel=ks&backer=812')['total'], 0)
+
+        root = self.request(records, 'POST', {'channel': 'other', 'reference': '#ROOT'})
+        child = self.request(records, 'POST', {'channel': 'other', 'reference': '#AB-812-Z',
+                                                'parent_id': root['id']})
+        self.request(records, 'POST', {'channel': 'other', 'reference': '#UNRELATED-ORDER', 'tracking': 'AB-812-Z'})
+        global_path = 'global-shipping/orders'
+        self.assertEqual(self.request(global_path + '?q=b-812', project=False)['total'], 2)
+        project_results = self.request(records + '?channel=other&q_field=reference&q=b-812')
+        self.assertEqual([row['id'] for row in project_results['rows']], [child['id']])
+        results = self.request(global_path + '?q_field=reference&q=%23ab-81', project=False)
+        self.assertEqual(results['total'], 1)
+        self.assertEqual({row['id'] for row in results['rows'][0]['packages']}, {root['id'], child['id']})
+        self.assertEqual(self.request(global_path + '?q_field=reference&q=812&page=2', project=False)['rows'], [])
+
+    def test_project_roles_combine_and_project_lead_can_delegate_business_roles(self):
+        admin = self.cookie
+        second = self.request('projects', 'POST', {'name': '另一个项目'})['id']
+        project = 'projects/' + self.project_id
+        other_project = 'projects/' + second
+        lead_account = {'name': '项目协管', 'email': 'lead@example.test', 'password': 'test-initial-1234'}
+        staff_account = {'name': '研发仓库', 'email': 'staff@example.test', 'password': 'test-initial-1234'}
+        lead = self.request('users', 'POST', lead_account)['id']
+        staff = self.request('users', 'POST', staff_account)['id']
+        self.request(project, 'PUT', {'members': [lead], 'member_roles': {lead: ['lead']}})
+        self.request(other_project, 'PUT', {'members': [staff], 'member_roles': {staff: []}})
+        supplier = self.supplier()
+        self.request('quotes', 'POST', {'part_id': self.part, 'supplier_id': supplier, 'price': 13})
+        self.request('auth/login', 'POST', lead_account)
+        self.request('account/password', 'POST', {'current_password': lead_account['password'], 'password': 'lead-updated-1234'})
+        self.request(project, 'PUT', {'members': [lead, staff], 'member_roles': {staff: ['lead']}}, 403)
+        self.request(project, 'PUT', {'members': [staff], 'member_roles': {staff: ['warehouse']}}, 403)
+        self.request(project, 'PUT', {
+            'members': [lead, staff], 'member_roles': {staff: ['engineering', 'warehouse']},
+        })
+        self.assertEqual(self.request(project)['member_roles'][staff], ['engineering', 'warehouse'])
+        self.request(other_project, 'PUT', {'name': '跨项目'}, 404)
+        self.request('auth/login', 'POST', staff_account)
+        self.request('account/password', 'POST', {'current_password': staff_account['password'], 'password': 'staff-updated-1234'})
+        product = self.product()
+        version = next(row['id'] for row in self.state()['bom_versions'] if row['product_id'] == product)
+        line = self.request('bom-lines', 'POST', {'part_id': self.part, 'version_id': version, 'qty': 2})['id']
+        self.request('bom-lines/' + line, 'PUT', {'qty': 3})
+        self.move('入库', 5)
+        self.assertEqual(self.stock(), 5)
+        self.assertIsNone(self.state()['quotes'][0]['price'])
+        self.request('suppliers', 'POST', {'name': '超出权限'}, 403)
+        self.request('shipping/records?channel=other', status=403)
+        self.request('parts', 'POST', {'name': '仅可浏览'}, 403, project=second)
+        self.request('users/' + staff, 'PUT', {'shopify_import': True}, 403)
+        staff_cookie = self.cookie
+        self.cookie = admin
+        self.request(project, 'PUT', {'members': [lead, staff], 'member_roles': {staff: ['engineering']}})
+        self.cookie = staff_cookie
+        self.request('movements', 'POST', {'part_id': self.part, 'type': '入库', 'qty': 1}, 403)
+        self.request('parts/' + self.part, 'PUT', {'notes': '仍可维护物料'})
+
+    def test_shopify_import_role_and_project_shipping_scope(self):
+        account = {'name': '发货经办', 'email': 'shipping@example.test', 'password': 'test-initial-1234'}
+        staff = self.request('users', 'POST', {**account, 'shopify_import': True})['id']
+        second = self.request('projects', 'POST', {'name': '非经办项目'})['id']
+        contact = {'name': '仅主项目可见'}
+        self.request('shipping/records', 'POST', {'channel': 'other', 'reference': '#PRIVATE', 'details': contact},
+                     project=second)
+        self.request('projects/' + self.project_id, 'PUT', {
+            'members': [staff], 'member_roles': {staff: ['shipping']},
+        })
+        self.request('projects/' + second, 'PUT', {'members': [staff], 'member_roles': {staff: []}})
+        scoped_product = self.product()
+        config = {'PLM_SHOPIFY_SHOP': 'test-shop.myshopify.com', 'PLM_SHOPIFY_CLIENT_ID': 'fake',
+                  'PLM_SHOPIFY_CLIENT_SECRET': 'fake'}
+        order_id = 'gid://shopify/Order/371'
+        order = {'id': order_id, 'name': '#SHOP-371', 'createdAt': '2026-11-01T12:00:00Z',
+                 'displayFulfillmentStatus': 'UNFULFILLED', 'cancelledAt': None,
+                 'shippingAddress': {**contact, 'address1': 'Test St', 'countryCodeV2': 'US'}, 'lineItems': {'nodes': []}}
+        path = 'global-shipping/shopify/orders'
+        admin = self.cookie
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': account['password'], 'password': 'ship-updated-1234'})
+        self.request('settings/shopify', status=403, project=False)
+        self.request('shipping/orders/paste', 'POST', {'clipboard': 'Backer Number\tName\n317\t经办收件人'})
+        with patch.dict(os.environ, config), patch.object(app.shopify_orders, 'list_orders', return_value=([order], None)), \
+                patch.object(app.shopify_orders, 'get_orders', return_value={order_id: order}), \
+                patch.object(app.shopify_orders, 'shipment_details', return_value=contact):
+            self.assertEqual(self.request(path, project=False)['rows'][0]['reference'], '#SHOP-371')
+            self.request(path, 'POST', {'ids': [order_id], 'project_id': second}, 403, project=False)
+            record = self.request(path, 'POST', {'ids': [order_id]}, project=False)['created'][0]['record_id']
+        result = self.request('global-shipping/orders', project=False)
+        self.assertEqual([row['order_number'] for row in result['rows']], ['#SHOP-371'])
+        pending = result['rows'][0]['packages'][0]
+        payload = {'version': pending['updated_at'], 'shipment_items': [
+            {'project_id': self.project_id, 'product_id': scoped_product, 'quantity': 1},
+        ]}
+        pending_path = 'global-shipping/shopify/pending/' + record
+        staff_cookie = self.cookie
+        self.cookie = admin
+        self.request('users/' + staff, 'PUT', {'shopify_import': False})
+        self.cookie = staff_cookie
+        self.request(path, status=403, project=False)
+        self.request(pending_path, 'PUT', payload, 403, project=False)
+        self.assertEqual(self.request('global-shipping/orders', project=False)['total'], 0)
+        self.cookie = admin
+        self.request('users/' + staff, 'PUT', {'shopify_import': True})
+        self.cookie = staff_cookie
+        self.request(pending_path, 'PUT', payload, project=False)
+        self.assertEqual(self.request('shipping/records/' + record)['reference'], '#SHOP-371')
+        self.request('shipping/records?channel=other', status=403, project=second)
+
     def test_ks_shipment_uses_order_details_and_explicit_shipping_status(self):
         self.request('shipping/orders/paste', 'POST', {
             'clipboard': 'Backer Number\t收件人\t主机\t底座\n88\t订单收件人\t2\t1\n89\t另一个收件人\t1\t0',
@@ -492,6 +618,8 @@ class IntegrationTests(unittest.TestCase):
             global_orders = 'global-shipping/orders'
             row = self.request(global_orders + '?q=SHOP-123', project=False)['rows'][0]
             record = row['packages'][0]
+            by_number = self.request(global_orders + '?q_field=reference&q=hop-123', project=False)
+            self.assertEqual([package['id'] for order in by_number['rows'] for package in order['packages']], [record_id])
             self.assertIsNone(record['project_id'])
             self.assertEqual(record['reference'], '#SHOP-123')
             self.assertEqual(record['details']['source'], 'Shopify')

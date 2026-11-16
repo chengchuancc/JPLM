@@ -12,12 +12,14 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
 import inspection
+import permissions
 import shipping
 import shopify_orders
 from projects import (
     VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
-    RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, COVER_SIZE_VERSION, IMAGE_NAME_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
+    RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, COVER_SIZE_VERSION, IMAGE_NAME_VERSION,
+    PROJECT_ROLE_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -148,6 +150,11 @@ def init_db(directory=None, bootstrap=None):
             if 'display_name' not in {row['name'] for row in db.execute('PRAGMA table_info(files)')}:
                 db.execute("ALTER TABLE files ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
             assign_existing_image_names(db)
+        if version < PROJECT_ROLE_VERSION:
+            if 'roles' not in {row['name'] for row in db.execute('PRAGMA table_info(project_members)')}:
+                db.execute("ALTER TABLE project_members ADD COLUMN roles TEXT CHECK(roles IS NULL OR json_valid(roles))")
+            if 'shopify_import' not in {row['name'] for row in db.execute('PRAGMA table_info(users)')}:
+                db.execute('ALTER TABLE users ADD COLUMN shopify_import INTEGER NOT NULL DEFAULT 0 CHECK(shopify_import IN (0,1))')
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -498,7 +505,7 @@ RESPONSIBILITIES = {
     'products': 'manager_id', 'parts': 'custodian_id',
     'purchases': 'responsible_id', 'movements': 'handler_id',
 }
-PUBLIC_USER = 'id,name,email,role,phone,must_change,(avatar IS NOT NULL) AS has_avatar'
+PUBLIC_USER = 'id,name,email,role,phone,must_change,shopify_import,(avatar IS NOT NULL) AS has_avatar'
 
 def account_email(value):
     value = str(value or '').strip().lower()
@@ -1012,8 +1019,49 @@ def enter_project(db, project_id, user, write=False):
     db.project_id = project_id
     return dict(project)
 
+
+def require_project_role(db, project_id, user, role, *, delegated=False):
+    if not permissions.can(db, project_id, user, role, delegated=delegated):
+        raise Problem('当前账号没有此项目的操作权限', 403)
+
+
+def save_project_members(db, project_id, owner, data, actor):
+    members = data.get('members')
+    assignments = data.get('member_roles')
+    if not isinstance(members, list) or any(not isinstance(id, str) for id in members):
+        raise Problem('项目成员格式错误')
+    member_ids = set(members) | ({owner} if owner else set())
+    if 'member_roles' in data and (
+        not isinstance(assignments, dict) or set(assignments) - member_ids or
+        any(not isinstance(roles, list) or
+            any(not isinstance(role, str) or role not in permissions.PROJECT_ROLES for role in roles)
+            for roles in assignments.values())
+    ):
+        raise Problem('项目角色格式错误')
+    current = {row['user_id']: row['roles'] for row in db.execute(
+        'SELECT user_id,roles FROM project_members WHERE project_id=?', (project_id,))}
+    if actor['role'] != 'admin':
+        # Keep assignment of project leads at system level, and prevent a
+        # delegated lead from removing another lead or changing their roles.
+        leads = {id for id, roles in current.items() if roles is not None and 'lead' in json.loads(roles)}
+        if not leads <= member_ids or any(
+            ('lead' in roles or id in leads) and set(roles) != set(json.loads(current.get(id) or '[]'))
+            for id, roles in (assignments or {}).items()
+        ):
+            raise Problem('只有系统管理员可以分配或移除项目负责人', 403)
+    for id in member_ids:
+        exists(db, 'users', id)
+    db.executemany('DELETE FROM project_members WHERE project_id=? AND user_id=?',
+                   ((project_id, id) for id in current.keys() - member_ids))
+    for id in member_ids:
+        roles = (json.dumps(sorted(set(assignments[id]))) if assignments is not None and id in assignments
+                 else current.get(id, '[]' if assignments is not None or actor['role'] != 'admin' else None))
+        db.execute('''INSERT INTO project_members(project_id,user_id,roles) VALUES(?,?,?)
+            ON CONFLICT(project_id,user_id) DO UPDATE SET roles=excluded.roles''', (project_id, id, roles))
+    log_activity(db, actor, '修改项目成员与角色', project_id, '项目权限')
+
 def list_projects(db, user):
-    return [dict(row) for row in db.execute("""
+    return [{**dict(row), 'roles': permissions.project_roles(db, row['id'], user)} for row in db.execute("""
         SELECT p.*, u.name AS owner_name, c.updated_at AS cover_version,
             CASE WHEN c.project_id IS NULL THEN (
                 SELECT f.id FROM files AS f
@@ -1263,6 +1311,10 @@ class Handler(BaseHTTPRequestHandler):
         if self.user['role'] != 'admin':
             raise Problem('需要管理员权限', 403)
 
+    def require_shopify_import(self):
+        if not permissions.can_import_shopify(self.user):
+            raise Problem('需要 Shopify 订单导入权限', 403)
+
     def require_admin_password(self, db, password):
         self.require_admin()
         if not isinstance(password, str) or not password:
@@ -1429,9 +1481,13 @@ class Handler(BaseHTTPRequestHandler):
                         return self.send([dict(row) for row in rows])
                     return self.send(list_projects(db, self.user))
                 project = enter_project(db, project_id, self.user)
-                project['members'] = [r[0] for r in db.execute(
-                    'SELECT user_id FROM project_members WHERE project_id=? ORDER BY user_id',
-                    (project_id,))]
+                project['roles'] = permissions.project_roles(db, project_id, self.user)
+                members = db.execute('SELECT user_id,roles FROM project_members WHERE project_id=? ORDER BY user_id',
+                                     (project_id,)).fetchall()
+                project['members'] = [row['user_id'] for row in members]
+                if 'lead' in project['roles']:
+                    project['member_roles'] = {row['user_id']: json.loads(row['roles']) if row['roles'] is not None else None
+                                               for row in members}
                 return self.send(project)
         if method == 'DELETE' and project_id:
             return self.set_project_deleted(project_id, deleted=True)
@@ -1451,13 +1507,17 @@ class Handler(BaseHTTPRequestHandler):
                 db.execute('INSERT INTO projects(id,code,name,owner_id,archived_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',
                            (project_id, automatic_code(db, 'projects', 'PJ'), name, self.user['id'],
                             None, stamp, stamp))
-                db.execute('INSERT INTO project_members VALUES(?,?)', (project_id, self.user['id']))
+                db.execute('INSERT INTO project_members(project_id,user_id,roles) VALUES(?,?,?)',
+                           (project_id, self.user['id'], '[]'))
                 db.project_id = project_id
                 log_activity(db, self.user, '新建项目', project_id, name)
             else:
                 project = enter_project(db, project_id, self.user)
-                if not is_admin and (project['owner_id'] != self.user['id'] or set(data) != {'name'}):
+                if not is_admin and (not permissions.can(db, project_id, self.user, 'lead')
+                                     or set(data) - {'name', 'members', 'member_roles'}):
                     raise Problem('无权修改项目设置', 403)
+                if 'member_roles' in data and 'members' not in data:
+                    raise Problem('请同时提交项目成员')
                 archived_at = project['archived_at']
                 if 'archived' in data:
                     if type(data['archived']) is not bool:
@@ -1470,22 +1530,10 @@ class Handler(BaseHTTPRequestHandler):
                 if owner:
                     exists(db, 'users', owner)
                 if 'members' in data:
-                    members = data['members']
-                    if not isinstance(members, list) or any(not isinstance(id, str) for id in members):
-                        raise Problem('项目成员格式错误')
-                    member_ids = set(members)
-                    for id in member_ids:
-                        exists(db, 'users', id)
-                    current = {r[0] for r in db.execute(
-                        'SELECT user_id FROM project_members WHERE project_id=?', (project_id,))}
-                    if owner:
-                        member_ids.add(owner)
-                    db.executemany('DELETE FROM project_members WHERE project_id=? AND user_id=?',
-                                   ((project_id, id) for id in current - member_ids))
-                    db.executemany('INSERT INTO project_members VALUES(?,?)',
-                                   ((project_id, id) for id in member_ids - current))
+                    save_project_members(db, project_id, owner, data, self.user)
                 if owner:
-                    db.execute('INSERT OR IGNORE INTO project_members VALUES(?,?)', (project_id, owner))
+                    db.execute("INSERT OR IGNORE INTO project_members(project_id,user_id,roles) VALUES(?,?,'[]')",
+                               (project_id, owner))
                 db.execute('UPDATE projects SET name=?,owner_id=?,archived_at=?,updated_at=? WHERE id=?',
                            (name, owner, archived_at, now(), project_id))
                 action = ('归档项目' if archived_at else '恢复项目') if archived_at != project['archived_at'] else '修改项目设置'
@@ -1531,7 +1579,14 @@ class Handler(BaseHTTPRequestHandler):
                 with connect() as db:
                     db.execute('BEGIN')
                     project = enter_project(db, project_id, self.user)
-                    return self.send({**get_state(db), 'project': project})
+                    project['roles'] = permissions.project_roles(db, project_id, self.user)
+                    state = get_state(db)
+                    if not permissions.can(db, project_id, self.user, 'purchasing'):
+                        for quote_row in state['quotes']:
+                            quote_row['price'] = None
+                        for line in state['purchase_lines']:
+                            line['price'] = None
+                    return self.send({**state, 'project': project})
             raise Problem('接口不存在', 404)
         resource = path.split('/')[2]
         if resource in ('users', 'account', 'reset-password'):
@@ -1568,7 +1623,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Problem('请扫描 PLM 物料二维码或输入物料编号')
             project_id, part_id = match[1] or '', match[2]
         with connect() as db:
-            rows = db.execute("""
+            rows = db.execute(f"""
                 WITH matches AS (
                     SELECT p.id, p.code, p.name, p.spec, p.unit, p.stock, p.location, p.external_code,
                            p.project_id, j.name AS project_name,
@@ -1581,7 +1636,8 @@ class Handler(BaseHTTPRequestHandler):
                     FROM parts p JOIN projects j ON j.id=p.project_id
                     WHERE p.deleted_at IS NULL AND j.deleted_at IS NULL AND j.archived_at IS NULL
                       AND (:admin OR EXISTS (SELECT 1 FROM project_members m
-                                            WHERE m.project_id=j.id AND m.user_id=:user))
+                                            WHERE m.project_id=j.id AND m.user_id=:user
+                                            AND {permissions.membership_allows('warehouse')}))
                 )
                 SELECT * FROM matches
                 WHERE (:part<>'' AND id=:part AND (:project='' OR project_id=:project))
@@ -1604,7 +1660,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def warehouse_history(self):
         with connect() as db:
-            rows = db.execute("""
+            rows = db.execute(f"""
                 SELECT m.*, p.code AS part_code, p.name AS part_name, p.unit, j.name AS project_name,
                        (j.archived_at IS NULL AND p.deleted_at IS NULL) AS can_delete
                 FROM movements m JOIN parts p ON p.id=m.part_id AND p.project_id=m.project_id
@@ -1612,7 +1668,8 @@ class Handler(BaseHTTPRequestHandler):
                 WHERE m.handler_id=? AND m.deleted_at IS NULL AND j.deleted_at IS NULL
                   AND m.type IN ('入库','出库','报废')
                   AND (? OR EXISTS (SELECT 1 FROM project_members pm
-                                   WHERE pm.project_id=m.project_id AND pm.user_id=?))
+                                   WHERE pm.project_id=m.project_id AND pm.user_id=?
+                                   AND {permissions.membership_allows('warehouse', 'pm')}))
                 ORDER BY m.created_at DESC, m.id DESC LIMIT 30
             """, (self.user['id'], self.user['role'] == 'admin', self.user['id'])).fetchall()
         fields = ('id', 'type', 'project_id', 'project_name', 'part_code', 'part_name',
@@ -1627,7 +1684,7 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict) or not isinstance(data.get('expected'), dict):
             raise Problem('请刷新流水记录后重试')
         with FILE_LOCK, transaction() as db:
-            self.inspection_writer(db, required(data.get('project_id'), '项目'))
+            self.project_writer(db, required(data.get('project_id'), '项目'), 'warehouse')
             row = exists(db, 'movements', movement_id)
             if row['handler_id'] != self.user['id'] or row['type'] not in ('入库', '出库', '报废'):
                 raise Problem('只能删除当前账户的出入库或报废记录', 403)
@@ -1654,6 +1711,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Problem('请先登录', 401)
             project = required(data.get('project_id'), '项目')
             enter_project(db, project, self.user, write=True)
+            require_project_role(db, project, self.user, 'warehouse')
             key = 'warehouse-' + request_id
             fingerprint = hashlib.sha256(json.dumps([self.user['id'], part_id, kind, qty]).encode()).hexdigest()
             saved = db.execute('SELECT fingerprint,result FROM import_runs WHERE project_id=? AND id=?',
@@ -1696,7 +1754,7 @@ class Handler(BaseHTTPRequestHandler):
             route = item_path or record_path
             project = route[1] if route else shipping.string(data.get('project_id'), 100)
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project)
+                self.project_writer(db, project, 'shipping')
                 allowed = shipping.accessible_projects(db, self.user)
                 writable = {key for key, p in allowed.items() if not p['archived_at']}
                 stamp = now()
@@ -1739,7 +1797,7 @@ class Handler(BaseHTTPRequestHandler):
         raise Problem('接口不存在', 404)
 
     def shopify_pending_shipment(self, record_id, method):
-        self.require_admin()
+        self.require_shopify_import()
         payload = self.body()
         if not isinstance(payload, dict):
             raise Problem('发货记录格式无效')
@@ -1747,7 +1805,7 @@ class Handler(BaseHTTPRequestHandler):
             self.user = self.authorized(db)
             if not self.user or self.user['must_change']:
                 raise Problem('请先登录', 401)
-            self.require_admin()
+            self.require_shopify_import()
             pending = db.execute('SELECT * FROM shipping_pending_shopify WHERE id=?', (record_id,)).fetchone()
             if not pending or payload.get('version') != pending['created_at']:
                 raise Problem('订单已更新，请刷新后重试', 409)
@@ -1757,7 +1815,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not isinstance(items, list) or not items or not isinstance(items[0], dict):
                     raise Problem('请先选择发货商品')
                 project = shipping.string(items[0].get('project_id'), 100)
-                self.inspection_writer(db, project)
+                self.project_writer(db, project, 'shipping')
                 projects = shipping.accessible_projects(db, self.user)
                 writable = {id for id, entry in projects.items() if not entry['archived_at']}
                 reference = shipping.string(payload.get('reference', pending['reference']), 150)
@@ -1778,8 +1836,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.send({'id': record_id})
 
     def shopify_order_import(self, method):
-        if self.user['role'] != 'admin':
-            raise Problem('需要管理员权限', 403)
+        self.require_shopify_import()
         config = shopify_orders.configuration(DATA)
         if method == 'GET':
             query = parse_qs(urlparse(self.path).query)
@@ -1810,7 +1867,7 @@ class Handler(BaseHTTPRequestHandler):
         ids = list(dict.fromkeys(ids))
         with connect() as db:
             if project:
-                self.inspection_writer(db, project)
+                self.project_writer(db, project, 'shipping')
             existing = shopify_orders.existing_sources(db, config, ids)
         pending = [id for id in ids if shopify_orders.source_id(config, id) not in existing]
         orders = shopify_orders.get_orders(config, pending) if pending else {}
@@ -1833,9 +1890,9 @@ class Handler(BaseHTTPRequestHandler):
             self.user = self.authorized(db)
             if not self.user or self.user['must_change']:
                 raise Problem('请先登录', 401)
-            self.require_admin()
+            self.require_shopify_import()
             if project:
-                enter_project(db, project, self.user, write=True)
+                self.project_writer(db, project, 'shipping')
             projects = shipping.accessible_projects(db, self.user)
             existing = shopify_orders.existing_sources(db, config, ids)
             stamp = now()
@@ -1874,6 +1931,8 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as db:
                 db.execute('BEGIN')
                 enter_project(db, project_id, self.user)
+                if resource not in ('devices', 'device-records'):
+                    require_project_role(db, project_id, self.user, 'shipping')
                 if resource == 'orders':
                     return self.send(shipping.list_orders(db, project_id, query))
                 if order_path:
@@ -1899,9 +1958,14 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send(shipping.list_sources(db, project_id))
                 if resource == 'device-records':
                     serial = shipping.string(query.get('serial'), 100)
-                    return self.send(shipping.for_device(db, project_id, serial))
+                    links = shipping.for_device(db, project_id, serial)
+                    if not permissions.can(db, project_id, self.user, 'shipping'):
+                        for link in links:
+                            link['recipient'] = ''
+                    return self.send(links)
         if resource in ('orders/preview', 'orders/import') and method == 'POST':
-            self.require_admin()
+            with connect() as db:
+                self.project_writer(db, project_id, 'shipping', delegated=True)
             _, uploads = self.multipart()
             if len(uploads) != 1:
                 raise Problem('请选择一个 KS 订单文件')
@@ -1910,13 +1974,12 @@ class Handler(BaseHTTPRequestHandler):
             if resource == 'orders/preview':
                 with connect() as db:
                     db.execute('BEGIN')
-                    enter_project(db, project_id, self.user, write=True)
+                    self.project_writer(db, project_id, 'shipping', delegated=True)
                     return self.send(shipping.apply_orders(db, project_id, entries, invalid, duplicate, now(), uid))
             if invalid:
                 raise Problem('文件中有无效订单，请先修正再导入')
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
-                self.require_admin()
+                self.project_writer(db, project_id, 'shipping', delegated=True)
                 report = shipping.apply_orders(db, project_id, entries, invalid, duplicate, now(), uid, commit=True)
                 if report['added'] or report['updated']:
                     touch_project(db)
@@ -1924,13 +1987,11 @@ class Handler(BaseHTTPRequestHandler):
                                  f"新增 {report['added']} 条，更新 {report['updated']} 条")
             return self.send(report)
         if (resource == 'orders/paste' and method == 'POST') or (order_path and method == 'PUT'):
-            self.require_admin()
             data = self.body()
             if not isinstance(data, dict):
                 raise Problem('KS 订单数据格式无效')
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
-                self.require_admin()
+                self.project_writer(db, project_id, 'shipping', delegated=True)
                 if order_path:
                     result = shipping.edit_order(db, project_id, order_path[1], data.get('version'), data.get('details'), now())
                     log_activity(db, self.user, '编辑 KS 订单', result['id'], 'Backer #' + result['backer'])
@@ -1947,7 +2008,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise Problem('发货记录格式无效')
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
+                self.project_writer(db, project_id, 'shipping')
                 deleted = method == 'DELETE'
                 row = shipping.set_shipment_deleted(db, project_id, (record_path or restore_path)[1],
                                                      data.get('version'), now(), deleted)
@@ -1960,7 +2021,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise Problem('发货商品格式无效')
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
+                self.project_writer(db, project_id, 'shipping')
                 row = shipping.get_shipment(db, project_id, shared_path[1], local=True)
                 if not row.get('shared') or not row['can_edit_items']:
                     raise Problem('此记录无法在当前项目修改', 409)
@@ -1974,7 +2035,7 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(data, dict):
                 raise Problem('发货记录格式无效')
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
+                self.project_writer(db, project_id, 'shipping')
                 result = shipping.save_shipment(db, project_id, record_path[1] if record_path else uid(),
                                                 data, now(), self.user['id'])
                 touch_project(db)
@@ -1998,6 +2059,10 @@ class Handler(BaseHTTPRequestHandler):
                     shipments = shipping.device_shipments(
                         db, project_id, [device['serial'] for device in devices], shipped_only=True,
                     )
+                    if not permissions.can(db, project_id, self.user, 'shipping'):
+                        for links in shipments.values():
+                            for link in links:
+                                link['recipient'] = ''
                     for device in devices:
                         device['shipments'] = shipments.get(device['serial'], [])
                     return self.send(page)
@@ -2012,7 +2077,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem('接口不存在', 404)
                 config = inspection.template(db, project_id, query.get('template'))
                 if query.get('deleted') == '1':
-                    self.require_admin()
+                    require_project_role(db, project_id, self.user, 'inspection', delegated=True)
                 if resource == 'options':
                     return self.send(inspection.list_options(db, project_id, config))
                 if resource == 'lookup':
@@ -2036,9 +2101,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.inspection_download(payload, name, as_csv)
 
         if resource in ('import-preview', 'import') and method == 'POST':
-            self.require_admin()
             with connect() as db:
-                enter_project(db, project_id, self.user, write=True)
+                self.project_writer(db, project_id, 'inspection', delegated=True)
             fields, uploads = self.multipart()
             if len(uploads) != 1:
                 raise Problem('请选择一个检测数据文件')
@@ -2046,13 +2110,12 @@ class Handler(BaseHTTPRequestHandler):
             if method == 'POST' and resource == 'import-preview':
                 with connect() as db:
                     db.execute('BEGIN')
-                    enter_project(db, project_id, self.user, write=True)
+                    self.project_writer(db, project_id, 'inspection', delegated=True)
                     config = inspection.template(db, project_id, fields.get('template'))
                     _, report = inspection.import_batch(db, project_id, config, blob, filename, now())
                     return self.send({**report, 'revision': config['revision']})
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
-                self.require_admin()
+                self.project_writer(db, project_id, 'inspection', delegated=True)
                 config = inspection.template(db, project_id, fields.get('template'))
                 if fields.get('revision') != str(config['revision']):
                     raise Problem('检测表已更新，请重新预览后再导入', 409)
@@ -2071,7 +2134,7 @@ class Handler(BaseHTTPRequestHandler):
         if resource == 'devices' and method == 'POST':
             data = self.body()
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
+                self.project_writer(db, project_id, 'inspection')
                 mode = (inspection.template(db, project_id, data['template_id'])['serial_mode']
                         if data.get('template_id') else 'text')
                 serial, prefix, produced = inspection.parse_serial(data.get('serial'), mode)
@@ -2086,8 +2149,7 @@ class Handler(BaseHTTPRequestHandler):
         if resource == 'options' and method == 'PUT':
             data = self.body()
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
-                self.require_admin()
+                self.project_writer(db, project_id, 'inspection', delegated=True)
                 config = inspection.template(db, project_id, data.get('template_id'))
                 inspection.hide_option(db, project_id, config, data, now())
                 touch_project(db)
@@ -2099,8 +2161,7 @@ class Handler(BaseHTTPRequestHandler):
                               (method == 'POST' and record_action[2])):
             deleted = method == 'DELETE'
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
-                self.require_admin()
+                self.project_writer(db, project_id, 'inspection', delegated=True)
                 row = inspection.set_record_deleted(db, project_id, record_action[1], deleted, now())
                 if bool(row['deleted_at']) != deleted:
                     touch_project(db)
@@ -2114,14 +2175,14 @@ class Handler(BaseHTTPRequestHandler):
         ):
             data = self.body()
             with FILE_LOCK, transaction() as db:
-                self.inspection_writer(db, project_id)
+                self.project_writer(db, project_id, 'inspection')
                 if resource == 'records':
                     config = inspection.template(db, project_id, data.get('template_id'))
                     record = inspection.save_record(db, project_id, config, data, self.user, now(), uid())
                     log_activity(db, self.user, '保存生产检测', record['id'], record['serial'], record['result'])
                     response = record
                 else:
-                    self.require_admin()
+                    require_project_role(db, project_id, self.user, 'inspection', delegated=True)
                     template_id = resource.split('/')[1] if editing else uid()
                     existing = inspection.template(db, project_id, template_id) if editing else None
                     response = inspection.save_template(db, project_id, template_id, data, now(), existing)
@@ -2131,11 +2192,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(response)
         raise Problem('接口不存在', 404)
 
-    def inspection_writer(self, db, project_id):
+    def project_writer(self, db, project_id, role, *, delegated=False):
         self.user = self.authorized(db)
         if not self.user or self.user['must_change']:
             raise Problem('请先登录', 401)
         enter_project(db, project_id, self.user, write=True)
+        require_project_role(db, project_id, self.user, role, delegated=delegated)
 
     def inspection_download(self, payload, name, as_csv):
         content_type = ('text/csv; charset=utf-8' if as_csv else
@@ -2167,7 +2229,7 @@ class Handler(BaseHTTPRequestHandler):
             with connect() as db:
                 db.execute('BEGIN')
                 project = enter_project(db, project_id, self.user, write=True)
-                if self.user['role'] != 'admin' and project['owner_id'] != self.user['id']:
+                if not permissions.can(db, project_id, self.user, 'lead'):
                     raise Problem('无权修改项目封面', 403)
             if self.body_size() > MAX_COVER + 65536:
                 raise Problem('项目封面不能超过 4 MB', 413)
@@ -2185,7 +2247,7 @@ class Handler(BaseHTTPRequestHandler):
             if not user or user['must_change']:
                 raise Problem('请先登录', 401)
             project = enter_project(db, project_id, user, write=True)
-            if user['role'] != 'admin' and project['owner_id'] != user['id']:
+            if not permissions.can(db, project_id, user, 'lead'):
                 raise Problem('无权修改项目封面', 403)
             if method == 'POST':
                 db.execute('''INSERT INTO project_covers VALUES(?,?,?,?)
@@ -2298,6 +2360,8 @@ class Handler(BaseHTTPRequestHandler):
             self.require_admin()
             if method == 'POST' and not id:
                 user_id = create_account(db, data)
+                if 'shopify_import' in data:
+                    self.set_shopify_permission(db, user_id, data['shopify_import'])
                 log_activity(db, actor, '新增用户', user_id, account_name(data.get('name')))
                 return {'id': user_id}
             if method == 'PUT' and id:
@@ -2307,6 +2371,8 @@ class Handler(BaseHTTPRequestHandler):
                 if db.execute('SELECT 1 FROM users WHERE email=? AND id<>?', (email, id)).fetchone():
                     raise Problem('邮箱已使用', 409)
                 db.execute('UPDATE users SET name=?,email=? WHERE id=?', (name, email, id))
+                if 'shopify_import' in data:
+                    self.set_shopify_permission(db, id, data['shopify_import'])
                 log_activity(db, actor, '修改用户', id, name)
                 return {'id': id}
         if resource == 'reset-password' and method == 'POST' and id:
@@ -2343,6 +2409,15 @@ class Handler(BaseHTTPRequestHandler):
                 return {'ok': True}
         raise Problem('不支持的账户操作', 405)
 
+    def set_shopify_permission(self, db, user_id, enabled):
+        if type(enabled) is not bool:
+            raise Problem('Shopify 导入权限格式错误')
+        result = db.execute('UPDATE users SET shopify_import=? WHERE id=? AND shopify_import<>?',
+                            (enabled, user_id, enabled))
+        if result.rowcount:
+            user = exists(db, 'users', user_id)
+            log_activity(db, self.user, '修改 Shopify 导入权限', user_id, user['name'], '开启' if enabled else '关闭')
+
     def change_part_suppliers(self, db, part_id, changes):
         if not isinstance(changes, dict) or changes.keys() - {'add', 'remove', 'create'}:
             raise Problem('供应商关联格式错误')
@@ -2350,6 +2425,8 @@ class Handler(BaseHTTPRequestHandler):
         if any(not isinstance(items, list) or any(not isinstance(value, str) or not value.strip()
                                                    for value in items) for items in (add, remove, names)):
             raise Problem('供应商关联格式错误')
+        if add or remove or names:
+            require_project_role(db, db.project_id, self.user, 'purchasing')
         linked = dict.fromkeys(add)
         for name in dict.fromkeys(name.strip() for name in names):
             matches = db.execute('SELECT id FROM suppliers WHERE project_id=? AND name=? COLLATE NOCASE LIMIT 2',
@@ -2391,6 +2468,16 @@ class Handler(BaseHTTPRequestHandler):
             return self.mutate_account(db, resource, id, method, d)
         if not db.project_id:
             raise Problem('请先选择项目', 404)
+        if resource in ('suppliers', 'quotes', 'purchases'):
+            require_project_role(db, db.project_id, self.user, 'purchasing')
+        elif resource == 'movements' or (
+            resource in ('parts', 'material-cells') and method == 'PUT' and set(d) == {'location'}
+            and not permissions.can(db, db.project_id, self.user, 'engineering')
+        ):
+            require_project_role(db, db.project_id, self.user, 'warehouse')
+        elif resource in ('products', 'parts', 'material-cells', 'material-links', 'material-children', 'material-parents',
+                          'bom-versions', 'bom-lines', 'bom-materials', 'bom-import', 'electronic-import', 'files', 'deleted-parts'):
+            require_project_role(db, db.project_id, self.user, 'engineering')
         if resource=='electronic-import' and id=='commit' and method=='POST': return self.commit_electronic_import(db,d)
         if resource=='material-cells' and method=='PUT':
             allowed={'spec','unit','price','min_stock','location','notes','category','material_level','external_code','brand'}
@@ -2624,7 +2711,7 @@ class Handler(BaseHTTPRequestHandler):
         except (ElectronicBomError,ValueError,KeyError,RuntimeError) as exc: raise Problem(str(exc))
         with connect() as db:
             db.execute('BEGIN')
-            enter_project(db, project_id, self.user, write=True)
+            self.project_writer(db, project_id, 'engineering')
             candidates=electronic_candidates(db)
             for row in result['rows']:
                 try:
@@ -2743,7 +2830,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def upload(self, project_id):
         with connect() as db:
-            enter_project(db, project_id, self.user, write=True)
+            self.project_writer(db, project_id, 'engineering')
         slot = large_upload_slot() if self.body_size() > MAX_UPLOAD else nullcontext()
         with slot, tempfile.TemporaryDirectory(dir=DATA) as folder:
             directory = Path(folder)
@@ -2775,6 +2862,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not user or user['must_change']:
                     raise Problem('请先登录', 401)
                 enter_project(db, project_id, user, write=True)
+                require_project_role(db, project_id, user, 'engineering')
                 record = exists(db, owner, owner_id)
                 db.execute(f'UPDATE {owner} SET updated_at=? WHERE id=?', (now(), owner_id))
                 old = None
@@ -3027,11 +3115,12 @@ class Handler(BaseHTTPRequestHandler):
                 raise Problem('请重新登录管理员账户', 403)
             if version == 6:
                 # Legacy archives predate user accounts. Keep the current directory.
-                recovered.executemany('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?)',
+                recovered.executemany('INSERT INTO users VALUES(?,?,?,?,?,?,?,?,?,?,?)',
                                       live.execute('SELECT * FROM users'))
                 recovered.execute('UPDATE projects SET owner_id=? WHERE id=?',
                                   (admin['id'], LEGACY_PROJECT_ID))
-                recovered.execute('INSERT INTO project_members SELECT p.id,u.id FROM projects p CROSS JOIN users u WHERE p.id=?',
+                recovered.execute('''INSERT INTO project_members(project_id,user_id)
+                    SELECT p.id,u.id FROM projects p CROSS JOIN users u WHERE p.id=?''',
                                   (LEGACY_PROJECT_ID,))
             for row in live.execute("SELECT key,value FROM settings WHERE key LIKE 'sequence_%'"):
                 current = recovered.execute('SELECT value FROM settings WHERE key=?', (row['key'],)).fetchone()

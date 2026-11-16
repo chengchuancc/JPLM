@@ -8,6 +8,7 @@ import { CarrierTags, CountryTag, costs, otherContactFields, shipmentStatuses, S
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import { ShippingPicker } from "./shipping-options";
 import { ShippingTableHeader } from "./shipping-table-header";
+import { ShippingSearchFieldPicker, type ShippingSearchField } from "./shipping-search";
 import { columnClass, groupedFields, type ShippingColumn } from "./shipping-columns";
 import { restoreListPages, usePageState } from "./navigation";
 import { useShipmentRowLocation } from "./shipping-location";
@@ -252,15 +253,17 @@ function OrderEditor({ request, projectRequest, projects, products, editor, clos
   </Dialog>;
 }
 
-export default function GlobalShipping({ request, projectRequest, onDraftChange, initialRecord = "", admin }: {
+export default function GlobalShipping({ request, projectRequest, onDraftChange, initialRecord = "", canImportShopify }: {
   request: Request; projectRequest: (project: string) => Request; onDraftChange: (dirty: boolean) => void;
-  initialRecord?: string; admin: boolean;
+  initialRecord?: string; canImportShopify: boolean;
 }) {
   const [visited, setVisited] = usePageState("global-shipping.visited", false);
   const restored = useRef(visited).current;
   const [data, setData] = useState<Page>();
   const [q, setQuery] = usePageState("global-shipping.q", "");
   const [search, setSearch] = usePageState("global-shipping.search", "");
+  const [field, setField] = usePageState<ShippingSearchField>("global-shipping.field", "");
+  const [searchField, setSearchField] = usePageState<ShippingSearchField>("global-shipping.searchField", "");
   const [project, setProject] = usePageState("global-shipping.project", "");
   const [status, setStatus] = usePageState("global-shipping.status", "");
   const [range, setRange] = usePageState("global-shipping.range", { first: 1, last: 1 });
@@ -313,7 +316,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     moreRequest.current = false;
     scrollAnchor.current = undefined;
     setBusy(true); setError(""); setMoreError(""); setLoadingMore(false);
-    const query = new URLSearchParams({ q: search, project, status });
+    const query = new URLSearchParams({ q: search, q_field: searchField, project, status });
     if (pending.current) query.set("locate", pending.current);
     const savedRange = restoreRange.current;
     restoreListPages(savedRange, (number) => {
@@ -334,7 +337,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
       setData(value);
     }, (e) => { if (active) setError(e.message); }).finally(() => { if (active) setBusy(false); });
     return () => { active = false; if (epoch === generation.current) generation.current++; };
-  }, [request, search, project, status, revision]);
+  }, [request, search, searchField, project, status, revision]);
   useLayoutEffect(() => {
     const anchor = scrollAnchor.current;
     const container = grid.current;
@@ -357,7 +360,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
       const epoch = generation.current;
       moreRequest.current = true;
       setLoadingMore(true);
-      const query = new URLSearchParams({ q: search, project, status, page: String(target) });
+      const query = new URLSearchParams({ q: search, q_field: searchField, project, status, page: String(target) });
       request("global-shipping/orders?" + query).then((next: Page) => {
         if (epoch !== generation.current) return;
         if (direction < 0 && grid.current) {
@@ -377,7 +380,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     if (hasEarlier && top.current) observer.observe(top.current);
     if (hasLater && tail.current) observer.observe(tail.current);
     return () => observer.disconnect();
-  }, [data, busy, loadingMore, moreError, error, range, request, search, project, status]);
+  }, [data, busy, loadingMore, moreError, error, range, request, search, searchField, project, status]);
   useEffect(() => {
     let active = true;
     request("global-shipping/products").then((result) => { if (active) setCatalog(result); },
@@ -386,9 +389,12 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   }, [request, revision]);
 
   function resetFocus() { restoreRange.current = null; pending.current = ""; setFocused(""); grid.current?.scrollTo({ top: 0 }); }
+  function clearSearch() {
+    setSearch(""); setQuery(""); setField(""); setSearchField("");
+  }
   function afterSave(id: string) {
     setEditor(undefined); setNotice("发货记录已保存");
-    setSearch(""); setQuery(""); setProject(""); setStatus("");
+    clearSearch(); setProject(""); setStatus("");
     pending.current = id; setFocused(id); setRevision((value) => value + 1);
   }
   async function remove(row: RecordRow) {
@@ -400,7 +406,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
       await request(path, "DELETE", { version: row.updated_at });
       if (focused === row.id) setFocused("");
       const next = data?.rows.flatMap((order) => order.packages).find((candidate) => candidate.id !== row.id);
-      pending.current = next?.id || "";
+      pending.current = search && searchField ? "" : next?.id || "";
       setRevision((value) => value + 1);
       setNotice("已删除。" + recovery);
     } catch (e) { setError((e as Error).message); }
@@ -409,10 +415,13 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
   return <section className="shipping-management">
     <div className="shipping-header"><h1>全局发货</h1></div>
     <div className="shipping-toolbar">
-      <form className="shipping-tools" onSubmit={(event) => {
-        event.preventDefault(); resetFocus(); setSearch(q.trim());
+      <form className="shipping-tools shipping-search" onSubmit={(event) => {
+        event.preventDefault(); resetFocus(); setSearch(q.trim()); setSearchField(field);
+        if (field && q.trim()) setOpened({});
       }}>
-        <input aria-label="搜索订单" placeholder="订单号、姓名、运单号或商品" value={q} onChange={(event) => setQuery(event.target.value)} />
+        <ShippingSearchFieldPicker value={field} onChange={setField} reference="订单号" />
+        <input aria-label="搜索订单" placeholder={field === "reference" ? "输入部分订单号" : "订单号、姓名、运单号或商品"}
+          value={q} onChange={(event) => setQuery(event.target.value)} />
         <button type="submit" className="btn"><Search size={15} />搜索</button>
       </form>
       <div className="shipping-tools global-shipping-filters">
@@ -425,7 +434,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
           choices={[{ value: "", label: "全部项目", tone: "slate" }, ...projects.map((p) => ({ value: p.id, label: p.name }))]} />
         <TableOptionPicker label="订单发货状态" value={status} onChange={(value) => { resetFocus(); setStatus(value); }}
           choices={[{ value: "", label: "全部状态", tone: "slate" }, ...shipmentStatuses]} />
-        {admin && <button className="btn" type="button" onClick={() => { setNotice(""); setShopifyOpen(true); }}>
+        {canImportShopify && <button className="btn" type="button" onClick={() => { setNotice(""); setShopifyOpen(true); }}>
           <Download size={15} />导入订单
         </button>}
         {canCreate && <button className="btn primary" type="button" onClick={() => { setNotice(""); setEditor({}); }}>
@@ -444,10 +453,11 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
           const records = orderRows(order);
           const hasChildren = records.length > 1;
           const root = records[0]?.row;
-          const term = search.replace(/^#/, "").toLowerCase();
-          const rootMatchesSearch = !term || !!root && [root.reference, root.tracking, root.details?.name,
-            ...root.shipment_items.flatMap((item) => [item.name, item.code])].some((value) =>
-            String(value ?? "").toLowerCase().includes(term));
+          const term = search.replace(searchField === "reference" ? /^#+/ : /^#/, "").toLowerCase();
+          const searchValues = searchField === "reference" ? [root?.reference, order.order_number] :
+            root ? [root.reference, root.tracking, root.details?.name,
+              ...root.shipment_items.flatMap((item) => [item.name, item.code])] : [];
+          const rootMatchesSearch = !term || searchValues.some((value) => String(value ?? "").toLowerCase().includes(term));
           const rootMatchesStatus = !status || !!root?.shipped === (status === "shipped");
           const expanded = hasChildren && (opened[order.order_key] ?? (!rootMatchesSearch || !rootMatchesStatus));
           return <Fragment key={order.order_key}>{(expanded ? records : records.slice(0, 1)).map(({ row, depth }, subIndex) =>
@@ -500,7 +510,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     {shopifyOpen && <ShopifyOrderImport request={request} close={() => setShopifyOpen(false)} imported={(count, complete) => {
         if (complete) setShopifyOpen(false);
         resetFocus();
-        setQuery(""); setSearch(""); setProject(""); setStatus("");
+        clearSearch(); setProject(""); setStatus("");
         setRevision((value) => value + 1);
         setNotice(`已导入 ${count} 笔 Shopify 订单`);
       }} />}

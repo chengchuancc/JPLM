@@ -27,9 +27,16 @@ main:has(> .shipping-management) > .main-footer { margin-top: 0; padding-block: 
   flex: 1 1 335px; min-width: 0; max-width: 465px; flex-wrap: nowrap;
 }
 .shipping-toolbar > form > input { flex: 1 1 0; width: 0; min-width: 0; }
-.shipping-toolbar > form > .material-category-trigger, .shipping-toolbar .btn { flex-shrink: 0; }
-.shipping-toolbar > form > :is(input, .material-category-trigger), .shipping-toolbar .btn {
+.shipping-toolbar > form > :is(.material-category-trigger, .shipping-search-field), .shipping-toolbar .btn { flex-shrink: 0; }
+.shipping-toolbar > form > :is(input, .material-category-trigger, .shipping-search-field), .shipping-toolbar .btn {
   height: 32px; min-height: 32px; padding: 0 9px; font-size: 12px;
+}
+@media (max-width: 520px) {
+  .shipping-toolbar > .shipping-search:has(.material-category-trigger) {
+    display: grid; grid-template-columns: max-content minmax(0, 1fr);
+  }
+  .shipping-toolbar > .shipping-search:has(.material-category-trigger) > input { width: 100%; }
+  .shipping-toolbar > .shipping-search:has(.material-category-trigger) > button[type="submit"] { justify-self: end; }
 }
 .shipping-table {
   --shipping-group-height: 26px;

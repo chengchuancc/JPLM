@@ -68,7 +68,7 @@ export type PurchaseLine = {
   purchase_id: string;
   part_id: string;
   qty: number;
-  price: number;
+  price: number | null;
   received: number;
 };
 export type Movement = {
@@ -114,6 +114,8 @@ export type MaterialLink = {
 };
 export type CodeAlias = { code: string; part_id: string };
 export type UserOption = { id: string; name: string };
+export type ProjectRole = "lead" | "engineering" | "purchasing" | "warehouse" | "inspection" | "shipping";
+export type ProjectAccess = ProjectRole | "legacy";
 export type ProjectSummary = {
   id: string;
   code: string;
@@ -125,9 +127,11 @@ export type ProjectSummary = {
   cover_file_id: string | null;
   pending_purchases: number;
   updated_at: string;
+  roles: ProjectAccess[];
 };
 export type ProjectDetails = Omit<ProjectSummary, "owner_name" | "pending_purchases" | "cover_version" | "cover_file_id"> & {
   members: string[];
+  member_roles?: Record<string, ProjectRole[] | null>;
 };
 export type User = UserOption & {
   email: string;
@@ -135,6 +139,7 @@ export type User = UserOption & {
   phone: string;
   must_change: number;
   has_avatar: number;
+  shopify_import: number;
 };
 export type Activity = {
   id: number;
