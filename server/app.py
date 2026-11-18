@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """捷程未来PLM：仅依赖 Python 3.10+ 标准库。"""
-import argparse, hashlib, hmac, io, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil, tempfile, zipfile
+import argparse, hashlib, hmac, io, ipaddress, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil, tempfile, zipfile
 import unicodedata
 from contextlib import ExitStack, contextmanager, nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
 from email.policy import default
 from http import cookies
@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, quote, urlparse, unquote
 from electronic_import import parse_electronic_file, ElectronicBomError
 import inspection
 import permissions
+import scanner_devices
 import shipping
 import shopify_orders
 from projects import (
@@ -108,6 +109,7 @@ def init_db(directory=None, bootstrap=None):
             raise RuntimeError('数据库版本高于当前程序版本')
         if version == VERSION:
             db.execute(shipping.PENDING_SHOPIFY_SCHEMA)
+            scanner_devices.initialize(db)
             if bootstrap:
                 if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
                     raise Problem('管理员已初始化')
@@ -155,6 +157,7 @@ def init_db(directory=None, bootstrap=None):
                 db.execute("ALTER TABLE project_members ADD COLUMN roles TEXT CHECK(roles IS NULL OR json_valid(roles))")
             if 'shopify_import' not in {row['name'] for row in db.execute('PRAGMA table_info(users)')}:
                 db.execute('ALTER TABLE users ADD COLUMN shopify_import INTEGER NOT NULL DEFAULT 0 CHECK(shopify_import IN (0,1))')
+        scanner_devices.initialize(db)
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -1090,6 +1093,7 @@ def write_backup(output):
             with connect() as source:
                 source.backup(target)
             target.execute('DELETE FROM sessions')
+            target.execute('DELETE FROM scanner_sessions')
             files = target.execute('SELECT id FROM files').fetchall()
         with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
             archive.write(database, 'plm.sqlite3')
@@ -1147,17 +1151,22 @@ def stage_restore(archive_path, directory):
                 raise Problem('备份缺少业务数据表')
             if project_tables and 'shipping_pending_shopify' in source_tables:
                 shipping_tables += ('shipping_pending_shopify',)
+            scanner_tables = scanner_devices.BACKUP_TABLES if project_tables and 'scanner_devices' in source_tables else ()
+            if not set(scanner_tables) <= source_tables:
+                raise Problem('备份缺少扫码枪数据表')
             (init_db if project_tables else init_legacy_db)(staged)
             with connect(staged) as db:
                 db.execute('BEGIN')
                 db.execute('PRAGMA defer_foreign_keys=ON')
                 for table in ('users', *project_tables, *category_tables, *TABLES, *inspection_tables, *shipping_tables,
-                              'settings', 'import_runs', 'activity'):
+                              *scanner_tables, 'settings', 'import_runs', 'activity'):
                     if table not in source_tables or (version == 6 and table in ('users', 'activity')):
                         continue
                     target_columns = [row['name'] for row in db.execute(f'PRAGMA table_info({table})')]
                     source_columns = {row['name'] for row in source.execute(f'PRAGMA table_info({table})')}
                     optional = {RESPONSIBILITIES.get(table)} if version == 6 else set()
+                    if table == 'scanner_devices':
+                        optional.update(('pending', 'enrolled_from'))
                     if table == 'parts' and version < 8:
                         optional.add('deleted_at')
                     if table == 'projects' and version < 11:
@@ -1302,6 +1311,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def authorized(self, db):
+        if getattr(self, 'warehouse_request', False) and self.headers.get('Authorization'):
+            return scanner_devices.operator_session(db, self.headers['Authorization'])
         return db.execute(
             f'SELECT {PUBLIC_USER} FROM users WHERE id=(SELECT user_id FROM sessions WHERE token=? AND expires>?)',
             (self.session_token(), time.time()),
@@ -1340,6 +1351,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self): self.handle_request('PUT')
     def do_DELETE(self): self.handle_request('DELETE')
     def handle_request(self, method):
+        self.warehouse_request = False
         try:
             path = unquote(urlparse(self.path).path)
             if BASE_PATH:
@@ -1347,6 +1359,11 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem('路径不存在', 404)
                 path = path[len(BASE_PATH):]
             asset_path = re.fullmatch(r'/api/assets/(file|cover|avatar)/([0-9a-f]{24}|legacy)', path)
+            scanner_image = (
+                re.fullmatch(r'/files/([0-9a-f]{24})', path)
+                if method in ('GET', 'HEAD') and parse_qs(urlparse(self.path).query).get('scanner_thumb') == ['1']
+                else None
+            )
             if method == 'HEAD' and not asset_path and not re.fullmatch(r'/files/[0-9a-f]{24}', path):
                 raise Problem('接口不存在', 404)
             if method not in ('GET', 'HEAD'):
@@ -1362,6 +1379,12 @@ class Handler(BaseHTTPRequestHandler):
                                   'user': dict(user) if user else None})
             if path in ('/api/auth/setup', '/api/auth/login') and method == 'POST':
                 return self.auth(path)
+            if (path, method) in (('/api/scanner/operators', 'POST'), ('/api/scanner/session', 'POST')):
+                return self.scanner_operator(path.endswith('/session'))
+            movement_delete = re.fullmatch(r'/api/warehouse/movements/([a-f0-9]{24})', path) if method == 'DELETE' else None
+            self.warehouse_request = (
+                (path, method) in (('/api/warehouse/material', 'GET'), ('/api/warehouse/movements', 'GET'),
+                                   ('/api/warehouse/movements', 'POST')) or movement_delete is not None or scanner_image is not None)
             if path.startswith(('/api/', '/files/')):
                 with connect() as db:
                     self.user = self.authorized(db)
@@ -1376,8 +1399,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self.warehouse_movement()
             if path == '/api/warehouse/movements' and method == 'GET':
                 return self.warehouse_history()
-            if method == 'DELETE' and (match := re.fullmatch(r'/api/warehouse/movements/([a-f0-9]{24})', path)):
-                return self.delete_warehouse_movement(match[1])
+            if movement_delete:
+                return self.delete_warehouse_movement(movement_delete[1])
+            if scanner_image:
+                return self.scanner_thumbnail(scanner_image[1])
+            if path == '/api/scanner-devices' and method in ('GET', 'POST'):
+                return self.scanner_directory(method)
+            if method == 'PUT' and (match := re.fullmatch(r'/api/scanner-devices/([a-f0-9]{24})', path)):
+                return self.scanner_directory(method, match[1])
             if path == '/api/settings/shopify' and method in ('GET', 'PUT'):
                 self.require_admin()
                 if method == 'PUT':
@@ -1611,6 +1640,132 @@ class Handler(BaseHTTPRequestHandler):
                 remove_upload(fid)
         self.send(result)
 
+    def scanner_directory(self, method, device_id=None):
+        self.require_admin()
+        if method == 'GET':
+            with connect() as db:
+                return self.send(scanner_devices.list_devices(db))
+        data = self.body()
+        if not isinstance(data, dict):
+            raise Problem('扫码枪设置格式无效')
+        name = required(data.get('name'), '设备名称')
+        user_ids = data.get('user_ids')
+        enabled = data.get('enabled', True)
+        rotate = data.get('rotate', False)
+        approve = data.get('approve', False)
+        reject = data.get('reject', False)
+        if (len(name) > 80 or type(enabled) is not bool or type(rotate) is not bool
+                or type(approve) is not bool or type(reject) is not bool or (approve and reject)
+                or not isinstance(user_ids, list) or len(user_ids) > 200
+                or any(not isinstance(id, str) or not UPLOAD_ID.fullmatch(id) for id in user_ids)):
+            raise Problem('扫码枪设置格式无效')
+        key = secrets.token_hex(32) if not device_id or rotate else None
+        with FILE_LOCK, transaction() as db:
+            if device_id:
+                device = exists(db, 'scanner_devices', device_id)
+                if device['pending'] and enabled and not reject and (not approve or not user_ids):
+                    raise Problem('请核对设备识别码并分配经办人后再启用')
+                pending = device['pending'] and not (reject or enabled)
+                enabled = enabled and not reject
+                db.execute('UPDATE scanner_devices SET name=?,enabled=?,pending=? WHERE id=?',
+                           (name, enabled, pending, device_id))
+                if rotate:
+                    db.execute("UPDATE scanner_devices SET key_hash=?,mac='' WHERE id=?",
+                               (scanner_devices.digest(key), device_id))
+                if rotate or not enabled:
+                    db.execute('DELETE FROM scanner_sessions WHERE device_id=?', (device_id,))
+            else:
+                device_id = uid()
+                db.execute('INSERT INTO scanner_devices(id,name,key_hash,enabled,created_at) VALUES(?,?,?,?,?)',
+                           (device_id, name, scanner_devices.digest(key), enabled, now()))
+            selected = set() if reject else set(user_ids)
+            for id in selected:
+                exists(db, 'users', id)
+            existing = {row[0] for row in db.execute(
+                'SELECT user_id FROM scanner_device_users WHERE device_id=?', (device_id,))}
+            db.executemany('DELETE FROM scanner_device_users WHERE device_id=? AND user_id=?',
+                           ((device_id, id) for id in existing - selected))
+            db.executemany('INSERT INTO scanner_device_users VALUES(?,?)',
+                           ((device_id, id) for id in selected - existing))
+            detail = ('已拒绝登记' if reject else '已审核通过' if approve and enabled
+                      else '已更换配对密钥' if rotate else '')
+            log_activity(db, self.user, '更新扫码枪' if method == 'PUT' else '登记扫码枪', device_id, name, detail)
+        return self.send({'id': device_id, 'key': key})
+
+    def scanner_operator(self, select):
+        if self.body_size() > 1024:
+            raise Problem('扫码枪请求过长', 413)
+        data = self.body()
+        if not isinstance(data, dict):
+            raise Problem('扫码枪请求格式无效')
+        mac, ip, firmware = (data.get(field) for field in ('mac', 'ip', 'firmware'))
+        if (not isinstance(mac, str) or not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac)
+                or not isinstance(ip, str) or not isinstance(firmware, str) or len(firmware) > 40):
+            raise Problem('扫码枪网络信息无效')
+        try:
+            ip = str(ipaddress.IPv4Address(ip))
+        except ValueError:
+            raise Problem('扫码枪 IP 地址无效')
+        mac = mac.upper()
+        offset = data.get('offset', 0)
+        operator_id = data.get('user_id')
+        automatic = not select and data.get('register') is True
+        if type(offset) is not int or not 0 <= offset <= 200 or (select and (
+                not isinstance(operator_id, str) or not UPLOAD_ID.fullmatch(operator_id))):
+            raise Problem('扫码枪用户选择无效')
+        with FILE_LOCK, transaction() as db:
+            key = self.headers.get('X-Scanner-Key')
+            device = scanner_devices.by_key(db, key, include_inactive=automatic)
+            if not device and automatic and re.fullmatch(r'[a-f0-9]{64}', key or ''):
+                device = self.register_scanner(db, key, mac, ip, firmware)
+            if not device or (device['mac'] and device['mac'] != mac):
+                raise Problem('扫码枪未登记、已停用或配对密钥不匹配', 401)
+            current = datetime.now(timezone.utc)
+            if (select or (device['mac'], device['ip'], device['firmware']) != (mac, ip, firmware)
+                    or (device['last_seen_at'] or '') < (current - timedelta(seconds=25)).isoformat()):
+                db.execute('UPDATE scanner_devices SET mac=?,ip=?,firmware=?,last_seen_at=? WHERE id=?',
+                           (mac, ip, firmware, current.isoformat(), device['id']))
+            if select:
+                users = scanner_devices.operators(db, device['id'], user_id=operator_id)
+                if not users:
+                    raise Problem('该用户未获准使用此扫码枪或需先修改初始密码', 403)
+                user = dict(users[0])
+                token = scanner_devices.new_session(db, device['id'], user['id'])
+                db.execute('UPDATE scanner_devices SET last_user_id=? WHERE id=?',
+                           (user['id'], device['id']))
+                log_activity(db, user, '扫码枪登录', device['id'], device['name'])
+                result = {'token': token, 'user': user}
+            else:
+                state = 'pending' if device['pending'] else 'ready' if device['enabled'] else 'disabled'
+                users = scanner_devices.operators(db, device['id'], offset=offset, limit=7) if state == 'ready' else []
+                result = {'name': device['name'], 'users': [dict(row) for row in users[:6]],
+                          'has_more': len(users) > 6}
+                if automatic:
+                    result.update(state=state, verification=device['key_hash'][:8].upper())
+        return self.send(result)
+
+    def register_scanner(self, db, key, mac, ip, firmware):
+        source = self.client_address[0]
+        if source in ('127.0.0.1', '::1'):
+            try:
+                source = str(ipaddress.ip_address(self.headers.get('X-Real-IP', source)))
+            except ValueError:
+                pass
+        current = datetime.now(timezone.utc)
+        db.execute('DELETE FROM scanner_devices WHERE pending=1 AND created_at<?',
+                   ((current - timedelta(days=7)).isoformat(),))
+        pending = db.execute('SELECT count(*) FROM scanner_devices WHERE pending=1').fetchone()[0]
+        recent = db.execute('SELECT count(*) FROM scanner_devices WHERE enrolled_from=? AND created_at>?',
+                            (source, (current - timedelta(hours=1)).isoformat())).fetchone()[0]
+        if pending >= 160 or recent >= 12:
+            raise Problem('新设备登记过多，请稍后重试或联系管理员', 429)
+        id = uid()
+        db.execute('''INSERT INTO scanner_devices(id,name,key_hash,enabled,mac,ip,firmware,
+            created_at,last_seen_at,pending,enrolled_from) VALUES(?,?,?,0,?,?,?,?,?,1,?)''',
+                   (id, '扫码枪 ' + mac[-5:].replace(':', ''), scanner_devices.digest(key),
+                    mac, ip, firmware, current.isoformat(), current.isoformat(), source))
+        return exists(db, 'scanner_devices', id)
+
     def warehouse_material(self):
         query = parse_qs(urlparse(self.path).query)
         code = required(query.get('q', [''])[0], '物料编号')
@@ -1626,7 +1781,7 @@ class Handler(BaseHTTPRequestHandler):
             rows = db.execute(f"""
                 WITH matches AS (
                     SELECT p.id, p.code, p.name, p.spec, p.unit, p.stock, p.location, p.external_code,
-                           p.project_id, j.name AS project_name,
+                           p.project_id, j.name AS project_name, custodian.name AS custodian_name,
                            (SELECT f.id FROM files f WHERE f.project_id=p.project_id
                             AND f.owner_type='parts' AND f.owner_id=p.id AND f.kind='image'
                             ORDER BY f.rowid LIMIT 1) AS image_id,
@@ -1634,6 +1789,7 @@ class Handler(BaseHTTPRequestHandler):
                                SELECT 1 FROM material_code_aliases a WHERE a.project_id=p.project_id
                                AND a.part_id=p.id AND a.code=:code COLLATE NOCASE)) AS exact_code
                     FROM parts p JOIN projects j ON j.id=p.project_id
+                    LEFT JOIN users custodian ON custodian.id=p.custodian_id
                     WHERE p.deleted_at IS NULL AND j.deleted_at IS NULL AND j.archived_at IS NULL
                       AND (:admin OR EXISTS (SELECT 1 FROM project_members m
                                             WHERE m.project_id=j.id AND m.user_id=:user
@@ -1658,7 +1814,38 @@ class Handler(BaseHTTPRequestHandler):
             raise Problem('编号匹配到多条物料，请扫描物料二维码', 409)
         return self.send(dict(rows[0]))
 
+    def scanner_thumbnail(self, file_id):
+        if scanner_devices.Image is None:
+            raise Problem('扫码枪缩略图服务未开启', 404)
+        with connect() as db:
+            db.execute('BEGIN')
+            image = db.execute("""SELECT f.project_id,f.size FROM files f
+                JOIN parts p ON p.id=f.owner_id AND p.project_id=f.project_id
+                JOIN projects j ON j.id=f.project_id
+                WHERE f.id=? AND f.owner_type='parts' AND f.kind='image' AND p.deleted_at IS NULL
+                  AND j.deleted_at IS NULL AND j.archived_at IS NULL""", (file_id,)).fetchone()
+            if (not image or not permissions.can(db, image['project_id'], self.user, 'warehouse')
+                    or image['size'] > scanner_devices.MAX_IMAGE_BYTES):
+                raise Problem('未找到可显示的物料图片', 404)
+        path = DATA / 'uploads' / file_id
+        if not path.is_file():
+            raise Problem('未找到物料图片', 404)
+        revision = 'scanner-rgb565-v1-' + file_id
+        if self.command == 'HEAD':
+            return self.send_asset_headers('application/octet-stream', scanner_devices.THUMBNAIL_LENGTH, revision)
+        content = scanner_devices.thumbnail(path)
+        if content is None:
+            raise Problem('无法生成物料缩略图', 415)
+        if self.send_asset_headers('application/octet-stream', len(content), revision):
+            self.wfile.write(content)
+
     def warehouse_history(self):
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            limit = min(30, max(1, int(query.get('limit', ['30'])[0])))
+            offset = min(10000, max(0, int(query.get('offset', ['0'])[0])))
+        except ValueError:
+            raise Problem('历史记录页码无效')
         with connect() as db:
             rows = db.execute(f"""
                 SELECT m.*, p.code AS part_code, p.name AS part_name, p.unit, j.name AS project_name,
@@ -1670,8 +1857,8 @@ class Handler(BaseHTTPRequestHandler):
                   AND (? OR EXISTS (SELECT 1 FROM project_members pm
                                    WHERE pm.project_id=m.project_id AND pm.user_id=?
                                    AND {permissions.membership_allows('warehouse', 'pm')}))
-                ORDER BY m.created_at DESC, m.id DESC LIMIT 30
-            """, (self.user['id'], self.user['role'] == 'admin', self.user['id'])).fetchall()
+                ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?
+            """, (self.user['id'], self.user['role'] == 'admin', self.user['id'], limit, offset)).fetchall()
         fields = ('id', 'type', 'project_id', 'project_name', 'part_code', 'part_name',
                   'qty', 'unit', 'created_at', 'can_delete')
         return self.send([{
@@ -1684,6 +1871,9 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict) or not isinstance(data.get('expected'), dict):
             raise Problem('请刷新流水记录后重试')
         with FILE_LOCK, transaction() as db:
+            self.user = self.authorized(db)
+            if not self.user or self.user['must_change']:
+                raise Problem('请先登录', 401)
             self.project_writer(db, required(data.get('project_id'), '项目'), 'warehouse')
             row = exists(db, 'movements', movement_id)
             if row['handler_id'] != self.user['id'] or row['type'] not in ('入库', '出库', '报废'):
@@ -1725,7 +1915,11 @@ class Handler(BaseHTTPRequestHandler):
                     'type': kind, 'part_id': part_id, 'qty': qty,
                     'reason': '仓库快速登记报废' if kind == '报废' else '',
                 }, self.user)
+                if 'scanner_id' in self.user.keys():
+                    db.execute('INSERT INTO scanner_movements VALUES(?,?)', (movement, self.user['scanner_id']))
                 result = {'id': movement, 'stock': active_part(db, part_id)['stock']}
+                if 'scanner_id' in self.user.keys():
+                    result['part_id'] = part_id
                 insert_scoped(db, 'import_runs', dict(id=key, fingerprint=fingerprint,
                                                      result=json.dumps(result), created_at=now()))
                 touch_project(db)

@@ -31,8 +31,8 @@ class ScanFrame {
 inline char singleMatrixKey(uint32_t mask) {
   // Reject multi-key states (no isolation diodes on the board).
   if (!mask || (mask & (mask - 1))) return 0;
-  constexpr char keys[] = {'B','O','I','S', 'U','1','2','3', 'D','4','5','6',
-                           'L','7','8','9', 'R','X','0','E'};
+  constexpr char keys[] = {'F','O','I','S', 'U','1','2','3', 'D','4','5','6',
+                           'L','7','8','9', 'R','B','0','E'};
   for (unsigned i = 0; i < 20; ++i) if (mask == (1UL << i)) return keys[i];
   return 0;
 }
@@ -46,4 +46,18 @@ inline bool validQuantity(const char* s) {
     value = value * 10 + s[i] - '0';
   }
   return value > 0;
+}
+
+inline int batteryPercent(int millivolts) {
+  if (millivolts < 2750 || millivolts > 4400) return -1;
+  constexpr int voltage[] = {3300, 3500, 3650, 3750, 3900, 4100, 4200};
+  constexpr int capacity[] = {0, 10, 25, 50, 75, 95, 100};
+  if (millivolts <= voltage[0]) return 0;
+  for (unsigned i = 1; i < sizeof(voltage) / sizeof(voltage[0]); ++i) {
+    if (millivolts <= voltage[i]) {
+      return capacity[i - 1] + (millivolts - voltage[i - 1]) *
+             (capacity[i] - capacity[i - 1]) / (voltage[i] - voltage[i - 1]);
+    }
+  }
+  return 100;
 }

@@ -11,20 +11,21 @@
 #ifndef TERMINAL_API_URL
 #define TERMINAL_API_URL "https://work.makagic.com/JPLM/"
 #endif
-#ifndef TERMINAL_EMAIL
-#define TERMINAL_EMAIL ""
-#endif
-#ifndef TERMINAL_PASSWORD
-#define TERMINAL_PASSWORD ""
+#ifndef TERMINAL_DEVICE_KEY
+#define TERMINAL_DEVICE_KEY ""
 #endif
 #ifndef TERMINAL_ROOT_CA
-#define TERMINAL_ROOT_CA ""
+#include "jplm_root_ca.h"
+#define TERMINAL_ROOT_CA kJplmRootCa
 #endif
 #ifndef TERMINAL_ALLOW_HTTP
 #define TERMINAL_ALLOW_HTTP 0
 #endif
+#ifndef TERMINAL_UTC_OFFSET
+#define TERMINAL_UTC_OFFSET (8 * 3600)
+#endif
 #ifndef TERMINAL_ROTATION
-#define TERMINAL_ROTATION 0
+#define TERMINAL_ROTATION 2
 #endif
 #ifndef TERMINAL_SPI_MODE
 #define TERMINAL_SPI_MODE 3

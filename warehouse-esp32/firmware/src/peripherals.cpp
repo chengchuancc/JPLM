@@ -14,13 +14,8 @@ void Peripherals::begin() {
   ledcWrite(0, 0);
   analogReadResolution(12);
   analogSetPinAttenuation(pins::battery, ADC_11db);
-  digitalWrite(pins::tftBacklight, !TERMINAL_BACKLIGHT_ON);
-  pinMode(pins::tftBacklight, OUTPUT);
-  SPI.begin(pins::tftClock, -1, pins::tftData, -1);
-  display_.init(240, 240, TERMINAL_SPI_MODE);
-  display_.setRotation(TERMINAL_ROTATION);
+  display_.init();
   display_.setTextWrap(true);
-  digitalWrite(pins::tftBacklight, TERMINAL_BACKLIGHT_ON);
   scannerPower(true);
 }
 
@@ -94,6 +89,11 @@ void Peripherals::beep(bool ok) {
   ledcWriteTone(0, ok ? 2300 : 1200);
   toneUntil_ = millis() + (ok ? 70 : 220);
 }
+void Peripherals::keyClick() {
+  if (toneUntil_) return;
+  ledcWriteTone(0, 2300);
+  toneUntil_ = millis() + 24;
+}
 void Peripherals::tick() {
   if (toneUntil_ && static_cast<int32_t>(millis() - toneUntil_) >= 0) {
     ledcWrite(0, 0); toneUntil_ = 0;
@@ -105,21 +105,43 @@ float Peripherals::batteryVolts() {
   for (unsigned i = 0; i < 8; ++i) total += analogReadMilliVolts(pins::battery);
   return total / 8000.0f * TERMINAL_BATTERY_SCALE;
 }
-void Peripherals::screen(const String& status, const String& code, const String& mode,
-                         const String& qty, const String& message) {
+void Peripherals::showKeyTest() {
   display_.fillScreen(ST77XX_BLACK);
-  display_.setCursor(8, 8);
-  display_.setTextColor(ST77XX_CYAN); display_.setTextSize(2);
-  display_.println("JPLM Warehouse");
-  display_.setTextSize(1); display_.setTextColor(ST77XX_WHITE);
-  display_.println(status);
-  display_.print("Battery: "); display_.print(batteryVolts(), 2); display_.println(" V");
-  display_.println();
-  display_.setTextSize(2); display_.println(mode + " Qty:" + qty);
+  display_.fillRect(0, 0, 80, 30, ST77XX_RED);
+  display_.fillRect(80, 0, 80, 30, ST77XX_GREEN);
+  display_.fillRect(160, 0, 80, 30, ST77XX_BLUE);
+  display_.setTextColor(ST77XX_WHITE);
+  display_.setTextSize(2);
+  display_.setCursor(12, 51);
+  display_.print("LCD / Key / Scan");
   display_.setTextSize(1);
-  display_.println(code.substring(0, 120));
-  display_.println(); display_.println(message.substring(0, 200));
-  display_.setCursor(8, 210);
-  display_.println("Scan -> Qty -> Confirm twice");
-  display_.println("Back: cancel  Delete: erase");
+  display_.setCursor(12, 84);
+  display_.print("Press one key at a time");
+}
+
+void Peripherals::showKeyPress(const char* name, char code, uint32_t count) {
+  display_.fillRect(0, 101, 240, 55, ST77XX_BLACK);
+  display_.setTextColor(ST77XX_CYAN);
+  display_.setTextSize(3);
+  display_.setCursor(12, 107);
+  display_.print(name);
+  display_.setTextColor(ST77XX_WHITE);
+  display_.setTextSize(1);
+  display_.setCursor(12, 138);
+  display_.printf("Code: %c   Presses: %lu", code, static_cast<unsigned long>(count));
+}
+
+void Peripherals::showScanTest(const char* status, const String& code) {
+  display_.fillRect(0, 156, 240, 84, ST77XX_BLACK);
+  display_.drawFastHLine(12, 160, 216, ST77XX_WHITE);
+  display_.setTextColor(ST77XX_YELLOW);
+  display_.setTextSize(1);
+  display_.setCursor(12, 171);
+  display_.print(status);
+  display_.setTextColor(ST77XX_WHITE);
+  for (unsigned offset = 0, y = 189; offset < code.length() && offset < 144;
+       offset += 36, y += 10) {
+    display_.setCursor(12, y);
+    display_.print(code.substring(offset, offset + 36));
+  }
 }

@@ -21,8 +21,9 @@ void test_scan_overflow_and_control_char_rejected() {
   TEST_ASSERT_EQUAL_STRING("D", f.data());
 }
 void test_matrix_layout_and_multikey_rejection() {
-  TEST_ASSERT_EQUAL_CHAR('B', singleMatrixKey(1));
+  TEST_ASSERT_EQUAL_CHAR('F', singleMatrixKey(1));
   TEST_ASSERT_EQUAL_CHAR('I', singleMatrixKey(1UL << 2));
+  TEST_ASSERT_EQUAL_CHAR('B', singleMatrixKey(1UL << 17));
   TEST_ASSERT_EQUAL_CHAR('E', singleMatrixKey(1UL << 19));
   TEST_ASSERT_EQUAL_CHAR(0, singleMatrixKey(3));
   TEST_ASSERT_EQUAL_CHAR(0, singleMatrixKey((1UL << 20) | 1));
@@ -37,11 +38,22 @@ void test_quantity_rejects_zero_negative_decimal_overflow() {
   TEST_ASSERT_FALSE(validQuantity("1.5"));
   TEST_ASSERT_FALSE(validQuantity("1000000"));
 }
+
+void test_battery_percentage_handles_missing_low_and_full_voltage() {
+  TEST_ASSERT_EQUAL_INT(-1, batteryPercent(0));
+  TEST_ASSERT_EQUAL_INT(-1, batteryPercent(4600));
+  TEST_ASSERT_EQUAL_INT(0, batteryPercent(3300));
+  TEST_ASSERT_EQUAL_INT(10, batteryPercent(3500));
+  TEST_ASSERT_EQUAL_INT(17, batteryPercent(3575));
+  TEST_ASSERT_EQUAL_INT(50, batteryPercent(3750));
+  TEST_ASSERT_EQUAL_INT(100, batteryPercent(4200));
+}
 int main() {
   UNITY_BEGIN();
   RUN_TEST(test_scan_crlf_and_next_frame);
   RUN_TEST(test_scan_overflow_and_control_char_rejected);
   RUN_TEST(test_matrix_layout_and_multikey_rejection);
   RUN_TEST(test_quantity_rejects_zero_negative_decimal_overflow);
+  RUN_TEST(test_battery_percentage_handles_missing_low_and_full_voltage);
   return UNITY_END();
 }

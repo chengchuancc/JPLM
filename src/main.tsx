@@ -980,6 +980,137 @@ function UserAdmin({
   );
 }
 
+type ScannerDevice = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  pending: boolean;
+  verification: string;
+  user_ids: string[];
+  mac: string;
+  ip: string;
+  firmware: string;
+  last_seen_at: string | null;
+  last_user: string | null;
+};
+
+function ScannerDevicesPanel() {
+  const [devices, setDevices] = useState<ScannerDevice[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [draft, setDraft] = useState<{
+    id: string; name: string; enabled: boolean; pending: boolean; verification: string;
+    user_ids: string[]; approve: boolean;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  async function load() {
+    setError("");
+    try {
+      const [rows, accounts] = await Promise.all([api("scanner-devices"), api("users")]);
+      setDevices(rows);
+      setUsers(accounts);
+    } catch (cause) {
+      setError((cause as Error).message);
+    }
+  }
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => {
+      void api("scanner-devices").then(setDevices).catch(() => {});
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  async function save(reject = false) {
+    if (!draft || busy) return;
+    setError("");
+    setBusy(true);
+    try {
+      await api("scanner-devices/" + draft.id, "PUT", {
+        ...draft, reject, approve: !reject && draft.approve,
+      });
+      setDraft(null);
+      await load();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="section-toolbar">
+        <h3>扫码枪</h3>
+        <div className="row-actions">
+          <Button small onClick={() => void load()}>刷新</Button>
+        </div>
+      </div>
+      {error && !draft && <p className="form-error" role="alert">{error}</p>}
+      <div className="table-wrap">
+        <table>
+          <thead><tr><th>名称</th><th>状态</th><th>识别码</th><th>IP / MAC</th><th>固件</th><th>最近登录</th><th>最近连接</th><th /></tr></thead>
+          <tbody>
+            {devices.map((device) => (
+              <tr key={device.id}>
+                <td>{device.name}</td>
+                <td>{device.pending ? "待审核" : !device.enabled ? "已停用" : device.mac ? "已启用" : "等待连接"}</td>
+                <td><code>{device.mac ? device.verification : "—"}</code></td>
+                <td>{[device.ip, device.mac].filter(Boolean).join(" / ") || "—"}</td>
+                <td>{device.firmware || "—"}</td>
+                <td>{device.last_user || "—"}</td>
+                <td>{device.last_seen_at ? datetime(device.last_seen_at) : "—"}</td>
+                <td><Button small onClick={() => {
+                  setError("");
+                  setDraft({ ...device, enabled: device.pending || device.enabled, approve: false });
+                }}>{device.pending ? "审核" : "编辑"}</Button></td>
+              </tr>
+            ))}
+            {devices.length === 0 && <tr><td colSpan={8}>扫码枪连上 Wi-Fi 后会自动出现在这里。</td></tr>}
+          </tbody>
+        </table>
+      </div>
+      {draft && (
+        <Dialog title={draft.pending ? "审核扫码枪" : "编辑扫码枪"} onClose={() => { if (!busy) setDraft(null); }}>
+          <form onSubmit={(event) => { event.preventDefault(); void save(); }}>
+            <div className="form-grid">
+              <label>设备名称<input required maxLength={80} value={draft.name}
+                onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
+              <label><input type="checkbox" checked={draft.enabled}
+                onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} /> 启用设备</label>
+            </div>
+            <fieldset>
+              <legend>允许免密选择的用户</legend>
+              {users.map((user) => (
+                <div key={user.id}><label>
+                  <input type="checkbox" checked={draft.user_ids.includes(user.id)}
+                    onChange={(event) => setDraft({ ...draft, user_ids: event.target.checked
+                      ? [...draft.user_ids, user.id] : draft.user_ids.filter((id) => id !== user.id) })} />
+                  {" "}{user.name} · {user.email}
+                </label></div>
+              ))}
+            </fieldset>
+            {draft.pending && draft.enabled && (
+              <label><input type="checkbox" checked={draft.approve}
+                onChange={(event) => setDraft({ ...draft, approve: event.target.checked })} />
+                {" "}已核对设备屏幕上的识别码 <code>{draft.verification}</code>
+              </label>
+            )}
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="row-actions">
+              <Button type="button" disabled={busy} onClick={() => setDraft(null)}>取消</Button>
+              {draft.pending && <Button type="button" disabled={busy} onClick={() => void save(true)}>拒绝登记</Button>}
+              <Button primary type="submit"
+                disabled={busy || (draft.pending && draft.enabled && (!draft.approve || draft.user_ids.length === 0))}>保存</Button>
+            </div>
+          </form>
+        </Dialog>
+      )}
+    </>
+  );
+}
+
 function ActivityPanel({
   part,
   kind = "operation",
@@ -4864,6 +4995,7 @@ function Workspace({
                   ...(currentUser?.role === "admin"
                     ? [
                         ["users", "用户管理"],
+                        ["scanner-devices", "扫码枪"],
                         ["system-activity", "系统操作记录"],
                         ["assets", "素材库"],
                         ["shopify", "Shopify"],
@@ -4905,6 +5037,7 @@ function Workspace({
               )}
               {currentUser.role === "admin" && accountView === "assets" && <AssetLibrary onChanged={reloadProjects} />}
               {currentUser.role === "admin" && accountView === "shopify" && <ShopifySettingsPanel />}
+              {currentUser.role === "admin" && accountView === "scanner-devices" && <ScannerDevicesPanel />}
               {currentUser?.role === "admin" && accountView === "backup" && (
                 <div className="settings-grid">
                   <BackupPanel onRestored={onRestore} />

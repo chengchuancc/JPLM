@@ -1,7 +1,7 @@
 #pragma once
 #include <Arduino.h>
-#include <Adafruit_ST7789.h>
 #include "board_pins.h"
+#include "hancai_st7789.h"
 #include "terminal_logic.h"
 
 class Peripherals {
@@ -10,14 +10,18 @@ class Peripherals {
   char pollKey(); // single press events after debounce; S is scrap, T is scan
   bool pollScanner(String& code);
   void trigger(bool active);
+  bool scanActive() const { return triggerActive_; }
   void scannerPower(bool on);
   void beep(bool ok = true);
+  void keyClick();
   void tick();
+  Adafruit_ST77xx& display() { return display_; }
   float batteryVolts();
-  void screen(const String& status, const String& code, const String& mode,
-              const String& qty, const String& message);
+  void showKeyTest();
+  void showKeyPress(const char* name, char code, uint32_t count);
+  void showScanTest(const char* status, const String& code);
  private:
-  Adafruit_ST7789 display_{&SPI, -1, pins::tftDc, pins::tftReset};
+  HancaiSt7789 display_;
   HardwareSerial scanner_{1};
   ScanFrame frame_;
   uint32_t lastByte_ = 0, changedAt_ = 0, toneUntil_ = 0;

@@ -19,6 +19,8 @@ class IntegrationTests(unittest.TestCase):
         cls.server.shutdown();cls.server.server_close();cls.thread.join();cls.tmp.cleanup()
     def setUp(self):
         with app.transaction() as db:
+            for table in ('scanner_sessions', *reversed(app.scanner_devices.BACKUP_TABLES)):
+                db.execute('DELETE FROM ' + table)
             db.execute('DELETE FROM shipping_pending_shopify')
             for table in reversed(app.shipping.TABLES): db.execute('DELETE FROM '+table)
             for table in reversed(app.inspection.TABLES): db.execute('DELETE FROM '+table)
@@ -64,6 +66,10 @@ class IntegrationTests(unittest.TestCase):
 
         qr = f'https://work.makagic.com/JPLM/#projects/{self.project_id}/parts/{self.part}'
         self.assertEqual(lookup(qr)['id'], self.part)
+        self.assertIsNone(lookup(qr)['custodian_name'])
+        manager = self.request('auth/status')['user']
+        self.request('parts/' + self.part, 'PUT', {'custodian_id': manager['id']})
+        self.assertEqual(lookup(qr)['custodian_name'], manager['name'])
         self.assertEqual(lookup(self.code.lower())['project_id'], self.project_id)
         self.assertEqual(lookup('https://old.example.test/#parts/' + self.part)['id'], self.part)
         with app.transaction() as db:
@@ -76,6 +82,7 @@ class IntegrationTests(unittest.TestCase):
         other_part = self.request('parts', 'POST', {'name': '测试物料配件'})['id']
         self.assertEqual({row['id'] for row in lookup('测试物料', fuzzy=True)['rows']}, {self.part, other_part})
         self.assertEqual(lookup(self.code, fuzzy=True)['rows'][0]['image_id'], image)
+        self.assertEqual(lookup(self.code, fuzzy=True)['rows'][0]['custodian_name'], manager['name'])
 
         path = 'warehouse/movements'
         payload = {'project_id': self.project_id, 'part_id': self.part}
@@ -115,6 +122,140 @@ class IntegrationTests(unittest.TestCase):
         self.cookie = member_cookie
         self.assertEqual(self.request(path, project=False), [])
         self.request(delete_path, 'DELETE', delete_body, 403, project=False)
+
+    def test_scanner_pairing_sessions_movement_history_and_revocation(self):
+        operator = self.request('users', 'POST', {
+            'name': '仓库甲', 'email': 'scanner-member@example.test', 'password': 'scanner-pass',
+        })['id']
+        admin_cookie = self.cookie
+        self.request('auth/login', 'POST', {'email': 'scanner-member@example.test', 'password': 'scanner-pass'})
+        self.request('account/password', 'POST', {'current_password': 'scanner-pass', 'password': 'scanner-pass'})
+        member_cookie = self.cookie
+        self.request('scanner-devices', status=403, project=False)
+        self.cookie = admin_cookie
+        self.request('projects/' + self.project_id, 'PUT', {'members': [operator]})
+        draft = {'name': '一号仓库扫码枪', 'user_ids': [operator], 'enabled': True}
+        device = self.request('scanner-devices', 'POST', draft, project=False)
+        device_path = 'scanner-devices/' + device['id']
+        metadata = {'mac': '10:22:33:44:55:66', 'ip': '192.168.100.150', 'firmware': 'test'}
+        credential = {'Cookie': '', 'X-Scanner-Key': device['key']}
+        self.request('scanner/operators', 'POST', metadata, 401, project=False)
+        roster = self.request('scanner/operators', 'POST', metadata, headers=credential, project=False)
+        self.assertEqual(roster['users'], [{'id': operator, 'name': '仓库甲'}])
+        self.request('scanner/operators', 'POST', {**metadata, 'mac': '10:22:33:44:55:77'}, 401,
+                     headers=credential, project=False)
+        self.request('scanner/session', 'POST', {**metadata, 'user_id': '0' * 24}, 403,
+                     headers=credential, project=False)
+        session = self.request('scanner/session', 'POST', {**metadata, 'user_id': operator},
+                               headers=credential, project=False)
+        bearer = {'Cookie': '', 'Authorization': 'Bearer ' + session['token']}
+        self.request('users', status=401, headers=bearer)
+        self.request('scanner-devices', status=401, headers=bearer, project=False)
+        material = self.request('warehouse/material?q=' + self.code, headers=bearer, project=False)
+        self.assertEqual(material['id'], self.part)
+        if app.scanner_devices.Image is not None:
+            picture = io.BytesIO()
+            app.scanner_devices.Image.new('RGB', (80, 80), (255, 0, 0)).save(picture, 'PNG')
+            file_id = self.upload('扫码枪红图.png', picture.getvalue())['ids'][0]
+            thumbnail = '/files/' + file_id + '?scanner_thumb=1'
+            for method in ('HEAD', 'GET'):
+                request = urllib.request.Request(self.base + thumbnail, headers=bearer, method=method)
+                with urllib.request.urlopen(request) as response:
+                    self.assertIn('scanner-rgb565-v1-', response.headers['ETag'])
+                    self.assertEqual(int(response.headers['Content-Length']), 12800)
+                    self.assertEqual(response.read(), b'' if method == 'HEAD' else b'\x00\xf8' * 6400)
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(self.base + thumbnail)
+            with denied.exception as response:
+                self.assertEqual(response.code, 401)
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(urllib.request.Request(self.base + '/files/' + file_id, headers=bearer))
+            with denied.exception as response:
+                self.assertEqual(response.code, 401)
+        movement_path = 'warehouse/movements'
+        receipt = {'request_id': 'e' * 32, 'part_id': self.part, 'project_id': self.project_id,
+                   'type': '入库', 'qty': 4}
+        result = self.request(movement_path, 'POST', receipt, headers=bearer, project=False)
+        self.assertEqual(self.request(movement_path, 'POST', receipt, headers=bearer, project=False), result)
+        self.assertEqual(self.stock(), 4)
+        with app.connect() as db:
+            self.assertEqual(db.execute('SELECT device_id FROM scanner_movements WHERE movement_id=?',
+                                        (result['id'],)).fetchone()[0], device['id'])
+        history = self.request(movement_path + '?limit=6&offset=0', headers=bearer, project=False)
+        delete_path = movement_path + '/' + result['id']
+        delete_body = {'project_id': self.project_id, 'expected': history[0]['expected']}
+        self.request(delete_path, 'DELETE', {**delete_body, 'expected': {}}, 409,
+                     headers=bearer, project=False)
+        self.assertEqual(self.request(delete_path, 'DELETE', delete_body, headers=bearer, project=False)['stock'], 0)
+        self.assertEqual(self.request(delete_path, 'DELETE', delete_body, headers=bearer, project=False)['stock'], 0)
+        details = self.request('scanner-devices', project=False)[0]
+        self.assertEqual((details['ip'], details['last_user']), (metadata['ip'], '仓库甲'))
+        self.assertNotIn('key', details)
+        self.assertNotIn('key_hash', details)
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            backup = directory / 'backup.zip'
+            backup.write_bytes(self.request('backup', raw=True))
+            staged, _ = app.stage_restore(backup, directory)
+            with app.connect(staged) as db:
+                self.assertIsNone(app.scanner_devices.operator_session(db, bearer['Authorization']))
+                self.assertEqual(app.scanner_devices.by_key(db, device['key'])['id'], device['id'])
+        self.request(device_path, 'PUT', {**draft, 'user_ids': []}, project=False)
+        self.request(movement_path, status=401, headers=bearer, project=False)
+        rotated = self.request(device_path, 'PUT', {**draft, 'rotate': True}, project=False)
+        self.request('scanner/operators', 'POST', metadata, 401, headers=credential, project=False)
+        self.request('scanner/operators', 'POST', metadata, headers={**credential, 'X-Scanner-Key': rotated['key']}, project=False)
+        self.request(device_path, 'PUT', {**draft, 'enabled': False}, project=False)
+        self.request('scanner/operators', 'POST', metadata, 401,
+                     headers={**credential, 'X-Scanner-Key': rotated['key']}, project=False)
+        self.cookie = member_cookie
+        self.request('scanner-devices', status=403, project=False)
+
+    def test_scanner_auto_enrollment_needs_admin_approval_and_device_identity(self):
+        admin = self.request('auth/status')['user']['id']
+        metadata = {'mac': '10:22:33:44:66:77', 'ip': '192.168.100.144',
+                    'firmware': 'scanner/0.2.0', 'register': True}
+        identity = 'a' * 64
+        no_session = {'Cookie': '', 'X-Scanner-Key': identity}
+
+        def roster(headers=no_session, status=200, payload=metadata):
+            return self.request('scanner/operators', 'POST', payload, status, headers=headers, project=False)
+
+        def select(headers=no_session, status=200):
+            return self.request('scanner/session', 'POST', {**metadata, 'user_id': admin},
+                                status, headers=headers, project=False)
+
+        first = roster()
+        self.assertEqual((first['state'], first['users']), ('pending', []))
+        self.assertEqual(roster(), first)
+        select(status=401)
+        roster(status=401, payload={**metadata, 'mac': '10:22:33:44:66:78'})
+        self.assertEqual(len(self.request('scanner-devices', project=False)), 1)
+        device = self.request('scanner-devices', project=False)[0]
+        self.assertEqual((device['pending'], device['enabled'], device['verification']),
+                         (True, False, first['verification']))
+        self.assertNotEqual(device['verification'], identity)
+        path = 'scanner-devices/' + device['id']
+        settings = {'name': '仓库扫码枪', 'enabled': True, 'user_ids': [admin]}
+        self.request(path, 'PUT', settings, 400, project=False)
+        self.request(path, 'PUT', {**settings, 'approve': True}, project=False)
+        self.assertEqual(roster()['users'][0]['id'], admin)
+        token = select()['token']
+        self.assertEqual(self.request('warehouse/material?q=' + self.code, headers={
+            'Cookie': '', 'Authorization': 'Bearer ' + token,
+        }, project=False)['id'], self.part)
+
+        second_headers = {**no_session, 'X-Scanner-Key': 'b' * 64}
+        second = roster(headers=second_headers)
+        self.assertEqual((second['state'], second['users']), ('pending', []))
+        self.assertNotEqual(second['verification'], first['verification'])
+        select(headers=second_headers, status=401)
+        pending = next(device for device in self.request('scanner-devices', project=False) if device['pending'])
+        self.request('scanner-devices/' + pending['id'], 'PUT', {
+            'name': pending['name'], 'user_ids': [], 'reject': True,
+        }, project=False)
+        self.assertEqual(roster(headers=second_headers)['state'], 'disabled')
+        self.assertEqual(roster()['state'], 'ready')
 
     def test_custom_material_categories_are_reused_and_preserve_material_serial(self):
         category = '包装耗材'
