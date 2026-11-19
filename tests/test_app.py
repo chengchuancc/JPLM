@@ -1,5 +1,5 @@
 """真实 HTTP + 临时 SQLite 的业务集成测试，不写入正式 data 目录。"""
-import sys, base64, concurrent.futures, importlib.util, io, json, tempfile, threading, unittest, urllib.request, urllib.error, zipfile, os
+import sys, base64, concurrent.futures, hashlib, importlib.util, io, json, tempfile, threading, time, unittest, urllib.request, urllib.error, zipfile, os
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'server'))
@@ -227,7 +227,10 @@ class IntegrationTests(unittest.TestCase):
 
         first = roster()
         self.assertEqual((first['state'], first['users']), ('pending', []))
-        self.assertEqual(roster(), first)
+        second_poll = roster()
+        self.assertAlmostEqual(first.pop('server_time'), time.time(), delta=5)
+        second_poll.pop('server_time')
+        self.assertEqual(second_poll, first)
         select(status=401)
         roster(status=401, payload={**metadata, 'mac': '10:22:33:44:66:78'})
         self.assertEqual(len(self.request('scanner-devices', project=False)), 1)
@@ -256,6 +259,45 @@ class IntegrationTests(unittest.TestCase):
         }, project=False)
         self.assertEqual(roster(headers=second_headers)['state'], 'disabled')
         self.assertEqual(roster()['state'], 'ready')
+
+    def test_scanner_ota_only_delivers_to_target_and_confirms_after_reboot(self):
+        admin = self.request('auth/status')['user']['id']
+        target = self.request('scanner-devices', 'POST', {'name': '目标扫码枪', 'user_ids': [admin]}, project=False)
+        other = self.request('scanner-devices', 'POST', {'name': '另一把扫码枪', 'user_ids': [admin]}, project=False)
+        target_key = {'Cookie': '', 'X-Scanner-Key': target['key']}
+        other_key = {'Cookie': '', 'X-Scanner-Key': other['key']}
+        release = bytearray(256)
+        release[:2] = b'\xe9\x01'
+        release[12] = 9
+        release[32:36] = b'\x32\x54\xcd\xab'
+        release[96:125] = app.scanner_devices.FIRMWARE_MARKER + b'0.2.8\0'
+        release = bytes(release)
+        digest = hashlib.sha256(release).hexdigest()
+        upload = 'scanner-devices/' + target['id'] + '/firmware'
+        check = 'scanner/update?version=0.2.7'
+        download = 'scanner/update/' + digest
+
+        self.request(upload, 'PUT', release, 400, project=False)
+        self.request(check, headers=target_key, project=False)
+        self.request(check, headers=other_key, project=False)
+        self.request(upload, 'PUT', release, 401, headers=target_key, project=False)
+        self.request(upload, 'PUT', bytes(len(release)), 400, project=False)
+        self.request(upload, 'PUT', release, project=False)
+        manifest = self.request(check, headers=target_key, project=False)['update']
+        self.assertEqual(manifest, {'version': '0.2.8', 'sha256': digest, 'size': len(release)})
+        self.assertIsNone(self.request(check, headers=other_key, project=False)['update'])
+        self.request(download, status=404, headers=other_key, project=False)
+        self.assertEqual(self.request(download, headers=target_key, raw=True, project=False), release)
+        self.request(check + '&failed=' + digest, headers=target_key, project=False)
+        states = lambda: {row['id']: row for row in self.request('scanner-devices', project=False)}
+        self.assertEqual(states()[target['id']]['ota_status'], 'retry')
+        self.request(upload, 'DELETE', project=False)
+        self.request(download, status=404, headers=target_key, project=False)
+        self.request(upload, 'PUT', release, project=False)
+        self.assertIsNone(self.request('scanner/update?version=0.2.8', headers=target_key, project=False)['update'])
+        self.assertEqual(states()[target['id']]['ota_status'], 'installed')
+        self.assertEqual(states()[target['id']]['firmware'], 'scanner/0.2.8')
+        self.request(upload, 'PUT', release, 409, project=False)
 
     def test_custom_material_categories_are_reused_and_preserve_material_serial(self):
         category = '包装耗材'

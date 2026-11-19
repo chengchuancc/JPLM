@@ -2,7 +2,9 @@
 #include "plm_client.h"
 #include <freertos/semphr.h>
 
-enum class Operation { Users, SignIn, Lookup, Submit, History, Delete, Image, Health, Prepare, KeepAlive };
+enum class Operation { Users, SignIn, Lookup, Submit, History, Delete, Image, Health, Prepare, KeepAlive,
+                       FirmwareCheck, FirmwareDownload };
+const char* operationLabel(Operation operation);
 
 struct NetworkJob {
   Operation operation;
@@ -17,6 +19,7 @@ struct NetworkReply {
   String error;
   int status = 0;
   bool ok = false, rejected = false, viaEdge = false;
+  char trace[240] = {};
 };
 
 class TerminalNetwork {
@@ -25,6 +28,7 @@ class TerminalNetwork {
   bool start(NetworkJob job);
   const NetworkReply* poll();
   const NetworkJob& job() const { return job_; }
+  unsigned requestId() const { return requestId_; }
   bool busy() const { return busy_; }
  private:
   static void run(void* context);
@@ -34,5 +38,6 @@ class TerminalNetwork {
   NetworkJob job_{Operation::Users, 0, "", "", 0, nullptr};
   NetworkReply reply_;
   PlmClient client_;
+  unsigned requestId_ = 0;
   bool busy_ = false;
 };

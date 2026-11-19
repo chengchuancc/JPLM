@@ -14,6 +14,10 @@ except ImportError:
 THUMBNAIL_SIZE = 80
 THUMBNAIL_LENGTH = THUMBNAIL_SIZE ** 2 * 2
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
+MAX_FIRMWARE_BYTES = 0x640000
+OTA_MIN_VERSION = (0, 2, 7)
+FIRMWARE_VERSION = re.compile(r'(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,3})')
+FIRMWARE_MARKER = b'JPLM_OTA_ESP32S3_N16R8:'
 
 BACKUP_TABLES = ('scanner_devices', 'scanner_device_users', 'scanner_movements')
 
@@ -42,6 +46,11 @@ SCHEMA = (
         movement_id TEXT PRIMARY KEY REFERENCES movements(id) ON DELETE CASCADE,
         device_id TEXT NOT NULL REFERENCES scanner_devices(id)
     )""",
+    """CREATE TABLE IF NOT EXISTS scanner_updates (
+        device_id TEXT PRIMARY KEY REFERENCES scanner_devices(id) ON DELETE CASCADE,
+        version TEXT NOT NULL, sha256 TEXT NOT NULL, size INTEGER NOT NULL,
+        image BLOB, status TEXT NOT NULL, updated_at TEXT NOT NULL
+    )""",
 )
 
 
@@ -57,6 +66,20 @@ def initialize(db):
 
 def digest(secret):
     return hashlib.sha256(secret.encode('ascii')).hexdigest()
+
+
+def version_tuple(version):
+    match = FIRMWARE_VERSION.fullmatch(version)
+    return tuple(map(int, match.groups())) if match else ()
+
+
+def image_version(image):
+    if (len(image) < 256 or image[0] != 0xe9 or not 1 <= image[1] <= 16
+            or image[12:14] != b'\x09\x00' or image[32:36] != b'\x32\x54\xcd\xab'):
+        return ''
+    # The running firmware also uses this marker as its version source.
+    marker = re.search(re.escape(FIRMWARE_MARKER) + rb'([0-9.]{5,14})\x00', image)
+    return marker[1].decode('ascii') if marker else ''
 
 
 def by_key(db, key, *, include_inactive=False):
@@ -98,7 +121,9 @@ def list_devices(db):
     devices = []
     for row in db.execute('''SELECT d.id,d.name,d.enabled,d.pending,d.mac,d.ip,d.firmware,d.created_at,d.last_seen_at,
         upper(substr(d.key_hash,1,8)) AS verification,
-        u.name AS last_user FROM scanner_devices d LEFT JOIN users u ON u.id=d.last_user_id
+        u.name AS last_user, o.version AS ota_version, o.status AS ota_status
+        FROM scanner_devices d LEFT JOIN users u ON u.id=d.last_user_id
+        LEFT JOIN scanner_updates o ON o.device_id=d.id
         ORDER BY d.pending DESC,d.name COLLATE NOCASE,d.id'''):
         devices.append({**dict(row), 'enabled': bool(row['enabled']), 'pending': bool(row['pending']),
                         'user_ids': [r[0] for r in db.execute(

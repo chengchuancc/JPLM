@@ -1,8 +1,10 @@
 #include "plm_client.h"
+#include "firmware_version.h"
 #include "settings.h"
 #include <HTTPClient.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <sdkconfig.h>
 #include <time.h>
 
 namespace {
@@ -22,7 +24,7 @@ String urlEncode(const String& value) {
 void deviceInfo(JsonDocument& data) {
   data["ip"] = WiFi.localIP().toString();
   data["mac"] = WiFi.macAddress();
-  data["firmware"] = "scanner/0.2.4";
+  data["firmware"] = String("scanner/") + firmwareVersion;
 }
 
 class ImageSink : public Stream {
@@ -55,9 +57,11 @@ void PlmClient::resetTiming() {
   status_ = 0;
   rejected_ = reusedConnection_ = false;
   connectMs_ = headersMs_ = bodyMs_ = 0;
+  transfer_ = {};
 }
 
 WiFiClient* PlmClient::prepareRequest(const String& path, bool binary) {
+  transfer_.phase = "setup";
   if (WiFi.status() != WL_CONNECTED) { error_ = "Wi-Fi 已断开"; return nullptr; }
   String base = TERMINAL_API_URL;
   if (!base.endsWith("/")) base += '/';
@@ -72,7 +76,9 @@ WiFiClient* PlmClient::prepareRequest(const String& path, bool binary) {
     if (!strstr(TERMINAL_ROOT_CA, "-----BEGIN CERTIFICATE-----")) {
       error_ = "Configure server root CA in local_config.h"; return nullptr;
     }
+#ifdef CONFIG_MBEDTLS_HAVE_TIME_DATE
     if (time(nullptr) < 1700000000) { error_ = "等待网络时间同步"; return nullptr; }
+#endif
     secure_.setCACert(TERMINAL_ROOT_CA);
     secure_.setHandshakeTimeout(4);
   }
@@ -87,12 +93,17 @@ WiFiClient* PlmClient::prepareRequest(const String& path, bool binary) {
 }
 
 bool PlmClient::connect() {
+  transfer_.phase = "connect";
   const uint32_t started = millis();
   const bool ok = http_.connect();
   lastRequestAt_ = millis();
   connectMs_ = lastRequestAt_ - started;
   if (!ok) {
     status_ = HTTPC_ERROR_CONNECTION_REFUSED;
+    if (String(TERMINAL_API_URL).startsWith("https://")) {
+      char message[64];
+      transfer_.tlsError = secure_.lastError(message, sizeof(message));
+    }
     error_ = "PLM 连接未建立";
     http_.end();
   }
@@ -118,13 +129,14 @@ bool PlmClient::request(const char* method, const String& path, const String& pa
   WiFiClient* transport = prepareRequest(path, pixels != nullptr);
   if (!transport || !connect()) return false;
   HTTPClient& http = http_;
-  const char* headers[] = {"X-JPLM-Edge", "Content-Type"};
-  http.collectHeaders(headers, 2);
+  const char* headers[] = {"X-JPLM-Edge", "Content-Type", "Date", "X-JPLM-Cache"};
+  http.collectHeaders(headers, pixels ? 4 : 3);
   http.addHeader("Accept", pixels ? "application/octet-stream" : "application/json");
   if (!deviceKey.isEmpty()) http.addHeader("X-Scanner-Key", deviceKey);
   else if (path != "health" && !token_.isEmpty()) http.addHeader("Authorization", "Bearer " + token_);
   if (!payload.isEmpty()) http.addHeader("Content-Type", "application/json; charset=utf-8");
   const uint32_t sentAt = millis();
+  transfer_.phase = "http";
   status_ = http.sendRequest(method, payload);
   headersMs_ = millis() - sentAt;
   if (status_ <= 0) {
@@ -133,12 +145,23 @@ bool PlmClient::request(const char* method, const String& path, const String& pa
     http.end(); return false;
   }
   const uint32_t bodyAt = millis();
+  transfer_.phase = "body";
+  transfer_.expected = http.getSize();
+  if (pixels) {
+    const String cache = http.header("X-JPLM-Cache");
+    for (const char* state : {"HIT", "MISS", "BYPASS", "EXPIRED", "REVALIDATED", "STALE", "UPDATING"}) {
+      if (cache == state) { transfer_.cache = state; break; }
+    }
+  }
   if (status_ == 401 && deviceKey.isEmpty() && path != "health") logout();
   if (pixels && status_ == 200) {
     ImageSink sink(pixels);
-    const bool valid = http.getSize() == ImageSink::length
-        && http.header("Content-Type") == "application/octet-stream";
+    const bool correctSize = transfer_.expected == static_cast<int>(ImageSink::length);
+    const bool correctType = http.header("Content-Type") == "application/octet-stream";
+    const bool valid = correctSize && correctType;
     const int received = valid ? http.writeToStream(&sink) : -1;
+    transfer_.received = sink.count;
+    if (!valid) transfer_.phase = correctSize ? "image-type" : "image-length";
     bodyMs_ = millis() - bodyAt;
     if (received < 0 || sink.count != ImageSink::length) transport->stop();
     http.end();
@@ -150,6 +173,7 @@ bool PlmClient::request(const char* method, const String& path, const String& pa
   }
   // Small endpoints only. Bound both known and chunked bodies before parsing.
   if (http.getSize() > static_cast<int>(kMaxJsonBytes)) {
+    transfer_.phase = "length-limit";
     error_ = "PLM 返回数据过长";
     transport->stop();
     http.end();
@@ -178,22 +202,40 @@ bool PlmClient::request(const char* method, const String& path, const String& pa
     void flush() override {}
   } sink;
   const int received = http.writeToStream(&sink);
+  transfer_.received = sink.data.length();
   bodyMs_ = millis() - bodyAt;
   if (path == "health") edge_ = http.header("X-JPLM-Edge") == "up";
+  const String date = path == "scanner/operators" && transport == &secure_ && time(nullptr) < 1700000000
+                      ? http.header("Date") : String();
   if (received < 0 || sink.overflow) transport->stop();
   http.end();
   if (received < 0 || sink.overflow) { error_ = "PLM 返回数据不完整"; return false; }
   if (deserializeJson(result, sink.data)) {
+    transfer_.phase = "json";
     error_ = status_ == 404 ? "服务器缺少扫码枪接口"
                           : status_ >= 500 ? "PLM 服务异常 " + String(status_)
                                            : "PLM 返回格式异常";
     return false;
   }
   if (status_ < 200 || status_ >= 300) {
+    transfer_.phase = "server";
     rejected_ = result["error"].is<const char*>()
         && (status_ == 400 || status_ == 403 || status_ == 404 || status_ == 409 || status_ == 422);
     error_ = result["error"] | "PLM 请求失败";
+    if (status_ == 401 || status_ == 403) transfer_.phase = "authorization";
+    else if (pixels) {
+      if (error_ == "扫码枪缩略图服务未开启") transfer_.phase = "image-service-disabled";
+      else if (error_ == "未找到物料图片") transfer_.phase = "image-file-missing";
+      else if (error_ == "未找到可显示的物料图片") transfer_.phase = "image-not-eligible";
+      else if (error_ == "无法生成物料缩略图") transfer_.phase = "image-decode";
+    }
     return false;
+  }
+  if (result["server_time"].isNull() && !date.isEmpty()) {
+    // Legacy PLM servers still supply the time in the HTTPS response's Date header.
+    tm utc{};
+    const char* end = strptime(date.c_str(), "%a, %d %b %Y %H:%M:%S GMT", &utc);
+    if (end && !*end) result["server_time"] = static_cast<long>(mktime(&utc));
   }
   return true;
 }
@@ -216,6 +258,7 @@ bool PlmClient::operators(const String& key, unsigned offset, JsonDocument& resu
   String body; serializeJson(data, body);
   if (!request("POST", "scanner/operators", body, result, key)) return false;
   if (result["users"].is<JsonArray>() && result["has_more"].is<bool>()) return true;
+  transfer_.phase = "schema";
   error_ = "设备用户列表格式无效";
   return false;
 }
@@ -229,6 +272,7 @@ bool PlmClient::select(const String& key, const String& user, JsonDocument& resu
   if (!request("POST", "scanner/session", body, result, key)) return false;
   String token = result["token"].as<String>();
   if (token.length() != 64 || result["user"]["id"].as<String>() != user) {
+    transfer_.phase = "schema";
     error_ = "登录返回的身份无效";
     return false;
   }
@@ -240,11 +284,16 @@ bool PlmClient::lookup(const String& code, JsonDocument& result) {
   const String path = "warehouse/material?q=" + urlEncode(code);
   if (request("GET", path, "", result)) return true;
   // An idle peer can close a reused connection just before the request is sent.
-  return reusedConnection_ && status_ < 0 && request("GET", path, "", result);
+  if (!reusedConnection_ || status_ >= 0) return false;
+  const int firstStatus = status_;
+  const bool ok = request("GET", path, "", result);
+  transfer_.retryHttp = firstStatus;
+  return ok;
 }
 bool PlmClient::submit(const String& exactPayload, JsonDocument& result) {
   if (!request("POST", "warehouse/movements", exactPayload, result)) return false;
   if (result["id"].as<String>().length() != 24 || !result["stock"].is<double>()) {
+    transfer_.phase = "schema";
     error_ = "Incomplete submit result; retain request for retry"; return false;
   }
   return true;
@@ -253,6 +302,7 @@ bool PlmClient::submit(const String& exactPayload, JsonDocument& result) {
 bool PlmClient::history(unsigned offset, JsonDocument& result) {
   if (!request("GET", "warehouse/movements?limit=6&offset=" + String(offset), "", result)) return false;
   if (result.is<JsonArray>()) return true;
+  transfer_.phase = "schema";
   error_ = "历史记录格式无效";
   return false;
 }
@@ -260,6 +310,7 @@ bool PlmClient::history(unsigned offset, JsonDocument& result) {
 bool PlmClient::removeMovement(const String& id, const String& payload, JsonDocument& result) {
   if (!request("DELETE", "warehouse/movements/" + urlEncode(id), payload, result)) return false;
   if (result["id"].as<String>() == id) return true;
+  transfer_.phase = "schema";
   error_ = "缺少删除结果，可安全重试";
   return false;
 }

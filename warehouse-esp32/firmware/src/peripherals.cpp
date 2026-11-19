@@ -69,15 +69,28 @@ char Peripherals::pollKey() {
   return singleMatrixKey(stable_);
 }
 
-bool Peripherals::pollScanner(String& code) {
+bool Peripherals::pollScanner(String& code, ScanStats* stats) {
   if (!powered_) return false;
   bool ready = false;
   while (scanner_.available()) {
     lastByte_ = millis();
-    if (frame_.feed(static_cast<char>(scanner_.read()))) { ready = true; break; }
+    const char byte = static_cast<char>(scanner_.read());
+    const bool closing = stats && (byte == '\r' || byte == '\n') && frame_.pending();
+    ready = frame_.feed(byte);
+    if (stats) {
+      ++stats->bytes;
+      if (!ready && closing) ++stats->rejected;
+      if (ready) stats->endedOnIdle = false;
+    }
+    if (ready) break;
   }
-  if (!ready && frame_.pending() && millis() - lastByte_ >= TERMINAL_SCANNER_IDLE_MS)
+  if (!ready && frame_.pending() && millis() - lastByte_ >= TERMINAL_SCANNER_IDLE_MS) {
     ready = frame_.finish();
+    if (stats) {
+      if (ready) stats->endedOnIdle = true;
+      else ++stats->rejected;
+    }
+  }
   if (!ready) return false;
   code = frame_.data();
   frame_.reset();

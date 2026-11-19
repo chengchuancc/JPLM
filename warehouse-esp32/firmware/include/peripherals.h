@@ -6,9 +6,13 @@
 
 class Peripherals {
  public:
+  struct ScanStats {
+    uint32_t bytes = 0, rejected = 0;
+    bool endedOnIdle = false;
+  };
   void begin();
   char pollKey(); // single press events after debounce; S is scrap, T is scan
-  bool pollScanner(String& code);
+  bool pollScanner(String& code, ScanStats* stats = nullptr);
   void trigger(bool active);
   bool scanActive() const { return triggerActive_; }
   void scannerPower(bool on);

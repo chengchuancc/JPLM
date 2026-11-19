@@ -992,6 +992,13 @@ type ScannerDevice = {
   firmware: string;
   last_seen_at: string | null;
   last_user: string | null;
+  ota_version: string | null;
+  ota_status: "queued" | "downloading" | "retry" | "installed" | "superseded" | null;
+};
+
+const scannerUpdateLabels = {
+  queued: "等待设备空闲", downloading: "已开始下载", retry: "下载失败，等待重试",
+  installed: "已安装", superseded: "已由更新版本替代",
 };
 
 function ScannerDevicesPanel() {
@@ -1003,6 +1010,8 @@ function ScannerDevicesPanel() {
   } | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [upgrade, setUpgrade] = useState<ScannerDevice | null>(null);
+  const [firmwareFile, setFirmwareFile] = useState<File | null>(null);
 
   async function load() {
     setError("");
@@ -1039,6 +1048,22 @@ function ScannerDevicesPanel() {
     }
   }
 
+  async function saveUpgrade(cancel = false) {
+    if (!upgrade || busy || (!cancel && !firmwareFile)) return;
+    setError("");
+    setBusy(true);
+    try {
+      await api(`scanner-devices/${upgrade.id}/firmware`, cancel ? "DELETE" : "PUT",
+        cancel ? undefined : firmwareFile!.slice(0, firmwareFile!.size, "application/octet-stream"));
+      setUpgrade(null);
+      await load();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <>
       <div className="section-toolbar">
@@ -1047,7 +1072,7 @@ function ScannerDevicesPanel() {
           <Button small onClick={() => void load()}>刷新</Button>
         </div>
       </div>
-      {error && !draft && <p className="form-error" role="alert">{error}</p>}
+      {error && !draft && !upgrade && <p className="form-error" role="alert">{error}</p>}
       <div className="table-wrap">
         <table>
           <thead><tr><th>名称</th><th>状态</th><th>识别码</th><th>IP / MAC</th><th>固件</th><th>最近登录</th><th>最近连接</th><th /></tr></thead>
@@ -1058,19 +1083,41 @@ function ScannerDevicesPanel() {
                 <td>{device.pending ? "待审核" : !device.enabled ? "已停用" : device.mac ? "已启用" : "等待连接"}</td>
                 <td><code>{device.mac ? device.verification : "—"}</code></td>
                 <td>{[device.ip, device.mac].filter(Boolean).join(" / ") || "—"}</td>
-                <td>{device.firmware || "—"}</td>
+                <td>{device.firmware || "—"}{device.ota_status && <div className="muted">
+                  {device.ota_version} · {scannerUpdateLabels[device.ota_status]}
+                </div>}</td>
                 <td>{device.last_user || "—"}</td>
                 <td>{device.last_seen_at ? datetime(device.last_seen_at) : "—"}</td>
-                <td><Button small onClick={() => {
+                <td><div className="row-actions"><Button small onClick={() => {
                   setError("");
                   setDraft({ ...device, enabled: device.pending || device.enabled, approve: false });
-                }}>{device.pending ? "审核" : "编辑"}</Button></td>
+                }}>{device.pending ? "审核" : "编辑"}</Button>
+                  {device.enabled && !device.pending && device.firmware && <Button small onClick={() => {
+                    setError(""); setFirmwareFile(null); setUpgrade(device);
+                  }}>固件升级</Button>}
+                </div></td>
               </tr>
             ))}
             {devices.length === 0 && <tr><td colSpan={8}>扫码枪连上 Wi-Fi 后会自动出现在这里。</td></tr>}
           </tbody>
         </table>
       </div>
+      {upgrade && (
+        <Dialog title={`固件升级 · ${upgrade.name}`} onClose={() => { if (!busy) setUpgrade(null); }}>
+          <form onSubmit={(event) => { event.preventDefault(); void saveUpgrade(); }}>
+            <p>设备联网且空闲时会自动下载、校验并重启。首次使用需通过 USB 烧录 0.2.7 或更新版本。</p>
+            <label>仓库应用固件 <input type="file" accept=".bin,application/octet-stream" required disabled={busy}
+              onChange={(event) => setFirmwareFile(event.target.files?.[0] ?? null)} /></label>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="row-actions">
+              <Button type="button" disabled={busy} onClick={() => setUpgrade(null)}>关闭</Button>
+              {upgrade.ota_status && ["queued", "downloading", "retry"].includes(upgrade.ota_status) &&
+                <Button type="button" disabled={busy} onClick={() => void saveUpgrade(true)}>取消已安排的升级</Button>}
+              <Button primary type="submit" disabled={busy || !firmwareFile}>上传并安排升级</Button>
+            </div>
+          </form>
+        </Dialog>
+      )}
       {draft && (
         <Dialog title={draft.pending ? "审核扫码枪" : "编辑扫码枪"} onClose={() => { if (!busy) setDraft(null); }}>
           <form onSubmit={(event) => { event.preventDefault(); void save(); }}>

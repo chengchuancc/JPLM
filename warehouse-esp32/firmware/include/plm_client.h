@@ -6,6 +6,12 @@
 
 class PlmClient {
  public:
+  struct Transfer {
+    unsigned received = 0;
+    int expected = -1, retryHttp = 0, tlsError = 0;
+    const char* phase = "none";
+    const char* cache = "-";
+  };
   bool operators(const String& key, unsigned offset, JsonDocument& result);
   bool select(const String& key, const String& user, JsonDocument& result);
   void logout() { token_ = ""; userId_ = ""; }
@@ -18,6 +24,8 @@ class PlmClient {
   bool history(unsigned offset, JsonDocument& result);
   bool removeMovement(const String& id, const String& payload, JsonDocument& result);
   bool thumbnail(const String& id, uint16_t* pixels);
+  bool checkFirmware(const String& key, const String& failed, JsonDocument& result);
+  bool installFirmware(const String& key, const String& sha256, unsigned size);
   bool authenticated() const { return !token_.isEmpty(); }
   bool viaEdge() const { return edge_; }
   const String& error() const { return error_; }
@@ -28,6 +36,7 @@ class PlmClient {
   uint32_t connectMs() const { return connectMs_; }
   uint32_t headersMs() const { return headersMs_; }
   uint32_t bodyMs() const { return bodyMs_; }
+  const Transfer& transfer() const { return transfer_; }
  private:
   class Request : public HTTPClient {
    public:
@@ -42,6 +51,7 @@ class PlmClient {
   WiFiClient plain_;
   WiFiClientSecure secure_;
   Request http_;
+  Transfer transfer_;
   uint32_t lastRequestAt_ = 0;
   uint32_t connectMs_ = 0, headersMs_ = 0, bodyMs_ = 0;
   int status_ = 0;

@@ -1094,6 +1094,8 @@ def write_backup(output):
                 source.backup(target)
             target.execute('DELETE FROM sessions')
             target.execute('DELETE FROM scanner_sessions')
+            target.execute('PRAGMA secure_delete=ON')
+            target.execute('DELETE FROM scanner_updates')
             files = target.execute('SELECT id FROM files').fetchall()
         with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
             archive.write(database, 'plm.sqlite3')
@@ -1381,6 +1383,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.auth(path)
             if (path, method) in (('/api/scanner/operators', 'POST'), ('/api/scanner/session', 'POST')):
                 return self.scanner_operator(path.endswith('/session'))
+            if method == 'GET' and path == '/api/scanner/update':
+                return self.scanner_update_check()
+            if method == 'GET' and (match := re.fullmatch(r'/api/scanner/update/([a-f0-9]{64})', path)):
+                return self.scanner_update_download(match[1])
             movement_delete = re.fullmatch(r'/api/warehouse/movements/([a-f0-9]{24})', path) if method == 'DELETE' else None
             self.warehouse_request = (
                 (path, method) in (('/api/warehouse/material', 'GET'), ('/api/warehouse/movements', 'GET'),
@@ -1405,6 +1411,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.scanner_thumbnail(scanner_image[1])
             if path == '/api/scanner-devices' and method in ('GET', 'POST'):
                 return self.scanner_directory(method)
+            if method in ('PUT', 'DELETE') and (match := re.fullmatch(r'/api/scanner-devices/([a-f0-9]{24})/firmware', path)):
+                return self.manage_scanner_update(method, match[1])
             if method == 'PUT' and (match := re.fullmatch(r'/api/scanner-devices/([a-f0-9]{24})', path)):
                 return self.scanner_directory(method, match[1])
             if path == '/api/settings/shopify' and method in ('GET', 'PUT'):
@@ -1692,6 +1700,88 @@ class Handler(BaseHTTPRequestHandler):
             log_activity(db, self.user, '更新扫码枪' if method == 'PUT' else '登记扫码枪', device_id, name, detail)
         return self.send({'id': device_id, 'key': key})
 
+    def manage_scanner_update(self, method, device_id):
+        self.require_admin()
+        if method == 'PUT':
+            size = self.body_size()
+            if not 256 <= size <= scanner_devices.MAX_FIRMWARE_BYTES:
+                raise Problem('固件大小超出扫码枪分区容量或文件不完整', 413)
+            image = self.rfile.read(size)
+            version = scanner_devices.image_version(image) if len(image) == size else ''
+            target = scanner_devices.version_tuple(version)
+            if not target:
+                raise Problem('请上传仓库应用编译生成的 ESP32-S3 N16R8 firmware.bin')
+            sha256 = hashlib.sha256(image).hexdigest()
+        with FILE_LOCK, transaction() as db:
+            device = exists(db, 'scanner_devices', device_id)
+            if method == 'DELETE':
+                db.execute("DELETE FROM scanner_updates WHERE device_id=? AND status!='installed'", (device_id,))
+                log_activity(db, self.user, '取消扫码枪升级', device_id, device['name'])
+            else:
+                running = scanner_devices.version_tuple(device['firmware'].removeprefix('scanner/'))
+                if not device['enabled'] or device['pending'] or running < scanner_devices.OTA_MIN_VERSION:
+                    raise Problem('启用设备并先通过 USB 烧录支持远程升级的固件')
+                if target <= running:
+                    raise Problem('固件版本必须高于当前设备版本', 409)
+                db.execute('''INSERT INTO scanner_updates(device_id,version,sha256,size,image,status,updated_at)
+                    VALUES(?,?,?,?,?,'queued',?) ON CONFLICT(device_id) DO UPDATE SET version=excluded.version,
+                    sha256=excluded.sha256,size=excluded.size,image=excluded.image,status='queued',updated_at=excluded.updated_at''',
+                           (device_id, version, sha256, size, image, now()))
+                log_activity(db, self.user, '安排扫码枪升级', device_id, device['name'], version)
+        return self.send({'ok': True})
+
+    def scanner_update_check(self):
+        query = parse_qs(urlparse(self.path).query)
+        version = query.get('version', [''])[0]
+        failed = query.get('failed', [''])[0]
+        running = scanner_devices.version_tuple(version)
+        if not running or (failed and not re.fullmatch(r'[a-f0-9]{64}', failed)):
+            raise Problem('固件参数无效')
+        with FILE_LOCK, transaction() as db:
+            device = scanner_devices.by_key(db, self.headers.get('X-Scanner-Key'))
+            if not device:
+                raise Problem('扫码枪未获授权', 401)
+            current = datetime.now(timezone.utc)
+            firmware = 'scanner/' + version
+            if (device['firmware'] != firmware
+                    or (device['last_seen_at'] or '') < (current - timedelta(seconds=25)).isoformat()):
+                db.execute('UPDATE scanner_devices SET firmware=?,last_seen_at=? WHERE id=?',
+                           (firmware, current.isoformat(), device['id']))
+            update = db.execute('SELECT version,sha256,size,status FROM scanner_updates WHERE device_id=?',
+                                (device['id'],)).fetchone()
+            result = None
+            if update and update['status'] != 'installed':
+                if running >= scanner_devices.version_tuple(update['version']):
+                    status = 'installed' if version == update['version'] else 'superseded'
+                    db.execute('UPDATE scanner_updates SET image=NULL,status=?,updated_at=? WHERE device_id=?',
+                               (status, now(), device['id']))
+                elif update['status'] != 'superseded':
+                    if failed == update['sha256'] and update['status'] != 'retry':
+                        db.execute("UPDATE scanner_updates SET status='retry',updated_at=? WHERE device_id=?",
+                                   (now(), device['id']))
+                    result = {key: update[key] for key in ('version', 'sha256', 'size')}
+        return self.send({'update': result})
+
+    def scanner_update_download(self, sha256):
+        with FILE_LOCK, transaction() as db:
+            device = scanner_devices.by_key(db, self.headers.get('X-Scanner-Key'))
+            if not device:
+                raise Problem('扫码枪未获授权', 401)
+            update = db.execute('SELECT image FROM scanner_updates WHERE device_id=? AND sha256=? AND image IS NOT NULL',
+                                (device['id'], sha256)).fetchone()
+            if not update:
+                raise Problem('升级已取消或已替换', 404)
+            image = update['image']
+            db.execute("UPDATE scanner_updates SET status='downloading',updated_at=? WHERE device_id=?",
+                       (now(), device['id']))
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(image)))
+        self.send_header('Cache-Control', 'private, no-store')
+        self.security_headers()
+        self.end_headers()
+        self.wfile.write(image)
+
     def scanner_operator(self, select):
         if self.body_size() > 1024:
             raise Problem('扫码枪请求过长', 413)
@@ -1739,7 +1829,7 @@ class Handler(BaseHTTPRequestHandler):
                 state = 'pending' if device['pending'] else 'ready' if device['enabled'] else 'disabled'
                 users = scanner_devices.operators(db, device['id'], offset=offset, limit=7) if state == 'ready' else []
                 result = {'name': device['name'], 'users': [dict(row) for row in users[:6]],
-                          'has_more': len(users) > 6}
+                          'has_more': len(users) > 6, 'server_time': int(current.timestamp())}
                 if automatic:
                     result.update(state=state, verification=device['key_hash'][:8].upper())
         return self.send(result)

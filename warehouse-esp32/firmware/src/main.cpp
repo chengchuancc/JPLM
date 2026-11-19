@@ -1,20 +1,29 @@
 #include <Arduino.h>
 #include <Preferences.h>
 #include <WiFi.h>
+#include <esp_ota_ops.h>
 #include <esp_system.h>
 #include <esp_wifi.h>
+#include <sdkconfig.h>
 #include <atomic>
+#include <stdarg.h>
+#include <sys/time.h>
 #include <time.h>
+#include <utility>
+#include "firmware_version.h"
 #include "material_preview.h"
 #include "peripherals.h"
 #include "provisioning.h"
 #include "settings.h"
 #include "terminal_display.h"
 #include "terminal_network.h"
+#include "wireless_debug.h"
 
 namespace {
 enum class Page { Users, Home, Material, Quantity, History, Record, Delete };
 enum class Route { Checking, Local, Cloud, Unconfirmed };
+// ESP-IDF 4.4 maps 80–84 quarter-dBm units to its highest table entry, 20 dBm.
+constexpr int8_t kWifiMaxTxPower = 80;
 using ui::Icon;
 Peripherals hardware;
 TerminalDisplay screen(hardware.display());
@@ -23,12 +32,18 @@ TerminalNetwork network;
 TerminalNetwork background;
 Preferences store;
 MaterialPreviewCache previews;
+WirelessDebug wirelessDebug;
+Peripherals::ScanStats scanStats;
+uint32_t scanStartedAt = 0, scanStartBytes = 0, scanStartRejected = 0;
 Page page = Page::Users;
 uint32_t generation = 0, usersAt = 0, healthAt = 0, batteryAt = 0, nextAnimation = 0;
 uint32_t keepAliveAt = 0, lastInteractionAt = 0;
-uint32_t pageShownAt = 0, keyPressedAt = 0;
+uint32_t keyPressedAt = 0;
+uint32_t imageShownAt = 0;
 char lastKey = 0;
 bool dirty = true, connected = false;
+bool debugPanel = false;
+uint32_t debugSampleAt = 0;
 bool freshRoute = true;
 Route route = Route::Checking;
 unsigned wifiRevision = 0;
@@ -36,6 +51,10 @@ uint8_t lastBssid[6] = {};
 uint32_t signalAt = 0;
 bool ready = false, backgroundReady = false, hasStorage = false, scanning = false;
 bool clockReady = false, lowBatteryAlert = false;
+bool verifyFirmwareBoot = false, rebootForFirmware = false;
+uint32_t firmwareCheckAt = 0, firmwareRetryAt = 0, firmwareRebootAt = 0;
+unsigned firmwareSize = 0;
+String firmwareDigest, failedFirmware;
 bool loadingVisible = false, motionVisible = false;
 bool scannedMaterial = false, warmWanted = false;
 int batteryLevel = -1, filteredMillivolts = 0;
@@ -55,6 +74,27 @@ bool moreUsers = false;
 JsonDocument users, history;
 String usbLine;
 
+void diagnostic(const char* format, ...) {
+  char line[192];
+  va_list arguments;
+  va_start(arguments, format);
+  vsnprintf(line, sizeof(line), format, arguments);
+  va_end(arguments);
+  Serial.print(line);
+  wirelessDebug.record(line);
+}
+
+void debugLog(const char* format, ...) {
+  if (!wirelessDebug.enabled()) return;
+  char line[192];
+  const int prefix = snprintf(line, sizeof(line), "[%lums] ", static_cast<unsigned long>(millis()));
+  va_list arguments;
+  va_start(arguments, format);
+  vsnprintf(line + prefix, sizeof(line) - prefix, format, arguments);
+  va_end(arguments);
+  wirelessDebug.record(line);
+}
+
 void show(const String& text, bool error = false) {
   notice = text;
   dirty = true;
@@ -65,7 +105,6 @@ void show(const String& text, bool error = false) {
 void go(Page next) {
   if (page != next) lastKey = 0;
   page = next;
-  pageShownAt = millis();
   ++generation;
   notice = "";
   dirty = true;
@@ -79,9 +118,17 @@ String formatQuantity(double value) {
   return text;
 }
 
+bool startRequest(TerminalNetwork& worker, NetworkJob job) {
+  if (!worker.start(std::move(job))) return false;
+  const auto& active = worker.job();
+  debugLog("PLM #%u %s start context=%lu\n", worker.requestId(), operationLabel(active.operation),
+           static_cast<unsigned long>(active.generation));
+  return true;
+}
+
 bool start(Operation operation, const String& argument = "", const String& payload = "",
            unsigned offset = 0, uint16_t* pixels = nullptr) {
-  if (!network.start({operation, generation, argument, payload, offset, pixels})) return false;
+  if (!startRequest(network, {operation, generation, argument, payload, offset, pixels})) return false;
   keepAliveAt = millis() + 25000;
   return true;
 }
@@ -107,13 +154,17 @@ void loadMaterial(const String& input, bool fromScanner = false) {
   scannedMaterial = fromScanner;
   partCode = input;
   partId = projectId = partName = custodian = unit = stock = imageId = "";
-  if (const auto* preview = previews.find(query)) {
+  const auto* preview = previews.find(query);
+  if (preview) {
     partCode = preview->code;
     partName = preview->name;
     unit = preview->unit;
   }
   imageWanted = imageShown = false;
   lookupWanted = true;
+  debugLog("Lookup queued context=%lu source=%s local_preview=%s wifi=%s\n",
+           static_cast<unsigned long>(generation), fromScanner ? "scanner" : "keyboard",
+           preview ? "hit" : "miss", connected ? "up" : "down");
   show(connected ? "正在查找物料..." : "等待联网后查找物料");
 }
 
@@ -220,8 +271,39 @@ void deleteMovement() {
   show("正在删除并重新计算库存...");
 }
 
+bool clockBlocksNetwork() {
+#ifdef CONFIG_MBEDTLS_HAVE_TIME_DATE
+  return !clockReady && String(TERMINAL_API_URL).startsWith("https://");
+#else
+  return false;
+#endif
+}
+
+bool idleForFirmware() {
+  if (!connected || network.busy() || scanning || debugPanel || wifi.active()
+      || !pending.isEmpty() || !signInWanted.isEmpty() || !waitingScan.isEmpty() || !typed.isEmpty()
+      || lookupWanted || historyWanted || page == Page::Quantity || page == Page::Delete) return false;
+  const unsigned quiet = page == Page::Home || page == Page::Users ? 6000 : 45000;
+  return millis() - lastInteractionAt >= quiet;
+}
+
+void rebootAfterFirmware() {
+  if (!rebootForFirmware) return;
+  if (!idleForFirmware()) {
+    if (firmwareRebootAt && notice == "固件已校验，即将重启") show("");
+    firmwareRebootAt = 0;
+    return;
+  }
+  if (!firmwareRebootAt) {
+    firmwareRebootAt = millis() + 1400;
+    show("固件已校验，即将重启");
+  } else if (int32_t(millis() - firmwareRebootAt) >= 0) {
+    ESP.restart();
+  }
+}
+
 void scheduleNetwork() {
-  if (!ready || !connected || !clockReady || wifi.active()) return;
+  if (!ready || !connected || clockBlocksNetwork() || wifi.active() || firmwareRebootAt) return;
   if (!network.busy()) {
     if (page == Page::Users && !signInWanted.isEmpty()) {
       if (start(Operation::SignIn, signInWanted, wifi.key())) signInWanted = "";
@@ -246,12 +328,24 @@ void scheduleNetwork() {
   }
   if (!backgroundReady || background.busy()) return;
   if (page == Page::Material && imageWanted && !sessionToken.isEmpty()) {
-    if (background.start({Operation::Image, generation, imageId, sessionToken, 0, imagePixels})) {
+    if (startRequest(background, {Operation::Image, generation, imageId, sessionToken, 0, imagePixels})) {
       imageWanted = false;
     }
   } else if (!network.busy() && int32_t(millis() - healthAt) >= 0
-             && background.start({Operation::Health, wifiRevision, freshRoute ? "fresh" : "", "", 0, nullptr})) {
+             && startRequest(background, {Operation::Health, wifiRevision, freshRoute ? "fresh" : "", "", 0, nullptr})) {
     healthAt = millis() + 60000;
+  } else if (!verifyFirmwareBoot && !rebootForFirmware && deviceState == "ready" && !network.busy()) {
+    const uint32_t now = millis();
+    if (int32_t(now - firmwareCheckAt) >= 0) {
+      if (startRequest(background, {Operation::FirmwareCheck, wifiRevision, wifi.key(), failedFirmware, 0, nullptr})) {
+        firmwareCheckAt = now + 15000;
+      }
+    } else if (!firmwareDigest.isEmpty() && idleForFirmware() && (batteryLevel < 0 || batteryLevel >= 20)
+               && (firmwareDigest != failedFirmware || int32_t(now - firmwareRetryAt) >= 0)) {
+      if (startRequest(background, {Operation::FirmwareDownload, wifiRevision, wifi.key(), firmwareDigest, firmwareSize, nullptr})) {
+        firmwareDigest = "";
+      }
+    }
   }
 }
 
@@ -261,17 +355,38 @@ void receiveBackground(const NetworkReply& reply, const NetworkJob& job) {
       route = reply.ok ? (reply.viaEdge ? Route::Local : Route::Cloud) : Route::Unconfirmed;
       freshRoute = !reply.ok;
       healthAt = millis() + (reply.ok ? 60000 : 5000);
-      Serial.printf("PLM route %s, dns=%s, rssi=%d dBm\n",
+      diagnostic("PLM route %s, dns=%s, rssi=%d dBm\n",
                     reply.ok ? (reply.viaEdge ? "local" : "cloud") : "unconfirmed",
                     WiFi.dnsIP().toString().c_str(), lastSignal);
       dirty = true;
     }
-  } else if (job.argument == imageId && job.payload == sessionToken
+  } else if (job.operation == Operation::FirmwareCheck) {
+    if (!reply.ok) firmwareCheckAt = millis() + 30000;
+    if (reply.ok && connected && job.generation == wifiRevision) {
+      firmwareDigest = reply.data["update"]["sha256"] | "";
+      firmwareSize = reply.data["update"]["size"] | 0U;
+    } else {
+      firmwareDigest = "";
+    }
+  } else if (job.operation == Operation::FirmwareDownload) {
+    if (reply.ok) {
+      diagnostic("Firmware validated; waiting to reboot while idle\n");
+      rebootForFirmware = true;
+    } else {
+      failedFirmware = job.payload;
+      firmwareRetryAt = millis() + 60000;
+      firmwareCheckAt = millis();
+      diagnostic("Firmware update failed: %s\n", reply.error.c_str());
+    }
+  } else if (job.operation == Operation::Image && job.argument == imageId && job.payload == sessionToken
              && (page == Page::Material || page == Page::Quantity)) {
     if (reply.ok) {
       imageWanted = false;
+      screen.setThumbnail(imagePixels);
+      imageShownAt = millis();
       imageShown = true;
       dirty = true;
+      debugLog("Thumbnail accepted for display context=%lu\n", static_cast<unsigned long>(job.generation));
     } else if (page == Page::Material && reply.status != 401 && notice.isEmpty()) {
       show("图片暂不可用");
     }
@@ -325,6 +440,20 @@ void receive(const NetworkReply& reply, const NetworkJob& job) {
 
   switch (job.operation) {
     case Operation::Users: {
+      const long serverTime = reply.data["server_time"] | 0L;
+      if (!clockReady && time(nullptr) < 1700000000 && serverTime >= 1700000000
+          && String(TERMINAL_API_URL).startsWith("https://")) {
+        const timeval stamp{serverTime, 0};
+        if (settimeofday(&stamp, nullptr) == 0) {
+          clockReady = true;
+          diagnostic("PLM clock ready at %lu ms\n", static_cast<unsigned long>(millis()));
+        }
+      }
+      if (verifyFirmwareBoot) {
+        const esp_err_t result = esp_ota_mark_app_valid_cancel_rollback();
+        if (result == ESP_OK) verifyFirmwareBoot = false;
+        diagnostic("Firmware %s boot check: %s\n", firmwareVersion, esp_err_to_name(result));
+      }
       users = reply.data["users"];
       userIndex = users.size() ? min(userIndex, users.size() - 1) : 0;
       moreUsers = reply.data["has_more"].as<bool>();
@@ -361,6 +490,7 @@ void receive(const NetworkReply& reply, const NetworkJob& job) {
       projectId = reply.data["project_id"] | "";
       if (partId.length() != 24 || projectId.isEmpty() || !reply.data["stock"].is<double>()) {
         partId = "";
+        debugLog("Lookup result rejected context=%lu reason=material-schema\n", static_cast<unsigned long>(job.generation));
         show("物料返回数据不完整", true);
         break;
       }
@@ -372,6 +502,13 @@ void receive(const NetworkReply& reply, const NetworkJob& job) {
       imageId = reply.data["image_id"] | "";
       if (!partCode.isEmpty()) previews.remember(query, partCode, partName, unit);
       imageWanted = imageId.length() == 24;
+      if (wirelessDebug.enabled()) {
+        const bool simpleCode = partCode.length() && partCode.length() <= 40
+            && strspn(partCode.c_str(), "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_.") == partCode.length();
+        debugLog("Lookup matched context=%lu material=%s thumbnail=%s\n",
+                 static_cast<unsigned long>(job.generation), simpleCode ? partCode.c_str() : "-",
+                 imageWanted ? "queued" : "none");
+      }
       show("");
       if (!scannedMaterial) hardware.beep();
       break;
@@ -389,11 +526,21 @@ void receive(const NetworkReply& reply, const NetworkJob& job) {
     case Operation::Image:
     case Operation::Prepare:
     case Operation::KeepAlive:
+    case Operation::FirmwareCheck:
+    case Operation::FirmwareDownload:
       break;
   }
 }
 
 void handleScan(const String& barcode) {
+  debugPanel = false;
+  if (wirelessDebug.enabled()) {
+    debugLog("Scan decoded bytes=%u end=%s trigger_ms=%ld payload=%s action=%s\n",
+             static_cast<unsigned>(barcode.length()), scanStats.endedOnIdle ? "uart-idle" : "cr-lf",
+             scanning ? static_cast<long>(millis() - scanStartedAt) : -1L,
+             barcode.startsWith("https://") || barcode.startsWith("http://") ? "url" : "text",
+             userId.isEmpty() ? "wait-for-login" : "lookup");
+  }
   scanning = false;
   lastInteractionAt = millis();
   hardware.beep();
@@ -410,10 +557,24 @@ void handleKey(char key) {
   keyPressedAt = millis();
   dirty = true;
   lastInteractionAt = millis();
+  if (debugPanel) {
+    if (key == 'E') {
+      wirelessDebug.disable();
+      debugPanel = false;
+      show("无线调试已关闭");
+      return;
+    }
+    if (key == 'B' || key == 'U' || key == 'T') debugPanel = false;
+    if (key != 'T') return;
+  }
   if (key == 'T') {
     if (!wifi.active()) {
       hardware.trigger(true);
       scanning = true;
+      scanStartedAt = millis();
+      scanStartBytes = scanStats.bytes;
+      scanStartRejected = scanStats.rejected;
+      debugLog("Scan trigger window=3000ms uart_baud=%u\n", static_cast<unsigned>(TERMINAL_SCANNER_BAUD));
       warmWanted = !userId.isEmpty();
       show("正在扫码...");
     }
@@ -466,7 +627,11 @@ void handleKey(char key) {
   }
   switch (page) {
     case Page::Home:
-      if (key == 'E' && typed.length() == 6) {
+      if (key == 'U') {
+        debugPanel = wirelessDebug.enable();
+        if (debugPanel) debugSampleAt = millis();
+        else show("无法开启无线调试", true);
+      } else if (key == 'E' && typed.length() == 6) {
         loadMaterial("JC" + typed);
         typed = "";
       } else if (key == 'E' && typed.isEmpty() && !pending.isEmpty()) {
@@ -522,12 +687,11 @@ void handleKey(char key) {
   }
 }
 
-String connection() {
+const char* connection() {
   if (!connected) return "Wi-Fi 重连中";
-  const char* path = route == Route::Local ? "  本地路由"
-                   : route == Route::Cloud ? "  云端直连"
-                   : route == Route::Checking ? "  检测路由" : "  路由重查";
-  return WiFi.localIP().toString() + path;
+  if (route == Route::Local) return "局域网";
+  if (route == Route::Cloud) return "云端";
+  return route == Route::Checking ? "检测中" : "重查中";
 }
 
 String recordTime(const char* timestamp, bool full = false) {
@@ -548,148 +712,216 @@ String recordQuantity(JsonObjectConst row) {
   return formatQuantity(row["qty"].as<double>());
 }
 
-void draw() {
+Icon movementIcon(const char* kind) {
+  if (strcmp(kind, "入库") == 0) return Icon::Inbound;
+  if (strcmp(kind, "出库") == 0) return Icon::Outbound;
+  return Icon::Trash;
+}
+
+void draw(uint32_t now) {
+  const char* link = connection();
   if (wifi.active()) {
-    screen.frame(Icon::Wifi, "手机配网", WiFi.softAPIP().toString(), batteryLevel);
-    screen.card(10, 56, 220, 108);
-    screen.text(78, "热点   " + wifi.network(), ui::accent, 22);
-    screen.text(102, "密码   " + wifi.password(), ui::text, 22);
-    screen.text(126, "连接热点后打开浏览器", ui::muted, 22);
-    screen.text(149, "http://" + WiFi.softAPIP().toString(), ui::text, 22);
-    screen.footer(wifi.message(), "返回 关闭配网");
+    screen.frame(Icon::Wifi, "手机配网", "配网热点", batteryLevel);
+    screen.icon(Icon::Wifi, 12, 65, 16, ui::muted);
+    screen.text(79, wifi.network(), ui::text, 46, 169);
+    screen.divider(90);
+    screen.icon(Icon::Key, 12, 99, 16, ui::muted);
+    screen.number(46, 99, 169, wifi.password(), ui::accent);
+    screen.icon(Icon::Link, 14, 150, 16);
+    screen.text(164, "http://" + WiFi.softAPIP().toString(), ui::text, 37, 186);
+    screen.text(196, wifi.message(), ui::muted, 12, 215);
+    screen.button(10, 212, 220, 25, Icon::Back, "关闭配网", 'B', ui::panel);
     return;
   }
-  const String link = connection();
+  if (debugPanel) {
+    screen.frame(Icon::Link, "无线调试", link, batteryLevel);
+    screen.text(66, wirelessDebug.attached() ? "浏览器已连接" : "在浏览器打开", ui::muted);
+    screen.text(89, connected ? "http://" + WiFi.localIP().toString() + ':' + WirelessDebug::port
+                              : "正在等待 Wi-Fi", ui::text, 11, 218);
+    screen.divider(105);
+    screen.icon(Icon::Key, 10, 115, 15, ui::muted);
+    screen.text(130, "临时连接码", ui::muted, 34, 186);
+    screen.number(10, 138, 210, wirelessDebug.code(), ui::accent);
+    screen.button(10, 182, 106, 29, Icon::Back, "返回工作", 'B', ui::panel);
+    screen.button(124, 182, 106, 29, Icon::Confirm, "关闭调试", 'E', ui::accent);
+    screen.text(233, "30 分钟后自动关闭", ui::muted);
+    return;
+  }
   switch (page) {
-    case Page::Users:
+    case Page::Users: {
       screen.frame(Icon::Person, "选择用户", link, batteryLevel);
       if (users.size()) {
         for (unsigned i = 0; i < users.size() && i < 6; ++i) {
-          screen.row(50 + i * 21, users[i]["name"] | "", i == userIndex);
+          screen.row(42 + i * 25, Icon::Person, users[i]["name"] | "", i == userIndex);
         }
+      } else if (deviceState == "pending" || deviceState == "disabled") {
+        screen.icon(Icon::Key, 15, 65, 20, ui::warning);
+        screen.text(82, deviceState == "pending" ? "等待后台审核" : "设备已停用", ui::warning, 51, 163);
+        screen.number(20, 100, 198, verification, ui::accent);
+        screen.text(153, "系统设置 / 扫码枪", ui::muted, 20, 198);
       } else {
-        screen.card(10, 56, 220, 113);
-        if (deviceState == "pending" || deviceState == "disabled") {
-          screen.text(79, deviceState == "pending" ? "等待后台审核" : "设备已停用", ui::warning, 22);
-          screen.number(22, 95, 195, verification, ui::accent);
-          screen.text(145, "系统设置 / 扫码枪", ui::muted, 22);
-        } else {
-          const String state = !connected ? "正在连接 Wi-Fi" : !clockReady ? "正在同步时间"
+        screen.icon(deviceState == "ready" ? Icon::Person : Icon::Wifi, 14, 63, 27);
+        const String state = !connected ? "正在连接 Wi-Fi" : clockBlocksNetwork() ? "正在同步时间"
                              : deviceState == "ready" ? "尚未分配经办人" : "正在连接 PLM";
-          screen.text(83, state, ui::text, 22);
-          screen.text(114, deviceName, ui::muted, 22, 195);
-        }
+        screen.text(112, state);
+        screen.text(139, deviceName, ui::muted);
       }
-      screen.footer(notice);
-      if (moreUsers) {
-        screen.button(10, 216, 68, 22, userOffset ? Icon::Left : Icon::Wifi,
+      screen.text(207, notice, ui::warning);
+      const bool hasUsers = users.size() > 0;
+      if (hasUsers && moreUsers) {
+        screen.button(10, 212, 68, 25, userOffset ? Icon::Left : Icon::Wifi,
                       userOffset ? "上页" : "配网", 'L', ui::panel);
-        screen.button(85, 216, 68, 22, Icon::Right, "下页", 'R', ui::panel);
-        screen.button(160, 216, 70, 22, Icon::Confirm, "登录", 'E', ui::accent);
+        screen.button(86, 212, 68, 25, Icon::Right, "下页", 'R', ui::panel);
+        screen.button(162, 212, 68, 25, Icon::Confirm, "登录", 'E', ui::accent);
       } else {
-        screen.button(10, 216, 105, 22, userOffset ? Icon::Left : Icon::Wifi,
+        screen.button(10, 212, 106, 25, userOffset ? Icon::Left : Icon::Wifi,
                       userOffset ? "上页" : "配网", 'L', ui::panel);
-        screen.button(123, 216, 107, 22, users.size() ? Icon::Confirm : Icon::Refresh,
-                      users.size() ? "登录" : "刷新", users.size() ? 'E' : 'F',
-                      users.size() ? ui::accent : ui::panel);
-      }
-      break;
-    case Page::Home:
-      screen.frame(Icon::Warehouse, userName.isEmpty() ? "仓库" : userName, link, batteryLevel);
-      screen.card(10, 52, 220, 51);
-      screen.text(69, "物料编号", ui::muted, 22);
-      screen.number(22, 76, 195, typed.isEmpty() ? "JC ------" : "JC " + typed, ui::accent);
-      screen.button(10, 111, 106, 69, Icon::Scan, "查料", 'E', ui::accent, "确定");
-      screen.button(124, 111, 106, 69, Icon::History, "历史", 'R', ui::raised, "右键");
-      screen.footer(notice.isEmpty() && !pending.isEmpty() ? "待确认登记，确定重试" : notice);
-      if (notice.isEmpty()) {
-        screen.button(10, 216, 105, 22, Icon::Back, "切换用户", 'B', ui::panel);
-        if (!typed.isEmpty()) screen.button(123, 216, 107, 22, Icon::Erase, "左键退格", 'L', ui::panel);
-      }
-      break;
-    case Page::Material: {
-      screen.frame(Icon::Document, "物料", link, batteryLevel);
-      screen.card(10, 48, 220, 103);
-      screen.text(65, partCode, ui::accent, 19, imageShown ? 118 : 195);
-      screen.text(83, partName, ui::text, 19, imageShown ? 118 : 195);
-      if (!partId.isEmpty()) {
-        screen.number(19, 89, imageShown ? 116 : 195, stock);
-        screen.text(125, "库存  " + unit, ui::muted, 19, imageShown ? 118 : 195);
-      } else if (!partName.isEmpty() && (lookupWanted || network.busy())) {
-        screen.text(112, "正在核对库存", ui::muted, 19, 195);
-      }
-      if (imageShown) screen.thumbnail(imagePixels);
-      if (!partId.isEmpty()) {
-        screen.text(146, "管理员  " + (custodian.isEmpty() ? String("未指定") : custodian),
-                    ui::muted, 19, 202);
-      }
-      screen.button(10, 156, 68, 45, Icon::Inbound, "入库", 'I', partId.isEmpty() ? ui::panel : ui::accent);
-      screen.button(86, 156, 68, 45, Icon::Outbound, "出库", 'O', partId.isEmpty() ? ui::panel : ui::raised);
-      screen.button(162, 156, 68, 45, Icon::Trash, "报废", 'S', partId.isEmpty() ? ui::panel : ui::danger);
-      const bool finding = notice == "正在查找物料...";
-      if (!finding) screen.text(221, notice, ui::warning);
-      if (notice.isEmpty() || finding) {
-        screen.button(10, 216, 105, 22, Icon::Back, "返回", 'B', ui::panel);
-        screen.button(123, 216, 107, 22, Icon::Refresh, "刷新", 'F', ui::panel);
+        screen.button(124, 212, 106, 25, hasUsers ? Icon::Confirm : Icon::Refresh,
+                      hasUsers ? "登录" : "刷新", hasUsers ? 'E' : 'F', hasUsers ? ui::accent : ui::panel);
       }
       break;
     }
-    case Page::Quantity:
-      screen.frame(strcmp(movementType, "入库") == 0 ? Icon::Inbound
-                   : strcmp(movementType, "出库") == 0 ? Icon::Outbound : Icon::Trash,
-                   movementType, link, batteryLevel);
-      screen.text(69, partCode + "  " + partName, ui::muted);
-      screen.card(10, 81, 220, 57);
-      screen.number(20, 97, 195, quantity.isEmpty() ? "----" : quantity, ui::accent);
-      screen.button(10, 146, 66, 36, Icon::Erase, "退格", 'L', ui::raised);
-      screen.button(82, 146, 66, 36, Icon::Back, "返回", 'B', ui::raised);
-      screen.button(154, 146, 76, 36, Icon::Confirm, "确定", 'E', ui::accent);
-      screen.footer(notice, "库存  " + stock + " " + unit);
+    case Page::Home: {
+      screen.frame(Icon::Warehouse, userName.isEmpty() ? "仓库" : userName, link, batteryLevel);
+      screen.text(72, "物料编号", ui::muted);
+      screen.number(10, 81, 174, typed.isEmpty() ? "JC ------" : "JC " + typed,
+                    typed.isEmpty() ? ui::muted : ui::text);
+      screen.icon(Icon::Scan, 196, 79, 23, scanning ? ui::accent : ui::muted);
+      if (scanning) screen.scanLine(198, 83, 18, now);
+      screen.divider(116);
+      const bool retry = typed.isEmpty() && !pending.isEmpty();
+      screen.text(140, notice.isEmpty() && typed.isEmpty() && !retry ? "按扳机扫码" : notice,
+                  notice.isEmpty() ? ui::muted : ui::text);
+      screen.button(10, 152, 131, 35, retry ? Icon::Refresh : Icon::Confirm,
+                    retry ? "重试登记" : "查料", 'E', ui::accent);
+      screen.button(149, 152, 81, 35, Icon::History, "历史", 'R', ui::raised);
+      screen.button(10, 212, 106, 25, Icon::Back, typed.isEmpty() ? "切换用户" : "清空编号", 'B', ui::panel);
+      screen.button(124, 212, 106, 25, typed.isEmpty() ? Icon::Link : Icon::Erase,
+                    typed.isEmpty() ? (wirelessDebug.enabled() ? "调试已开" : "上键调试") : "左键退格",
+                    typed.isEmpty() ? 'U' : 'L', ui::panel);
       break;
-    case Page::History:
+    }
+    case Page::Material: {
+      screen.frame(Icon::Box, "物料", link, batteryLevel);
+      const bool found = !partId.isEmpty();
+      const bool picture = imageShown || imageId.length() == 24;
+      const String manager = custodian.isEmpty() ? String("未指定") : custodian;
+      if (picture) {
+        screen.text(63, partName.isEmpty() ? partCode : partName);
+        screen.outline(11, 70, 122, 122);
+        if (imageShown) screen.thumbnail(12, 71, imagePixels, now - imageShownAt);
+        else screen.icon(Icon::Photo, 59, 115, 25, ui::muted);
+        screen.text(84, partCode, ui::muted, 143, 87);
+        screen.divider(91, 143, 87);
+        screen.text(111, "库存", ui::muted, 143, 87);
+        if (found) screen.number(143, 118, 87, stock);
+        screen.text(156, unit, ui::muted, 143, 87);
+        screen.text(175, "管理员", ui::muted, 143, 87);
+        if (found) screen.text(191, manager, ui::text, 143, 87);
+      } else {
+        screen.text(64, partCode, ui::muted);
+        screen.multiline(87, 17, 2, partName, ui::text, 10, 220);
+        screen.divider(115);
+        if (found) {
+          screen.text(136, "库存", ui::muted, 20, 99);
+          screen.number(20, 146, 92, stock);
+          screen.text(171, unit, ui::muted, 114, 40);
+          screen.text(136, "管理员", ui::muted, 160, 65);
+          screen.text(164, manager, ui::text, 160, 65);
+        } else {
+          screen.icon(Icon::Box, 23, 133, 23, ui::muted);
+          screen.text(155, partName.isEmpty() ? "查料" : "正在核对库存", ui::muted, 55, 160);
+        }
+      }
+      screen.button(10, 197, 68, 23, Icon::Inbound, "入库", 'I', found ? ui::inbound : ui::background);
+      screen.button(86, 197, 68, 23, Icon::Outbound, "出库", 'O', found ? ui::outbound : ui::background);
+      screen.button(162, 197, 68, 23, Icon::Trash, "报废", 'S', found ? ui::danger : ui::background);
+      const bool finding = notice == "正在查找物料...";
+      if (!notice.isEmpty() && !finding) screen.text(237, notice, ui::warning);
+      else {
+        screen.icon(Icon::Back, 11, 225, 13, ui::muted);
+        screen.text(237, "返回", ui::muted, 29, 86);
+        screen.icon(Icon::Refresh, 171, 225, 13, ui::muted);
+        screen.text(237, "刷新", ui::muted, 191, 44);
+      }
+      break;
+    }
+    case Page::Quantity: {
+      const Icon operation = movementIcon(movementType);
+      const uint16_t color = ui::movementColor(operation);
+      screen.frame(operation, movementType, link, batteryLevel);
+      screen.text(65, partName.isEmpty() ? partCode : partName);
+      screen.text(85, partCode, ui::muted);
+      screen.text(112, "数量", ui::muted);
+      screen.number(10, 121, 170, quantity.isEmpty() ? "----" : quantity, color);
+      screen.text(143, unit, ui::muted, 184, 37);
+      screen.divider(153);
+      screen.text(177, "当前库存  " + stock + ' ' + unit, ui::muted);
+      screen.text(202, notice, ui::warning);
+      screen.button(10, 212, 68, 25, Icon::Back, "返回", 'B', ui::panel);
+      screen.button(86, 212, 68, 25, Icon::Erase, "退格", 'L', ui::raised);
+      screen.button(162, 212, 68, 25, Icon::Confirm, "确定", 'E', color);
+      break;
+    }
+    case Page::History: {
       screen.frame(Icon::History, "库存历史", link, batteryLevel);
       for (unsigned i = 0; i < history.size() && i < 6; ++i) {
         const JsonObjectConst row = history[i].as<JsonObjectConst>();
         const String name = row["part_name"] | "";
-        screen.row(50 + i * 21, name.isEmpty() ? (row["part_code"] | "") : name,
-                   i == historyIndex, String(row["type"] | "") + " " + recordQuantity(row));
+        const char* kind = row["type"] | "";
+        screen.row(49 + i * 22, movementIcon(kind), name.isEmpty() ? (row["part_code"] | "") : name,
+                   i == historyIndex, kind, recordQuantity(row));
       }
-      screen.footer(notice);
-      if (history.size() && notice.isEmpty()) {
-        if (historyOffset > 0) screen.button(10, 216, 68, 22, Icon::Left, "上页", 'L', ui::panel);
-        if (history.size() == 6) screen.button(85, 216, 68, 22, Icon::Right, "下页", 'R', ui::panel);
-        screen.button(160, 216, 70, 22, Icon::Document, "详情", 'E', ui::accent);
-      }
+      if (!history.size()) screen.icon(Icon::History, 15, 67, 31, ui::muted);
+      screen.text(history.size() ? 204 : 127, notice, history.size() ? ui::warning : ui::muted);
+      screen.button(10, 212, 52, 25, Icon::Back, "返回", 'B', ui::panel);
+      if (historyOffset > 0) screen.button(66, 212, 52, 25, Icon::Left, "上页", 'L', ui::panel);
+      if (history.size() == 6) screen.button(122, 212, 52, 25, Icon::Right, "下页", 'R', ui::panel);
+      if (history.size()) screen.button(178, 212, 52, 25, Icon::Document, "详情", 'E', ui::accent);
+      else screen.button(154, 212, 76, 25, Icon::Refresh, "刷新", 'F', ui::raised);
       break;
+    }
     case Page::Record: {
       const JsonObjectConst row = history[historyIndex].as<JsonObjectConst>();
-      const bool canDelete = row["can_delete"].as<bool>();
+      const char* kind = row["type"] | "";
+      const Icon operation = movementIcon(kind);
+      const uint16_t color = ui::movementColor(operation);
       const char* timestamp = row["expected"]["occurred_at"] | "";
+      const String name = row["part_name"] | "";
       const String reason = row["expected"]["reason"] | "";
       screen.frame(Icon::Document, "流水详情", link, batteryLevel);
-      screen.card(10, 48, 220, 124);
-      screen.multiline(67, 16, 2, row["part_name"] | "", ui::text, 20, 200);
-      screen.text(101, row["part_code"] | "", ui::muted, 20, 200);
-      screen.text(120, String(row["type"] | "") + "  " + recordQuantity(row) + " " + (row["unit"] | ""),
-                  ui::accent, 20, 200);
-      screen.text(139, recordTime(*timestamp ? timestamp : (row["created_at"] | ""), true),
-                  ui::text, 20, 200);
-      screen.text(158, row["project_name"] | "", ui::muted, 20, 200);
-      screen.text(202, notice.isEmpty() ? reason : notice, notice.isEmpty() ? ui::muted : ui::warning);
-      screen.button(10, 216, 105, 22, Icon::Back, "返回", 'B', ui::panel);
-      if (canDelete) screen.button(123, 216, 107, 22, Icon::Trash, "删除", 'E', ui::danger);
+      screen.multiline(64, 17, 2, name.isEmpty() ? (row["part_code"] | "") : name, ui::text, 10, 220);
+      screen.text(100, row["part_code"] | "", ui::muted);
+      screen.divider(109);
+      screen.divider(155);
+      screen.icon(operation, 14, 120, 23, color);
+      screen.text(137, kind, color, 50, 51);
+      screen.number(104, 118, 82, recordQuantity(row));
+      screen.text(138, row["unit"] | "", ui::muted, 190, 34);
+      screen.icon(Icon::History, 12, 161, 13, ui::muted);
+      screen.text(174, recordTime(*timestamp ? timestamp : (row["created_at"] | ""), true), ui::text, 31, 199);
+      screen.icon(Icon::Warehouse, 12, 180, 13, ui::muted);
+      screen.text(193, row["project_name"] | "", ui::muted, 31, 199);
+      if (notice.isEmpty() && reason.isEmpty()) screen.divider(204);
+      else screen.text(209, notice.isEmpty() ? reason : notice, notice.isEmpty() ? ui::muted : ui::warning);
+      screen.button(10, 215, 106, 23, Icon::Back, "返回", 'B', ui::panel);
+      if (row["can_delete"].as<bool>()) screen.button(124, 215, 106, 23, Icon::Trash, "删除", 'E', ui::raised);
       break;
     }
     case Page::Delete: {
       const JsonObjectConst row = history[historyIndex].as<JsonObjectConst>();
-      screen.frame(Icon::Trash, "确认删除", link, batteryLevel);
-      screen.card(10, 52, 220, 83);
-      screen.text(73, String(row["type"] | "") + " " + (row["part_code"] | ""), ui::warning, 20);
-      screen.text(96, row["part_name"] | "", ui::text, 20, 200);
-      screen.text(121, "数量 " + recordQuantity(row) + " " + (row["unit"] | ""), ui::muted, 20);
-      screen.button(10, 142, 106, 41, Icon::Back, "取消", 'B', ui::raised);
-      screen.button(124, 142, 106, 41, Icon::Trash, "确定删除", 'E', ui::danger);
-      screen.footer(notice);
+      const String name = row["part_name"] | "";
+      screen.frame(Icon::Alert, "确认删除", link, batteryLevel);
+      screen.icon(Icon::Trash, 12, 65, 24, ui::danger);
+      screen.text(82, name.isEmpty() ? (row["part_code"] | "") : name, ui::text, 52, 165);
+      screen.text(104, row["part_code"] | "", ui::muted, 52, 165);
+      screen.text(127, String(row["type"] | "") + ' ' + recordQuantity(row) + ' ' + (row["unit"] | ""),
+                  ui::text, 52, 165);
+      screen.divider(145);
+      screen.multiline(170, 18, 2, notice.isEmpty() ? String("删除后将重新计算库存") : notice,
+                       notice.isEmpty() ? ui::text : ui::warning, 10, 220);
+      screen.button(10, 209, 106, 28, Icon::Back, "取消", 'B', ui::raised);
+      screen.button(124, 209, 106, 28, Icon::Trash, "确定删除", 'E', ui::danger);
       break;
     }
   }
@@ -730,9 +962,9 @@ void sampleSignal() {
   if (memcmp(lastBssid, ap.bssid, sizeof(lastBssid)) != 0) {
     memcpy(lastBssid, ap.bssid, sizeof(lastBssid));
     recheckRoute();
-    Serial.printf("WiFi AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u rssi=%d dBm\n",
-                  ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
-                  static_cast<unsigned>(ap.primary), static_cast<int>(ap.rssi));
+    diagnostic("WiFi AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u rssi=%d dBm\n",
+               ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+               static_cast<unsigned>(ap.primary), static_cast<int>(ap.rssi));
   }
   if (ap.rssi != lastSignal) {
     lastSignal = ap.rssi;
@@ -743,6 +975,20 @@ void sampleSignal() {
 void wifiDisconnected(WiFiEvent_t, WiFiEventInfo_t info) {
   wifiReason.store(info.wifi_sta_disconnected.reason);
   wifiDisconnects.fetch_add(1);
+}
+
+void wifiStationStarted(WiFiEvent_t) {
+  // Configure the transmit ceiling before the first association starts.
+  esp_wifi_set_max_tx_power(kWifiMaxTxPower);
+}
+
+void reportWifiPerformance() {
+  int8_t txPower;
+  wifi_ps_type_t sleep;
+  if (esp_wifi_get_max_tx_power(&txPower) == ESP_OK && esp_wifi_get_ps(&sleep) == ESP_OK) {
+    diagnostic("WiFi radio tx_limit=%.2f dBm, modem_sleep=%s\n",
+               txPower / 4.0, sleep == WIFI_PS_NONE ? "off" : "on");
+  }
 }
 
 const char* wifiReasonName(unsigned reason) {
@@ -764,9 +1010,50 @@ void reportWifiDisconnect() {
   reportedDisconnects = drops;
   recheckRoute();
   const unsigned reason = wifiReason.load();
-  Serial.printf("WiFi disconnected reason=%u (%s), last_rssi=%d dBm, setup=%s, uptime=%lu ms\n",
-                reason, wifiReasonName(reason), lastSignal, wifi.active() ? "yes" : "no",
-                static_cast<unsigned long>(millis()));
+  diagnostic("WiFi disconnected reason=%u (%s), last_rssi=%d dBm, setup=%s, uptime=%lu ms\n",
+             reason, wifiReasonName(reason), lastSignal, wifi.active() ? "yes" : "no",
+             static_cast<unsigned long>(millis()));
+}
+
+void reportStatus() {
+  const char* routeName = route == Route::Local ? "local" : route == Route::Cloud ? "cloud" : "unconfirmed";
+  diagnostic("WiFi=%s route=%s rssi=%d drops=%u reason=%u reset=%d\n",
+             connected ? "on" : "off", routeName, lastSignal, wifiDisconnects.load(),
+             wifiReason.load(), static_cast<int>(esp_reset_reason()));
+  if (connected) {
+    reportWifiPerformance();
+    wifi_ap_record_t ap{};
+    if (esp_wifi_sta_get_ap_info(&ap) == ESP_OK) {
+      diagnostic("WiFi current AP %02x:%02x:%02x:%02x:%02x:%02x ch=%u\n",
+                 ap.bssid[0], ap.bssid[1], ap.bssid[2], ap.bssid[3], ap.bssid[4], ap.bssid[5],
+                 static_cast<unsigned>(ap.primary));
+    }
+  }
+  diagnostic("auth=%s pending=%s PSRAM=%u battery=%.2fV estimate=%d\n",
+             userId.isEmpty() ? "no" : "yes", pending.isEmpty() ? "no" : "yes",
+             ESP.getPsramSize(), hardware.batteryVolts(), batteryLevel);
+}
+
+void serviceWirelessDebug() {
+  if (!wirelessDebug.enabled()) return;
+  const bool attached = wirelessDebug.attached();
+  const bool available = connected && !wifi.active();
+  if (wirelessDebug.tick(available ? WiFi.localIP() : IPAddress(),
+                         available ? WiFi.subnetMask() : IPAddress())) reportStatus();
+  if (attached != wirelessDebug.attached()) dirty = true;
+  if (!wirelessDebug.enabled()) {
+    debugPanel = false;
+    dirty = true;
+  } else if (int32_t(millis() - debugSampleAt) >= 0) {
+    debugSampleAt = millis() + 5000;
+    if (available) {
+      char line[96];
+      snprintf(line, sizeof(line), "WiFi sample rssi=%d dBm drops=%u route=%s\n", lastSignal,
+               wifiDisconnects.load(), route == Route::Local ? "local" :
+                                       route == Route::Cloud ? "cloud" : "unconfirmed");
+      wirelessDebug.record(line);
+    }
+  }
 }
 
 void readConsole() {
@@ -774,11 +1061,7 @@ void readConsole() {
     const char ch = static_cast<char>(Serial.read());
     if (ch == '\n' || ch == '\r') {
       if (usbLine == "status") {
-        Serial.printf("WiFi=%s auth=%s pending=%s PSRAM=%u battery=%.2fV estimate=%d rssi=%d drops=%u reason=%u reset=%d\n",
-                      connected ? "on" : "off", userId.isEmpty() ? "no" : "yes",
-                      pending.isEmpty() ? "no" : "yes", ESP.getPsramSize(), hardware.batteryVolts(),
-                      batteryLevel, lastSignal, wifiDisconnects.load(), wifiReason.load(),
-                      static_cast<int>(esp_reset_reason()));
+        reportStatus();
       } else if (usbLine == "clear-pending CONFIRMED-IN-JPLM" && !pending.isEmpty()) {
         if (network.busy()) Serial.println("Wait for current request to finish.");
         else Serial.println(clearPending() ? "Operator verified pending request cleared." : "NVS clear failed.");
@@ -796,12 +1079,17 @@ void readConsole() {
 
 void setup() {
   Serial.begin(115200);
-  Serial.printf("Scanner boot reset_reason=%d\n", static_cast<int>(esp_reset_reason()));
+  Serial.printf("Scanner boot firmware=%s reset_reason=%d\n", firmwareVersion, static_cast<int>(esp_reset_reason()));
   hardware.begin();
   screen.begin();
   readPending();
   ready = network.begin();
   backgroundReady = background.begin();
+  esp_ota_img_states_t imageState;
+  verifyFirmwareBoot = esp_ota_get_state_partition(esp_ota_get_running_partition(), &imageState) == ESP_OK
+                       && imageState == ESP_OTA_IMG_PENDING_VERIFY;
+  if (verifyFirmwareBoot && (!ready || !backgroundReady)) esp_ota_mark_app_invalid_rollback_and_reboot();
+  WiFi.onEvent(wifiStationStarted, ARDUINO_EVENT_WIFI_STA_START);
   WiFi.onEvent(wifiDisconnected, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
   wifi.begin();
   configTime(0, 0, "ntp.aliyun.com", "pool.ntp.org", "time.cloudflare.com");
@@ -818,45 +1106,65 @@ void loop() {
     recheckRoute();
     if (online) {
       usersAt = signalAt = millis();
-      if (!WiFi.setTxPower(WIFI_POWER_19_5dBm)) Serial.println("WiFi could not set TX power");
+      firmwareCheckAt = millis();
+      const esp_err_t txResult = esp_wifi_set_max_tx_power(kWifiMaxTxPower);
+      if (txResult != ESP_OK) diagnostic("WiFi could not set TX limit: %s\n", esp_err_to_name(txResult));
       lastSignal = WiFi.RSSI();
-      Serial.printf("WiFi connected at %lu ms, rssi=%d dBm, tx_limit=%.2f dBm, sleep=%d\n",
-                    static_cast<unsigned long>(millis()), lastSignal,
-                    static_cast<int>(WiFi.getTxPower()) / 4.0, static_cast<int>(WiFi.getSleep()));
+      diagnostic("WiFi connected at %lu ms, rssi=%d dBm\n",
+                 static_cast<unsigned long>(millis()), lastSignal);
+      reportWifiPerformance();
     }
   }
   if (!clockReady && time(nullptr) >= 1700000000) {
     clockReady = true;
     usersAt = healthAt = millis();
     dirty = true;
-    Serial.printf("TLS clock ready at %lu ms\n", static_cast<unsigned long>(millis()));
+    diagnostic("TLS clock ready at %lu ms\n", static_cast<unsigned long>(millis()));
   }
   String scanned;
-  const bool freshScan = hardware.pollScanner(scanned);
+  const uint32_t rejectedBeforePoll = scanStats.rejected;
+  const bool freshScan = hardware.pollScanner(scanned, wirelessDebug.enabled() ? &scanStats : nullptr);
+  if (scanStats.rejected != rejectedBeforePoll) {
+    debugLog("Scan rejected frames=%lu reason=invalid-uart-frame\n",
+             static_cast<unsigned long>(scanStats.rejected - rejectedBeforePoll));
+  }
   if (freshScan && !wifi.active()) handleScan(scanned);
   hardware.tick();
   if (scanning && !hardware.scanActive()) {
     scanning = false;
+    debugLog("Scan timed out elapsed=%lums uart_bytes=%lu rejected=%lu\n",
+             static_cast<unsigned long>(millis() - scanStartedAt),
+             static_cast<unsigned long>(scanStats.bytes - scanStartBytes),
+             static_cast<unsigned long>(scanStats.rejected - scanStartRejected));
     show("扫码超时，请重试", true);
   }
-  if (const auto* reply = network.poll()) receive(*reply, network.job());
-  if (const auto* reply = background.poll()) receiveBackground(*reply, background.job());
+  if (const auto* reply = network.poll()) {
+    wirelessDebug.record(reply->trace);
+    receive(*reply, network.job());
+  }
+  if (const auto* reply = background.poll()) {
+    wirelessDebug.record(reply->trace);
+    receiveBackground(*reply, background.job());
+  }
   const char key = hardware.pollKey();
   if (key && !freshScan) handleKey(key);
   readConsole();
   sampleSignal();
   sampleBattery();
+  serviceWirelessDebug();
+  rebootAfterFirmware();
   scheduleNetwork();
   const uint32_t now = millis();
   const bool busy = network.busy() && network.job().operation != Operation::Prepare
                                    && network.job().operation != Operation::KeepAlive;
-  const bool loading = !wifi.active() && (busy || scanning || (connected && !clockReady)
+  const bool loading = !wifi.active() && (busy || scanning || (connected && clockBlocksNetwork())
                      || (connected && page == Page::Material && lookupWanted));
   if (loading != loadingVisible) {
     loadingVisible = loading;
     dirty = true;
   }
-  const bool moving = now - pageShownAt < 140 || (lastKey && now - keyPressedAt < 100);
+  const bool moving = (lastKey && now - keyPressedAt < ui::keyMotionMs)
+                      || (page == Page::Material && imageShown && now - imageShownAt < ui::imageMotionMs);
   if (moving != motionVisible) {
     motionVisible = moving;
     dirty = true;
@@ -867,10 +1175,10 @@ void loop() {
   }
   if (dirty) {
     dirty = false;
-    screen.motion(now - pageShownAt, lastKey, now - keyPressedAt);
-    draw();
+    screen.motion(lastKey, now - keyPressedAt);
+    draw(now);
     screen.signal(connected && !wifi.active() ? lastSignal : 0);
-    if (loading) screen.loading(now);
+    if (loading && !debugPanel) screen.loading(now);
     screen.present();
   }
   delay(2);
