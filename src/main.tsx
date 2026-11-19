@@ -1,4 +1,7 @@
+import { TableScroll } from "./table-scroll";
 import { randomUuid } from "./random-uuid";
+import { useTableViewport } from "./table-viewport";
+import { ThemePicker, useAppearance } from "./theme";
 import React, { Suspense, lazy, useContext, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { clearNavigationSnapshots, NavigationPage, useNavigationHistory, usePageState } from "./navigation";
@@ -59,6 +62,7 @@ import {
   emptyState,
   State,
   Product,
+  ProductMold,
   ProjectSummary,
   ProjectDetails,
   ProjectRole,
@@ -84,21 +88,30 @@ import { materialCategoryTone, OptionTag, type OptionTone } from "./option-tag";
 import "./style.css";
 import { ProductionInspection } from "./inspection";
 import { Dialog } from "./dialog";
+import { TableTextCell } from "./table-text-cell";
 import type { LabelMaterial } from "./material-labels";
 
 const ShippingManagement = lazy(() => import("./shipping"));
 const GlobalShipping = lazy(() => import("./global-shipping"));
 const WarehouseRegistration = lazy(() => import("./warehouse-registration"));
 const MaterialLabelsDialog = lazy(() => import("./material-labels"));
-const money = (n: number) =>
+const FeishuSettings = lazy(() => import("./feishu-settings"));
+const FeishuAccount = lazy(() => import("./feishu-settings").then((module) => ({ default: module.FeishuAccount })));
+const money = (n: number, maximumFractionDigits = 2) =>
   new Intl.NumberFormat("zh-CN", {
     style: "currency",
     currency: "CNY",
     minimumFractionDigits: 2,
-    maximumFractionDigits: 2,
+    maximumFractionDigits,
   }).format(n);
 const amount = (n: number) =>
   new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 }).format(n);
+const moldAmortizationQuantity = (mold: ProductMold) => mold.amortization_qty ?? mold.moq;
+const moldUnitCost = (mold: ProductMold) => {
+  const quantity = moldAmortizationQuantity(mold);
+  return mold.cost !== null && quantity ? mold.cost / (quantity * Math.max(1, mold.part_ids.length)) : null;
+};
+const moldUnitMoney = (cost: number | null) => cost === null ? "—" : money(cost, 6);
 const date = (s: string) =>
   new Date(s).toLocaleDateString("zh-CN", {
     year: "numeric",
@@ -195,6 +208,7 @@ type Field = {
   autoComplete?: string;
   required?: boolean;
   options?: { value: string; label: string }[];
+  records?: Part[];
   categoryOptions?: string[];
   placeholder?: string;
   wide?: boolean;
@@ -346,6 +360,57 @@ function Button({
     </button>
   );
 }
+function MoldAmortization({ molds, findPart }: {
+  molds: ProductMold[];
+  findPart: (id: string) => Part | undefined;
+}) {
+  const parts = new Map<string, { total: number; calculated: number; pending: number }>();
+  for (const mold of molds) {
+    const unitCost = moldUnitCost(mold);
+    for (const id of mold.part_ids) {
+      const row = parts.get(id) ?? { total: 0, calculated: 0, pending: 0 };
+      if (unitCost === null) row.pending++;
+      else {
+        row.total += unitCost;
+        row.calculated++;
+      }
+      parts.set(id, row);
+    }
+  }
+  return (
+    <section className="mold-amortization" id="mold-amortization" aria-label="模具费均摊">
+      <p className="table-note">
+        单件均摊 = 模具费 ÷（均摊数量 × 关联零件种数）。均摊数量留空时取 MOQ。同一零件的多项模具费相加。
+        {molds.some((mold) => !mold.part_ids.length) && " 未关联零件的模具按单种零件估算，结果显示在下方模具表。"}
+      </p>
+      {parts.size > 0 && (
+        <TableScroll>
+          <table aria-label="各零件模具费均摊">
+            <thead>
+              <tr><th>料号</th><th>零件名称</th><th className="num">模具费合计（元/件）</th></tr>
+            </thead>
+            <tbody>
+              {[...parts].map(([id, row]) => {
+                const part = findPart(id);
+                return (
+                  <tr key={id}>
+                    <td className="mono">{part?.code || "—"}</td>
+                    <td>{part?.name || "—"}{part?.deleted_at && "（已删除）"}</td>
+                    <td className="num">
+                      {moldUnitMoney(row.calculated ? row.total : null)}
+                      {!!row.pending && <small className="mold-cost-note">{row.pending} 个模具待补模具费或数量</small>}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </TableScroll>
+      )}
+    </section>
+  );
+}
+
 function Empty({
   title = "暂无记录",
   text = "",
@@ -520,7 +585,17 @@ function EntityForm({
       <div className="form-grid">
         {fields.map((f) => (
           <React.Fragment key={f.name}>
-            <label className={f.wide ? "wide-field" : ""}>
+            {f.records ? (
+              <div className={f.wide ? "wide-field" : ""} role="group" aria-label={f.label}>
+                <span>{f.label}</span>
+                <RecordChoices
+                  records={f.records}
+                  selected={values[f.name] ?? []}
+                  disabled={busy}
+                  onChange={(ids) => setValues((previous: any) => ({ ...previous, [f.name]: ids }))}
+                />
+              </div>
+            ) : <label className={f.wide ? "wide-field" : ""}>
               {f.label}
               {f.required && <span className="required"> *</span>}
               {f.categoryOptions ? <MaterialCategory label={f.label} value={values[f.name] ?? ""}
@@ -573,7 +648,7 @@ function EntityForm({
                   }
                 />
               )}
-            </label>
+            </label>}
             {f.name === "name" && suppliers && <SupplierLinksInput options={suppliers.options}
               draft={supplierDraft} onChange={setSupplierDraft} disabled={busy} />}
             {f.name === "name" && bomLinks && <BomLinksInput products={bomLinks.products}
@@ -827,6 +902,9 @@ function ProfilePanel({
         </div>
         <PasswordForm key={version} onSaved={onSaved} />
       </section>
+      <Suspense fallback={<p className="muted">正在加载飞书绑定…</p>}>
+        <FeishuAccount api={api} />
+      </Suspense>
     </div>
   );
 }
@@ -868,7 +946,7 @@ function UserAdmin({
           {error}
         </p>
       )}
-      <div className="table-wrap">
+      <TableScroll>
         <table>
           <thead>
             <tr>
@@ -905,7 +983,7 @@ function UserAdmin({
             ))}
           </tbody>
         </table>
-      </div>
+      </TableScroll>
       {editor && (
         <Dialog
           title={
@@ -980,12 +1058,190 @@ function UserAdmin({
   );
 }
 
+type ScannerDevice = {
+  id: string;
+  name: string;
+  enabled: boolean;
+  pending: boolean;
+  verification: string;
+  user_ids: string[];
+  mac: string;
+  ip: string;
+  firmware: string;
+  last_seen_at: string | null;
+  last_user: string | null;
+  ota_version: string | null;
+  ota_status: "queued" | "downloading" | "retry" | "installed" | "superseded" | null;
+};
+
+const scannerUpdateLabels = {
+  queued: "等待设备空闲", downloading: "已开始下载", retry: "下载失败，等待重试",
+  installed: "已安装", superseded: "已由更新版本替代",
+};
+
+function ScannerDevicesPanel() {
+  const [devices, setDevices] = useState<ScannerDevice[]>([]);
+  const [users, setUsers] = useState<User[]>([]);
+  const [draft, setDraft] = useState<{
+    id: string; name: string; enabled: boolean; pending: boolean; verification: string;
+    user_ids: string[]; approve: boolean;
+  } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [upgrade, setUpgrade] = useState<ScannerDevice | null>(null);
+  const [firmwareFile, setFirmwareFile] = useState<File | null>(null);
+
+  async function load() {
+    setError("");
+    try {
+      const [rows, accounts] = await Promise.all([api("scanner-devices"), api("users")]);
+      setDevices(rows);
+      setUsers(accounts);
+    } catch (cause) {
+      setError((cause as Error).message);
+    }
+  }
+  useEffect(() => {
+    void load();
+    const timer = window.setInterval(() => {
+      void api("scanner-devices").then(setDevices).catch(() => {});
+    }, 5000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  async function save(reject = false) {
+    if (!draft || busy) return;
+    setError("");
+    setBusy(true);
+    try {
+      await api("scanner-devices/" + draft.id, "PUT", {
+        ...draft, reject, approve: !reject && draft.approve,
+      });
+      setDraft(null);
+      await load();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveUpgrade(cancel = false) {
+    if (!upgrade || busy || (!cancel && !firmwareFile)) return;
+    setError("");
+    setBusy(true);
+    try {
+      await api(`scanner-devices/${upgrade.id}/firmware`, cancel ? "DELETE" : "PUT",
+        cancel ? undefined : firmwareFile!.slice(0, firmwareFile!.size, "application/octet-stream"));
+      setUpgrade(null);
+      await load();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="section-toolbar">
+        <h3>扫码枪</h3>
+        <div className="row-actions">
+          <Button small onClick={() => void load()}>刷新</Button>
+        </div>
+      </div>
+      {error && !draft && !upgrade && <p className="form-error" role="alert">{error}</p>}
+      <TableScroll>
+        <table>
+          <thead><tr><th>名称</th><th>状态</th><th>识别码</th><th>IP / MAC</th><th>固件</th><th>最近登录</th><th>最近连接</th><th /></tr></thead>
+          <tbody>
+            {devices.map((device) => (
+              <tr key={device.id}>
+                <td>{device.name}</td>
+                <td>{device.pending ? "待审核" : !device.enabled ? "已停用" : device.mac ? "已启用" : "等待连接"}</td>
+                <td><code>{device.mac ? device.verification : "—"}</code></td>
+                <td>{[device.ip, device.mac].filter(Boolean).join(" / ") || "—"}</td>
+                <td>{device.firmware || "—"}{device.ota_status && <div className="muted">
+                  {device.ota_version} · {scannerUpdateLabels[device.ota_status]}
+                </div>}</td>
+                <td>{device.last_user || "—"}</td>
+                <td>{device.last_seen_at ? datetime(device.last_seen_at) : "—"}</td>
+                <td><div className="row-actions"><Button small onClick={() => {
+                  setError("");
+                  setDraft({ ...device, enabled: device.pending || device.enabled, approve: false });
+                }}>{device.pending ? "审核" : "编辑"}</Button>
+                  {device.enabled && !device.pending && device.firmware && <Button small onClick={() => {
+                    setError(""); setFirmwareFile(null); setUpgrade(device);
+                  }}>固件升级</Button>}
+                </div></td>
+              </tr>
+            ))}
+            {devices.length === 0 && <tr><td colSpan={8}>扫码枪连上 Wi-Fi 后会自动出现在这里。</td></tr>}
+          </tbody>
+        </table>
+      </TableScroll>
+      {upgrade && (
+        <Dialog title={`固件升级 · ${upgrade.name}`} onClose={() => { if (!busy) setUpgrade(null); }}>
+          <form onSubmit={(event) => { event.preventDefault(); void saveUpgrade(); }}>
+            <p>设备联网且空闲时会自动下载、校验并重启。首次使用需通过 USB 烧录 0.2.7 或更新版本。</p>
+            <label>仓库应用固件 <input type="file" accept=".bin,application/octet-stream" required disabled={busy}
+              onChange={(event) => setFirmwareFile(event.target.files?.[0] ?? null)} /></label>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="row-actions">
+              <Button type="button" disabled={busy} onClick={() => setUpgrade(null)}>关闭</Button>
+              {upgrade.ota_status && ["queued", "downloading", "retry"].includes(upgrade.ota_status) &&
+                <Button type="button" disabled={busy} onClick={() => void saveUpgrade(true)}>取消已安排的升级</Button>}
+              <Button primary type="submit" disabled={busy || !firmwareFile}>上传并安排升级</Button>
+            </div>
+          </form>
+        </Dialog>
+      )}
+      {draft && (
+        <Dialog title={draft.pending ? "审核扫码枪" : "编辑扫码枪"} onClose={() => { if (!busy) setDraft(null); }}>
+          <form onSubmit={(event) => { event.preventDefault(); void save(); }}>
+            <div className="form-grid">
+              <label>设备名称<input required maxLength={80} value={draft.name}
+                onChange={(event) => setDraft({ ...draft, name: event.target.value })} /></label>
+              <label><input type="checkbox" checked={draft.enabled}
+                onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })} /> 启用设备</label>
+            </div>
+            <fieldset>
+              <legend>允许免密选择的用户</legend>
+              {users.map((user) => (
+                <div key={user.id}><label>
+                  <input type="checkbox" checked={draft.user_ids.includes(user.id)}
+                    onChange={(event) => setDraft({ ...draft, user_ids: event.target.checked
+                      ? [...draft.user_ids, user.id] : draft.user_ids.filter((id) => id !== user.id) })} />
+                  {" "}{user.name} · {user.email}
+                </label></div>
+              ))}
+            </fieldset>
+            {draft.pending && draft.enabled && (
+              <label><input type="checkbox" checked={draft.approve}
+                onChange={(event) => setDraft({ ...draft, approve: event.target.checked })} />
+                {" "}已核对设备屏幕上的识别码 <code>{draft.verification}</code>
+              </label>
+            )}
+            {error && <p className="form-error" role="alert">{error}</p>}
+            <div className="row-actions">
+              <Button type="button" disabled={busy} onClick={() => setDraft(null)}>取消</Button>
+              {draft.pending && <Button type="button" disabled={busy} onClick={() => void save(true)}>拒绝登记</Button>}
+              <Button primary type="submit"
+                disabled={busy || (draft.pending && draft.enabled && (!draft.approve || draft.user_ids.length === 0))}>保存</Button>
+            </div>
+          </form>
+        </Dialog>
+      )}
+    </>
+  );
+}
+
 function ActivityPanel({
   part,
   kind = "operation",
 }: {
   part?: string;
-  kind?: "operation" | "user";
+  kind?: "operation" | "material" | "user";
 }) {
   const { id: projectId } = useContext(ProjectContext);
   const title = kind === "user" ? "用户操作日志" : "操作记录";
@@ -998,7 +1254,9 @@ function ActivityPanel({
     setError("");
     try {
       const path = "activity?" + new URLSearchParams({ before: String(before), part: part || "", kind });
-      const result = projectId && kind === "operation"
+      const result = kind === "material" && !projectId && part
+        ? await api("global-materials/" + part + "/activity?" + new URLSearchParams({ before: String(before) }))
+        : projectId && kind !== "user"
         ? await projectRequest(projectId, path)
         : await api(path);
       setItems((previous) =>
@@ -1013,7 +1271,7 @@ function ActivityPanel({
   }
   useEffect(() => {
     void loadActivity();
-  }, [part, kind]);
+  }, [part, kind, projectId]);
   return (
     <>
       <div className="section-toolbar">
@@ -1028,7 +1286,7 @@ function ActivityPanel({
           {error}
         </p>
       )}
-      <div className="table-wrap" tabIndex={0} role="region" aria-label={title}>
+      <TableScroll tabIndex={0} role="region" aria-label={title}>
         <table className="activity-table">
           <thead>
             <tr>
@@ -1056,7 +1314,7 @@ function ActivityPanel({
         {!busy && !items.length && (
           <Empty title={"暂无" + title} />
         )}
-      </div>
+      </TableScroll>
       {more && (
         <Button
           small
@@ -1302,7 +1560,7 @@ function AssetLibrary({ onChanged }: { onChanged: () => Promise<unknown> }) {
       <Button type="submit" small><Search size={15} />搜索</Button>
     </form>
     {error && <p className="form-error" role="alert">{error}</p>}
-    <div className="table-wrap" aria-busy={busy}>
+    <TableScroll aria-busy={busy}>
       <table>
         <thead><tr>
           <th>文件</th><th>类型</th><th className="num">大小</th>
@@ -1339,7 +1597,7 @@ function AssetLibrary({ onChanged }: { onChanged: () => Promise<unknown> }) {
       {!data?.items.length && !error && <p className="asset-library-empty muted">
         {busy ? "正在加载…" : "暂无素材"}
       </p>}
-    </div>
+    </TableScroll>
     {(page > 1 || data?.more) && <div className="dialog-actions">
       <Button type="button" small disabled={busy || page === 1} onClick={() => setPage(page - 1)}>上一页</Button>
       <span>第 {page} 页</span>
@@ -1374,6 +1632,7 @@ function readWorkspaceRoute(hash = location.hash): WorkspaceRoute {
   if (top === "settings") return { ...projectHome, view: "settings" };
   if (top === "warehouse") return { ...projectHome, view: "warehouse" };
   if (top === "global-shipping") return { ...projectHome, view: "global-shipping", detail: /^[a-f0-9]{24}$/.test(id || "") ? id : "" };
+  if (top === "global-materials") return { ...projectHome, view: "global-materials", detail: /^[a-f0-9]{24}$/.test(id || "") ? id : "" };
   if (top === "projects" && id) {
     const valid = navs.some((nav) => nav.id === view) || view === "project-settings";
     return { projectId: id, view: valid ? view : "products", detail: valid ? detail || "" : "" };
@@ -1389,7 +1648,9 @@ function workspaceHash(route: WorkspaceRoute) {
 }
 
 function App() {
+  useTableViewport();
   const [auth, setAuth] = useState<AuthState | null>(null);
+  const appearance = useAppearance(auth?.user?.id);
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [restored, setRestored] = useState(false);
   const [loading, setLoading] = useState(true);
@@ -1481,14 +1742,17 @@ function App() {
     };
   }, [signedIn]);
   useEffect(() => {
-    if (route.projectId || route.view === "global-shipping" || !route.detail || !auth?.authenticated || auth.user?.must_change) return;
+    const material = route.view === "parts";
+    const availableProject = projects.some((item) => item.id === route.projectId);
+    if ((route.projectId && (!material || availableProject)) || ["global-shipping", "global-materials"].includes(route.view) ||
+        !route.detail || loading || !auth?.authenticated || auth.user?.must_change) return;
     let active = true;
-    api("resolve/" + route.view + "/" + encodeURIComponent(route.detail)).then(
+    api("resolve/" + route.view + "/" + encodeURIComponent(route.detail) + (material ? "?catalog=1" : "")).then(
       (record) => { if (active) navigate({ ...route, projectId: record.project_id }, true); },
       () => { if (active) navigate(projectHome, true); },
     );
     return () => { active = false; };
-  }, [route, auth?.authenticated, auth?.user?.must_change]);
+  }, [route, projects, loading, auth?.authenticated, auth?.user?.must_change]);
 
   if (loading) return <div className="loading-page"><BrandMark /><span>加载中…</span></div>;
   if (error) return <div className="loading-page"><AlertCircle /><p>{error}</p><Button onClick={load}>重试</Button></div>;
@@ -1509,7 +1773,7 @@ function App() {
     return <Suspense fallback={<div className="loading-page">正在打开出入库登记…</div>}>
       <WarehouseRegistration request={api} />
     </Suspense>;
-  if (!route.projectId && route.detail && route.view !== "global-shipping")
+  if (!route.projectId && route.detail && !["global-shipping", "global-materials"].includes(route.view))
     return <div className="loading-page"><BrandMark /><span>正在打开记录…</span></div>;
   const project = projects.find((item) => item.id === route.projectId);
   if (route.projectId && !project)
@@ -1526,6 +1790,7 @@ function App() {
         project={project}
         projects={projects}
         currentUser={auth.user}
+        appearance={appearance}
         connection={connection}
         navigate={navigate}
         back={back}
@@ -1554,16 +1819,18 @@ function App() {
   );
 }
 
-function ProjectCover({ project }: { project: ProjectSummary }) {
+function ProjectCover({ project, thumbnail = false }: { project: ProjectSummary; thumbnail?: boolean }) {
   const [failed, setFailed] = useState("");
   const source = project.cover_version
     ? appBase + "api/projects/" + encodeURIComponent(project.id) + "/cover?v=" + encodeURIComponent(project.cover_version)
     : project.cover_file_id ? fileUrl(project.cover_file_id) : "";
   const hasPhoto = !!source && failed !== source;
   return (
-    <div className={"project-cover" + (hasPhoto ? " has-photo" : "")}>
+    <div className={thumbnail ? "project-thumbnail" : "project-cover"}>
       {hasPhoto ? (
-        <img key={source} src={source} alt={project.name + " 封面"} loading="lazy" onError={() => setFailed(source)} />
+        <img key={source} src={source} alt={thumbnail ? "" : project.name + " 封面"} loading="lazy" onError={() => setFailed(source)} />
+      ) : thumbnail ? (
+        <FolderOpen size={18} aria-hidden="true" />
       ) : (
         <img src={appBase + "project-drawing.svg"} alt="" aria-hidden="true" />
       )}
@@ -1605,18 +1872,10 @@ function ProjectDirectory({ projects, open, create, onRecovered }: {
   const activeCount = projects.filter((project) => !project.archived_at).length;
   return (
     <section className="project-directory">
-      <header className="project-directory-hero">
-        <img className="project-hero-art" src={appBase + "project-drawing.svg"} alt="" />
-        <div className="project-hero-content">
-          <p className="project-hero-eyebrow">捷程未来 PLM</p>
-          <h1>项目工作台</h1>
-          <div className="project-hero-summary">
-            <span><strong>{activeCount}</strong> 进行中</span>
-            <span><strong>{projects.length - activeCount}</strong> 已归档</span>
-          </div>
-        </div>
+      <header className="project-directory-heading">
+        <h1>项目工作台</h1>
         {create && (
-          <Button primary className="project-create" onClick={() => setCreating(true)}>
+          <Button primary onClick={() => setCreating(true)}>
             <Plus size={17} />新建项目
           </Button>
         )}
@@ -1625,9 +1884,9 @@ function ProjectDirectory({ projects, open, create, onRecovered }: {
       <div className="section-toolbar project-directory-toolbar">
         <div className="tabs" aria-label="项目状态">
           <button className={status === "active" ? "selected" : ""} aria-pressed={status === "active"}
-            onClick={() => setStatus("active")}>进行中</button>
+            onClick={() => setStatus("active")}>进行中 <span>{activeCount}</span></button>
           <button className={archived ? "selected" : ""} aria-pressed={archived}
-            onClick={() => setStatus("archived")}>已归档</button>
+            onClick={() => setStatus("archived")}>已归档 <span>{projects.length - activeCount}</span></button>
           {create && <button className={status === "deleted" ? "selected" : ""} aria-pressed={status === "deleted"}
             onClick={() => setStatus("deleted")}>已删除</button>}
         </div>
@@ -1638,7 +1897,7 @@ function ProjectDirectory({ projects, open, create, onRecovered }: {
         </div>
       </div>
       {status === "deleted" ? (
-        <div className="table-wrap">
+        <TableScroll>
           {deletedError ? <p className="form-error" role="alert">{deletedError}</p> :
             !deletedRows ? <p className="project-deleted-loading muted" role="status">加载中…</p> :
             deletedRows.length ? (
@@ -1653,32 +1912,37 @@ function ProjectDirectory({ projects, open, create, onRecovered }: {
                 ))}</tbody>
               </table>
             ) : <Empty title={term ? "没有符合条件的项目" : "暂无已删除项目"} />}
-        </div>
+        </TableScroll>
       ) : rows.length ? (
         <ul className="project-card-grid" aria-label="项目">
           {rows.map((project) => (
             <li key={project.id}>
-              <a className="project-card" href={workspaceHash({ projectId: project.id, view: "products", detail: "" })}
+              <a className="project-entry-card"
+                href={workspaceHash({ projectId: project.id, view: "products", detail: "" })}
                 onClick={(event) => {
                   if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
                   event.preventDefault();
                   open(project.id);
                 }}>
-                <div className="project-card-media">
-                  <ProjectCover project={project} />
-                  <span className="project-card-code">{project.code}</span>
-                </div>
-                <div className="project-card-body">
-                  <div className="project-card-title">
-                    <h2>{project.name}</h2>
-                    <ArrowUpRight size={20} aria-hidden="true" />
+                <div className="project-card-heading">
+                  <ProjectCover project={project} thumbnail />
+                  <div>
+                    <strong>{project.name}</strong>
+                    <span className="mono">{project.code}</span>
                   </div>
-                  <div className="project-card-meta">
-                    <span title={project.owner_name || "未指定负责人"}>{project.owner_name || "未指定负责人"}</span>
-                    <span>待入库 <b>{project.pending_purchases}</b> 单</span>
-                  </div>
-                  <time dateTime={project.updated_at}>更新于 {date(project.updated_at)}</time>
+                  <ArrowUpRight size={17} aria-hidden="true" />
                 </div>
+                <dl className="project-card-fields">
+                  <div>
+                    <dt>负责人</dt>
+                    <dd title={project.owner_name || "未指定"}>{project.owner_name || "未指定"}</dd>
+                  </div>
+                  <div>
+                    <dt>待入库</dt>
+                    <dd className={project.pending_purchases > 0 ? "project-pending" : undefined}>{project.pending_purchases} 单</dd>
+                  </div>
+                </dl>
+                <span className="project-card-updated">更新于 <time dateTime={project.updated_at}>{date(project.updated_at)}</time></span>
               </a>
             </li>
           ))}
@@ -1956,12 +2220,13 @@ function ProjectSettings({ project, user, onSaved, onDeleted, canSeed, onSeed }:
 
 function Workspace({
   route, project, projects, currentUser, navigate, back, canGoBack, draftOpen, reloadProjects,
-  updateUser, onLogout, onRestore, connection,
+  updateUser, onLogout, onRestore, connection, appearance,
 }: {
   route: WorkspaceRoute;
   project?: ProjectSummary;
   projects: ProjectSummary[];
   currentUser: User;
+  appearance: ReturnType<typeof useAppearance>;
   connection: ConnectionRoute;
   navigate: (route: WorkspaceRoute, replace?: boolean, initial?: Record<string, unknown>) => void;
   back: (fallback: WorkspaceRoute) => void;
@@ -1977,6 +2242,8 @@ function Workspace({
   const [avatarVersion, setAvatarVersion] = useState(0);
   const [accountView, setAccountView] = usePageState("workspace.accountView", "profile");
   const { view, detail } = route;
+  const globalMaterials = view === "global-materials";
+  const materialView = globalMaterials || view === "parts";
   const projectId = project?.id || "";
   const projectArchived = !!project?.archived_at || !!state.project?.archived_at;
   const effectiveProject = project && { ...project, ...state.project };
@@ -1997,7 +2264,14 @@ function Workspace({
     state.users.find((user) => user.id === id)?.name ||
     state.former_users.find((user) => user.id === id)?.name || "—";
   const [fatal, setFatal] = useState("");
-  const [projectReady, setProjectReady] = useState(!project);
+  const [projectReady, setProjectReady] = useState(!project && !globalMaterials);
+  const [catalogProjects, setCatalogProjects] = useState<{ id: string; name: string }[]>([]);
+  const [projectFilter, setProjectFilter] = usePageState<string[]>("material.projectFilter", []);
+  const [scopedMaterialAction, setScopedMaterialAction] = usePageState<"part" | "electronic-import" | "edit" | undefined>(
+    "material.scopedAction", undefined);
+  const [catalogAction, setCatalogAction] = useState<"part" | "electronic-import">();
+  const [projectAssignment, setProjectAssignment] = useState<Part>();
+  const editableMaterialProjects = projects.filter((item) => !item.archived_at && hasProjectRole(item, currentUser, "engineering"));
   const mounted = useRef(true);
   useEffect(() => {
     mounted.current = true;
@@ -2008,6 +2282,7 @@ function Workspace({
   const [locationFilter, setLocationFilter] = usePageState("workspace.locationFilter", "");
   const [expandedPurchases, setExpandedPurchases] = usePageState<Set<string>>("workspace.expandedPurchases", new Set());
   const [materialLevel, setMaterialLevel] = usePageState("workspace.materialLevel", 1);
+  const [showMoldAmortization, setShowMoldAmortization] = usePageState("workspace.moldAmortization", false);
   const [selectedLabels, setSelectedLabels] = usePageState<Set<string>>("workspace.selectedLabels", new Set(), false);
   const [printMaterials, setPrintMaterials] = useState<LabelMaterial[] | null>(null);
   const labelSelection = {
@@ -2028,7 +2303,7 @@ function Workspace({
           localStorage.getItem("plm-hidden-columns") || "{}",
         );
         return Object.fromEntries(
-          ["parts", "inventory", "bom", "children"].map((id) => [
+          ["parts", "global-materials", "inventory", "bom", "children"].map((id) => [
             id,
             Array.isArray(saved?.[id]) ? saved[id] : [],
           ]),
@@ -2042,7 +2317,7 @@ function Workspace({
   const [categories, setCategories] = usePageState<Record<string, string>>("workspace.categories", {});
   const categoryProps = (key: string) => ({
     category: categories[key] || "",
-    categoryOptions: state.material_categories,
+    categoryOptions: ["parts", "global-materials", "bom"].includes(key) ? catalogCategories : state.material_categories,
     setCategory: (value: string) =>
       setCategories((old) => ({ ...old, [key]: value })),
   });
@@ -2076,9 +2351,16 @@ function Workspace({
   const refreshSequence = useRef(0);
   async function refresh() {
     const sequence = ++refreshSequence.current;
-    if (!projectId) return emptyState;
+    if (!projectId && !globalMaterials) return emptyState;
     try {
-      const result = await businessApi("state") as State;
+      let result: State;
+      if (globalMaterials) {
+        const data = await api("global-materials") as { parts: Part[]; deleted_parts: Part[]; projects: typeof catalogProjects };
+        result = { ...emptyState, shared_parts: data.parts, deleted_parts: data.deleted_parts };
+        if (sequence === refreshSequence.current) setCatalogProjects(data.projects);
+      } else {
+        result = await businessApi("state") as State;
+      }
       if (sequence === refreshSequence.current) {
         setState({ ...emptyState, ...result });
         setFatal("");
@@ -2095,7 +2377,7 @@ function Workspace({
     }
   }
   useEffect(() => {
-    if (!projectId) return;
+    if (!projectId && !globalMaterials) return;
     const sync = () => {
       if (document.visibilityState === "visible") void refresh().catch(() => {});
     };
@@ -2109,7 +2391,7 @@ function Workspace({
       window.removeEventListener("focus", sync);
       document.removeEventListener("visibilitychange", sync);
     };
-  }, [projectId]);
+  }, [projectId, globalMaterials]);
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(""), 4000);
@@ -2133,7 +2415,7 @@ function Workspace({
   function go(nextView: string, id = "", initial?: Record<string, unknown>) {
     if (!mounted.current) return;
     const next = {
-      projectId: ["settings", "projects", "global-shipping"].includes(nextView) ? "" : projectId,
+      projectId: ["settings", "projects", "global-shipping", "global-materials"].includes(nextView) ? "" : projectId,
       view: nextView,
       detail: id,
     };
@@ -2142,6 +2424,16 @@ function Workspace({
   }
   function goBack() {
     back({ ...route, detail: "" });
+  }
+  function openCatalogAction(id: string, action: "part" | "electronic-import" | "edit", partId = "") {
+    setCatalogAction(undefined);
+    navigate({ projectId: id, view: "parts", detail: partId }, false, {
+      "material.scopedAction": action, "workspace.materialLevel": materialLevel,
+    });
+  }
+  function chooseCatalogProject(action: "part" | "electronic-import") {
+    if (editableMaterialProjects.length === 1) openCatalogAction(editableMaterialProjects[0].id, action);
+    else setCatalogAction(action);
   }
   function openDetailTab(nextTab: string) {
     if (tab !== nextTab) navigate(route, false, { "workspace.tab": nextTab });
@@ -2166,9 +2458,19 @@ function Workspace({
     setModal(null);
     notify(message);
   }
-  const findPart = (id: string) =>
-    state.parts.find((x) => x.id === id) ||
-    state.deleted_parts.find((x) => x.id === id);
+  const catalogParts = [...state.parts, ...state.shared_parts.filter((part) => !part.deleted_at)];
+  const catalogCategories = [...new Set([...state.material_categories, ...catalogParts.map((part) => part.category)])];
+  const partsById = new Map([...state.parts, ...state.deleted_parts, ...state.shared_parts].map((part) => [part.id, part]));
+  const findPart = (id: string) => partsById.get(id);
+  const sharedPart = (part: Part) => part.project_id !== projectId;
+  const sharedImageUrl = (part: Part) => part.shared_image_id
+    ? appBase + (globalMaterials ? "api/global-materials/" + part.id + "/image/" :
+      "api/projects/" + encodeURIComponent(projectId) + "/shared-material-images/" + part.id + "/") + part.shared_image_id
+    : "";
+  const custodianName = (part: Part) => part.custodian_name || userName(part.custodian_id);
+  const relatedProjects = (part: Part) => part.project_assignments?.map((item) => item.name).join("、") ||
+    part.project_name || project?.name || "—";
+  const canEditMaterialSource = (part: Part) => editableMaterialProjects.some((item) => item.id === part.project_id);
   const findProduct = (id: string | null) =>
     state.products.find((x) => x.id === id);
   const findSupplier = (id: string) => state.suppliers.find((x) => x.id === id);
@@ -2185,13 +2487,14 @@ function Workspace({
   }) => {
     const f = files(owner, id).find((f) => f.kind === "image");
     const p = owner === "parts" ? findPart(id) : null;
+    const imageUrl = f ? fileUrl(f.id) : p ? sharedImageUrl(p) : "";
     return (
       <div
         className={`thumb ${large ? "large" : ""} ${p?.category === "电子物料" ? "electronic" : ""}`}
       >
-        {f ? (
+        {imageUrl ? (
           <img
-            src={fileUrl(f.id)}
+            src={imageUrl}
             alt={owner === "parts" ? p?.name : findProduct(id)?.name}
           />
         ) : owner === "parts" ? (
@@ -2206,6 +2509,13 @@ function Workspace({
   const productHasMovements =
     !!product && state.movements.some((row) => row.product_id === product.id);
   const part = findPart(detail);
+  useEffect(() => {
+    if (!scopedMaterialAction || !projectReady || !canEditEngineering) return;
+    if (scopedMaterialAction === "edit" && !part) return;
+    setScopedMaterialAction(undefined);
+    setModal(scopedMaterialAction === "edit" ? { kind: "part", item: part }
+      : { kind: scopedMaterialAction, extra: {} });
+  }, [scopedMaterialAction, projectReady, canEditEngineering, part?.id]);
   const inventoryPart = modal?.kind === "inventory-part" ? findPart(modal.item.id) : undefined;
   const partBomLines = part ? state.bom_lines.filter((line) => line.part_id === part.id) : [];
   const partBomProducts = [...new Set(partBomLines.map((line) =>
@@ -2237,6 +2547,10 @@ function Workspace({
     ? state.quotes.filter((q) => q.supplier_id === supplier.id)
     : [];
   const versions = state.bom_versions.filter((v) => v.product_id === detail);
+  const productMolds = product ? state.product_molds.filter((mold) => mold.product_id === product.id) : [];
+  const showMolds = view === "products" && tab === "molds";
+  const moldTotal = productMolds.reduce((total, mold) => total + (mold.cost ?? 0), 0);
+  const unpricedMolds = productMolds.filter((mold) => mold.cost === null).length;
   const selectedVersion =
     versions.find((v) => v.id === version) || versions[versions.length - 1];
   const match = (...values: any[]) =>
@@ -2257,15 +2571,16 @@ function Workspace({
     <div
       className="tabs material-level-tabs"
       role="tablist"
-      aria-label="物料级别"
+      aria-label={view === "products" ? "产品 BOM" : "物料级别"}
     >
       {[1, 2].map((level) => (
         <button
           role="tab"
-          aria-selected={materialLevel === level}
+          aria-selected={!showMolds && materialLevel === level}
           key={level}
-          className={materialLevel === level ? "selected" : ""}
+          className={!showMolds && materialLevel === level ? "selected" : ""}
           onClick={() => {
+            if (showMolds) setTab("info");
             setMaterialLevel(level);
             setParentFilter("");
             setSearch("");
@@ -2278,29 +2593,37 @@ function Workspace({
               ? bomAll.filter(
                   (l) => findPart(l.part_id)?.material_level === level,
                 ).length
-              : state.parts.filter((p) => p.material_level === level).length}
+              : (materialView ? catalogParts : state.parts).filter((p) => p.material_level === level).length}
           </span>
         </button>
       ))}
+      {view === "products" && product && (
+        <button role="tab" aria-selected={showMolds} className={showMolds ? "selected" : ""}
+          onClick={() => setTab("molds")}>
+          模具 <span>{productMolds.length}</span>
+        </button>
+      )}
     </div>
   );
   const warehouseLocations = [...new Set(state.parts.map((p) => p.location).filter(Boolean))]
     .sort((a, b) => a.localeCompare(b, "zh-CN", { numeric: true }));
   const locationChoices = warehouseLocations.map((value) => ({ value, label: value }));
   const inventoryLocation = warehouseLocations.includes(locationFilter) ? locationFilter : "";
-  const visibleParts = state.parts.filter(
+  const visibleParts = (materialView ? catalogParts : state.parts).filter(
     (p) =>
       p.material_level === materialLevel &&
       matchesCategory(view, p) &&
+      (!globalMaterials || !projectFilter.length ||
+        p.project_assignments?.some((item) => projectFilter.includes(item.id))) &&
       (view !== "inventory" || !inventoryLocation || p.location === inventoryLocation) &&
       (materialLevel !== 2 ||
         !parentFilter ||
-        (parentFilter === "unlinked"
+        (!sharedPart(p) && (parentFilter === "unlinked"
           ? !state.material_links.some((l) => l.child_id === p.id)
           : state.material_links.some(
               (l) => l.child_id === p.id && l.parent_id === parentFilter,
-            ))) &&
-      match(p.name, p.code, p.external_code, p.brand, p.spec, p.location) &&
+            )))) &&
+      match(p.name, p.code, p.external_code, p.brand, p.spec, p.location, relatedProjects(p)) &&
       (filter === "全部" ||
         p.category === filter ||
         (filter === "低库存" && p.stock < p.min_stock) ||
@@ -2316,6 +2639,13 @@ function Workspace({
     await refresh();
   }
   function materialPhoto(p: Part) {
+    const url = sharedImageUrl(p);
+    if (url) return <div className="material-photo-cell">
+      <button type="button" className="material-photo" aria-label={"预览" + p.name + "图片"}
+        onClick={() => setModal({ kind: "preview", item: { name: p.name + " · 图片", url } })}>
+        <img src={url} alt={p.name} loading="lazy" />
+      </button>
+    </div>;
     return (
       <MaterialPhoto
         name={p.name}
@@ -2327,6 +2657,10 @@ function Workspace({
   const childLinks = state.material_links.filter(
     (l) => l.parent_id === part?.id,
   );
+  const secondaryCost = childLinks.reduce(
+    (total, link) => total + (findPart(link.child_id)?.price ?? 0) * link.qty,
+    0,
+  );
   const displayedChildren = childLinks.filter((link) =>
     matchesCategory("children", findPart(link.child_id)),
   );
@@ -2336,7 +2670,7 @@ function Workspace({
     (l) => l.child_id === part?.id,
   );
   function openMaterial(id: string, section = "info") {
-    go("parts", id, section === "info" ? undefined : { "workspace.tab": section });
+    go(globalMaterials ? "global-materials" : "parts", id, section === "info" ? undefined : { "workspace.tab": section });
   }
   function openInventoryPart(id: string) {
     setModal({ kind: "inventory-part", item: { id } });
@@ -2389,12 +2723,12 @@ function Workspace({
     </Button>;
   }
   function materialEditButton(p: Part) {
-    if (p.deleted_at) return null;
+    if (p.deleted_at || (globalMaterials ? !canEditMaterialSource(p) : sharedPart(p) || !canEditEngineering)) return null;
     return (
       <button
         title="编辑物料"
         aria-label={"编辑物料 " + p.name}
-        onClick={() => editMaterial(p)}
+        onClick={() => globalMaterials ? openCatalogAction(p.project_id, "edit", p.id) : editMaterial(p)}
       >
         <Pencil size={15} />
       </button>
@@ -2416,15 +2750,18 @@ function Workspace({
     label: string,
     options?: Field["options"],
   ) {
-    if (p.deleted_at) return p[field] || "—";
+    if (p.deleted_at) return field === "notes"
+      ? <TableTextCell value={p.notes} label="备注" />
+      : p[field] || "—";
     return (
       <InlineCell
         label={p.name + " " + label}
         value={p[field]}
-        readOnly={!(canEditEngineering || (field === "location" && canUseWarehouse))}
+        note={field === "notes"}
+        readOnly={sharedPart(p) || !(canEditEngineering || (field === "location" && canUseWarehouse))}
         type={field === "price" || field === "min_stock" ? "number" : "text"}
         options={field === "location" ? [{ value: "", label: "未设置" }, ...locationChoices] : options}
-        categoryOptions={field === "category" ? state.material_categories : undefined}
+        categoryOptions={field === "category" ? catalogCategories : undefined}
         createOptionLabel={field === "location" ? "搜索或新增库位" : undefined}
         save={(value) => savePart(p.id, field, value)}
       />
@@ -2438,6 +2775,7 @@ function Workspace({
         </button>
       ),
       photo: materialPhoto(p),
+      source_project: <span className="material-project-names" title={relatedProjects(p)}>{relatedProjects(p)}</span>,
       name: (
         <button
           className="text-link material-name"
@@ -2448,7 +2786,7 @@ function Workspace({
           {p.deleted_at && "（已删除）"}
         </button>
       ),
-      parents: p.material_level === 2 && !p.deleted_at ? parentsCell(p) : null,
+      parents: p.material_level === 2 && !p.deleted_at && !sharedPart(p) ? parentsCell(p) : null,
       spec: materialCell(p, "spec", "规格型号"),
       external_code: materialCell(p, "external_code", "外部料号"),
       brand: materialCell(p, "brand", "品牌"),
@@ -2456,9 +2794,10 @@ function Workspace({
       category: materialCell(p, "category", "类别"),
       price: materialCell(p, "price", "单价"),
       stock: amount(p.stock),
-      custodian: userName(p.custodian_id),
+      min_stock: materialCell(p, "min_stock", "最低库存"),
+      custodian: custodianName(p),
       children:
-        p.material_level === 1 ? (
+        p.material_level === 1 && !sharedPart(p) ? (
           <button
             className="text-link child-count"
             onClick={() => openMaterial(p.id, "children")}
@@ -2521,54 +2860,54 @@ function Workspace({
   const levelColumns: Column[] = materialLevel === 2 ? ["parents"] : [];
   const childColumns: Column[] = materialLevel === 1 ? ["children"] : [];
   const bomColumns: Column[] = [
-    "photo",
     "name",
-    "category",
-    "custodian",
-    ...levelColumns,
-    "spec",
-    "external_code",
-    "brand",
-    "unit",
     "qty",
+    "unit",
     "price",
     "subtotal",
+    "spec",
+    "category",
+    "photo",
     "stock",
     "reference",
+    "source_project",
+    "custodian",
+    ...levelColumns,
+    "external_code",
+    "brand",
+    "min_stock",
     "notes",
     ...childColumns,
   ];
+  const libraryPrimaryColumns: Column[] = materialView
+    ? ["category", "spec", "source_project", "stock", "unit", "photo", "price", "min_stock", "location"]
+    : ["stock", "min_stock", "location", "unit", "spec", "category", "photo", "price"];
   const libraryColumns: Column[] = [
-    "photo",
     "name",
-    "category",
+    ...libraryPrimaryColumns,
     "custodian",
     ...levelColumns,
-    "spec",
     "external_code",
     "brand",
-    "unit",
-    "price",
-    "stock",
-    "min_stock",
-    "location",
     "notes",
     "level",
     ...childColumns,
   ];
   const childrenColumns: Column[] = [
-    "photo",
     "name",
-    "category",
-    "custodian",
-    "spec",
-    "external_code",
-    "brand",
-    "unit",
     "qty",
+    "unit",
     "price",
+    "subtotal",
+    "spec",
+    "category",
+    "photo",
     "stock",
     "reference",
+    "custodian",
+    "external_code",
+    "brand",
+    "min_stock",
     "notes",
     "parents",
   ];
@@ -2607,7 +2946,7 @@ function Workspace({
   }
   const low = state.parts.filter((p) => p.stock < p.min_stock);
   const title = navs.find((n) => n.id === view)?.name ||
-    ({ projects: "项目列表", "global-shipping": "全局发货", settings: "系统设置", "project-settings": "项目设置" }[view] || "工作空间");
+    ({ projects: "项目列表", "global-materials": "物料库", "global-shipping": "全局发货", settings: "系统设置", "project-settings": "项目设置" }[view] || "工作空间");
   const partOptions = state.parts.map((p) => ({
     value: p.id,
     label: p.code + " · " + p.name + " / 库存 " + amount(p.stock),
@@ -2697,7 +3036,7 @@ function Workspace({
   }
   function movementTable(rows: Movement[], limit = rows.length) {
     return (
-      <div className="table-wrap">
+      <TableScroll>
         <table>
           <thead>
             <tr>
@@ -2750,7 +3089,7 @@ function Workspace({
                         prefix={["入库", "退库"].includes(m.type) ? "+" : "−"}
                         tone={["入库", "退库"].includes(m.type) ? "green" : "rose"} /> {p?.unit}
                     </td>
-                    <td className="num"><QuantityHighlight value={m.balance} tone={m.balance === 0 ? "slate" : "blue"} /></td>
+                    <td className="num"><QuantityHighlight value={m.balance} tone={m.balance === 0 ? "slate" : "green"} /></td>
                     <td>
                       {po ? (
                         <button
@@ -2773,7 +3112,7 @@ function Workspace({
                       )}
                     </td>
                     <td>{userName(m.handler_id)}</td>
-                    <td>{m.reason || "—"}</td>
+                    <td className="table-note-column"><TableTextCell value={m.reason} label="用途或原因" /></td>
                     <td className="muted nowrap" title={"登记时间 " + datetime(m.created_at)}>{datetime(m.occurred_at)}</td>
                     {!archived && <td>{p && !p.deleted_at && (
                       <Button type="button" small aria-label={"编辑流水 " + m.code}
@@ -2787,7 +3126,7 @@ function Workspace({
           </tbody>
         </table>
         {!rows.length && <Empty title="暂无流水" />}
-      </div>
+      </TableScroll>
     );
   }
   function startInventory(type: string, p?: Part, extra?: any) {
@@ -2833,7 +3172,22 @@ function Workspace({
           <BrandMark />
           <strong>捷程未来PLM</strong>
         </a>
-        {project && (
+        <nav aria-label="全局导航">
+          <button className={view === "projects" ? "active" : ""} aria-current={view === "projects" ? "page" : undefined} onClick={() => go("projects")}>
+            <Layers size={19} strokeWidth={1.7} /><span>项目列表</span>
+          </button>
+          {(currentUser.role === "admin" || projects.length > 0) && <button
+            className={materialView ? "active" : ""} aria-current={materialView ? "page" : undefined} onClick={() => go("global-materials")}>
+            <Package size={19} strokeWidth={1.7} /><span>物料库</span>
+          </button>}
+          {canGlobalShipping && <button className={view === "global-shipping" ? "active" : ""} aria-current={view === "global-shipping" ? "page" : undefined} onClick={() => go("global-shipping")}>
+            <Truck size={19} strokeWidth={1.7} /><span>全局发货</span>
+          </button>}
+          {canRegisterStock && <button onClick={() => window.open(appBase + "#warehouse", "_blank", "noopener")}>
+            <ScanLine size={19} strokeWidth={1.7} /><span>出入库登记</span>
+          </button>}
+        </nav>
+        {project && <>
           <label className="project-switch">
             <span>当前项目</span>
             <select aria-label="切换项目" value={project.id} onChange={(event) => {
@@ -2842,43 +3196,32 @@ function Workspace({
               {projects.map((item) => <option key={item.id} value={item.id}>{item.name}{item.archived_at ? "（已归档）" : ""}</option>)}
             </select>
           </label>
-        )}
-        <nav>
-          <button className={view === "projects" ? "active" : ""} onClick={() => go("projects")}>
-            <Layers size={19} strokeWidth={1.7} /><span>项目列表</span>
-          </button>
-          {canGlobalShipping && <button className={view === "global-shipping" ? "active" : ""} onClick={() => go("global-shipping")}>
-            <Truck size={19} strokeWidth={1.7} /><span>全局发货</span>
-          </button>}
-          {canRegisterStock && <button onClick={() => window.open(appBase + "#warehouse", "_blank", "noopener")}>
-            <ScanLine size={19} strokeWidth={1.7} /><span>出入库登记</span>
-          </button>}
-          {project && navs.filter((n) => n.id !== "shipping" || can("shipping")).map((n) => (
-            <button
-              key={n.id}
-              className={view === n.id ? "active" : ""}
-              onClick={() => go(n.id)}
-            >
-              <n.icon size={19} strokeWidth={1.7} />
-              <span>{n.name}</span>
-              {n.id === "products" && (
-                <span className="nav-count">{state.products.length}</span>
-              )}
-              {n.id === "parts" && (
-                <span className="nav-count">{state.parts.length}</span>
-              )}
+          <nav aria-label="项目导航">
+            {navs.filter((n) => n.id !== "parts" && (n.id !== "shipping" || can("shipping"))).map((n) => (
+              <button
+                key={n.id}
+                className={view === n.id ? "active" : ""}
+                aria-current={view === n.id ? "page" : undefined}
+                onClick={() => go(n.id)}
+              >
+                <n.icon size={19} strokeWidth={1.7} />
+                <span>{n.name}</span>
+                {n.id === "products" && (
+                  <span className="nav-count">{state.products.length}</span>
+                )}
+              </button>
+            ))}
+            <button className={view === "project-settings" ? "active" : ""} aria-current={view === "project-settings" ? "page" : undefined} onClick={() => go("project-settings")}>
+              <Settings size={19} strokeWidth={1.7} /><span>项目设置</span>
             </button>
-          ))}
-          {project && <button className={view === "project-settings" ? "active" : ""} onClick={() => go("project-settings")}>
-            <Settings size={19} strokeWidth={1.7} /><span>项目设置</span>
-          </button>}
-        </nav>
+          </nav>
+        </>}
         <div className="sidebar-bottom">
           {project && !fatal && <button onClick={() => setModal({ kind: "scan" })}>
             <ScanLine size={18} />
             扫码识别物料<span className="key">↵</span>
           </button>}
-          <button onClick={() => go("settings")}>
+          <button className={view === "settings" ? "active" : ""} aria-current={view === "settings" ? "page" : undefined} onClick={() => go("settings")}>
             <Settings size={18} />
             系统设置
           </button>
@@ -2917,6 +3260,7 @@ function Workspace({
           <button
             className="icon-btn mobile-menu"
             aria-label="打开菜单"
+            aria-expanded={mobile}
             onClick={() => setMobile(!mobile)}
           >
             <Menu size={20} />
@@ -2946,6 +3290,7 @@ function Workspace({
             )}
           </div>
           <div className="topbar-right">
+            <ThemePicker {...appearance} />
             <span className="today">
               {new Date().toLocaleDateString("zh-CN", {
                 month: "long",
@@ -2970,7 +3315,7 @@ function Workspace({
               {fatal}
               <Button
                 onClick={() => {
-                  if (project) void refresh().catch(() => {});
+                  if (project || globalMaterials) void refresh().catch(() => {});
                   else void reloadProjects().then(() => setFatal(""), (e) => setFatal(e.message));
                 }}
               >
@@ -2978,7 +3323,7 @@ function Workspace({
               </Button>
             </div>
           )}
-          {project && !projectReady && <p className="muted">正在加载项目…</p>}
+          {(project || globalMaterials) && !projectReady && <p className="muted">{globalMaterials ? "正在加载物料库…" : "正在加载项目…"}</p>}
           {archived && !fatal && <p className="project-archived" role="status">{projectArchived ? "项目已归档，只能查看" : "当前模块为只读"}</p>}
           {projectReady && !fatal && <>
           {view === "projects" && <ProjectDirectory projects={projects}
@@ -3253,7 +3598,7 @@ function Workspace({
             </>
           )}
           {view === "products" && detail && product && (
-            <>
+            <section className="bom-workspace">
               <div className="detail-heading">
                 <button className="back-btn" aria-label="返回上一页" onClick={goBack}>
                   <ArrowLeft size={18} />
@@ -3285,15 +3630,13 @@ function Workspace({
                   ["info", "产品 BOM"],
                   ["files", "图片与附件"],
                 ].map(([id, name]) => (
-                  <button
-                    key={id}
-                    className={tab === id ? "selected" : ""}
-                    onClick={() => setTab(id)}
-                  >
-                    {name}
-                    {id === "files" && (
-                      <span>{files("products", product.id).length}</span>
-                    )}
+                    <button
+                      key={id}
+                      className={tab === id || (id === "info" && showMolds) ? "selected" : ""}
+                      onClick={() => setTab(id)}
+                    >
+                      {name}
+                      {id === "files" && <span>{files("products", product.id).length}</span>}
                   </button>
                 ))}
               </div>
@@ -3301,24 +3644,42 @@ function Workspace({
                 fileManager("products", product.id)
               ) : (
                 <>
-                  <div className="bom-version-bar">
-                    <select
-                      aria-label="BOM 版本"
-                      value={selectedVersion?.id || ""}
-                      onChange={(e) => setVersion(e.target.value)}
-                    >
-                      {versions.map((v) => (
-                        <option key={v.id} value={v.id}>
-                          {v.name}
-                        </option>
-                      ))}
-                    </select>
+                  <div className={"bom-version-bar" + (showMolds ? " mold-version-bar" : "")}>
+                    <label className="bom-version-label">
+                      <span>BOM 版本</span>
+                      <select
+                        value={selectedVersion?.id || ""}
+                        onChange={(e) => setVersion(e.target.value)}
+                      >
+                        {versions.map((v) => (
+                          <option key={v.id} value={v.id}>
+                            {v.name}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
                     <Button small onClick={() => setModal({ kind: "version" })}>
                       <Copy size={14} />
                       新建版本
                     </Button>
-                    <span className="bom-total">
-                      合计{" "}
+                    {showMolds ? (
+                      <>
+                        <span className="bom-total">
+                          模具费{unpricedMolds ? "小计" : "总价"}{" "}
+                          <strong>{productMolds.length && unpricedMolds === productMolds.length ? "—" : money(moldTotal)}</strong>
+                          {!!unpricedMolds && <small className="mold-cost-note">{unpricedMolds} 个未填模具费</small>}
+                        </span>
+                        {!!productMolds.length && (
+                          <Button small
+                            aria-expanded={showMoldAmortization}
+                            aria-controls={showMoldAmortization ? "mold-amortization" : undefined}
+                            onClick={() => setShowMoldAmortization((shown) => !shown)}>
+                            {showMoldAmortization ? "收起均摊" : "查看均摊"}
+                          </Button>
+                        )}
+                      </>
+                    ) : <span className="bom-total">
+                      BOM 成本{" "}
                       <strong>
                         {money(
                           bomAll.reduce(
@@ -3328,11 +3689,20 @@ function Workspace({
                           ),
                         )}
                       </strong>
-                    </span>
+                    </span>}
                   </div>
-                  <div className="section-toolbar">
+                  <div className="section-toolbar data-toolbar">
                     {levelTabs}
-                    <div className="toolbar-controls">
+                    {showMolds ? (
+                      canEditEngineering && (
+                        <div className="toolbar-controls">
+                          <Button small primary onClick={() => setModal({ kind: "mold" })}>
+                            <Plus size={15} />
+                            新增模具
+                          </Button>
+                        </div>
+                      )
+                    ) : <div className="toolbar-controls">
                       {displayFields("bom", bomColumns)}
                       {batchLabelButton(selectedBomLabels)}
                       <Button
@@ -3381,9 +3751,81 @@ function Workspace({
                         <Plus size={15} />
                         新建物料
                       </Button>
-                    </div>
+                    </div>}
                   </div>
-                  <MaterialTable
+                  {showMolds && showMoldAmortization && productMolds.length > 0 && (
+                    <MoldAmortization molds={productMolds} findPart={findPart} />
+                  )}
+                  {showMolds ? (
+                    productMolds.length ? (
+                      <TableScroll>
+                        <table>
+                          <thead>
+                            <tr>
+                              <th>模具编号</th>
+                              <th>模具名称</th>
+                              <th>关联一级物料</th>
+                              <th>供应商</th>
+                              <th className="num">模具费（元）</th>
+                              <th className="num">MOQ（件）</th>
+                              <th className="num">均摊数量（件）</th>
+                              {showMoldAmortization && <th className="num">均摊（元/件）</th>}
+                              <th>备注</th>
+                              {canEditEngineering && <th>操作</th>}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {productMolds.map((mold) => (
+                              <tr key={mold.id}>
+                                <td className="mono">{mold.code || "—"}</td>
+                                <td>{mold.name}</td>
+                                <td>
+                                  {mold.part_ids.length ? (
+                                    <div className="relation-cell">
+                                      {mold.part_ids.map((id) => {
+                                        const material = findPart(id);
+                                        return material && (
+                                          <button key={id} type="button" className="record-tag"
+                                            onClick={() => openMaterial(id)}>
+                                            {material.code} {material.name}{material.deleted_at && "（已删除）"}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  ) : "—"}
+                                </td>
+                                <td>{(mold.supplier_id && findSupplier(mold.supplier_id)?.name) || "—"}</td>
+                                <td className="num">{mold.cost === null ? "—" : money(mold.cost)}</td>
+                                <td className="num">{mold.moq ? amount(mold.moq) : "—"}</td>
+                                <td className="num">
+                                  {mold.amortization_qty != null ? amount(mold.amortization_qty)
+                                    : mold.moq ? amount(mold.moq) + "（按 MOQ）" : "—"}
+                                </td>
+                                {showMoldAmortization && <td className="num">
+                                  {moldUnitMoney(moldUnitCost(mold))}
+                                </td>}
+                                <td className="table-note-column"><TableTextCell value={mold.notes} label="备注" /></td>
+                                {canEditEngineering && (
+                                  <td>
+                                    <div className="row-actions">
+                                      <button title="编辑模具" aria-label={"编辑模具 " + mold.name}
+                                        onClick={() => setModal({ kind: "mold", item: mold })}>
+                                        <Pencil size={15} />
+                                      </button>
+                                      <button title="删除模具" aria-label={"删除模具 " + mold.name}
+                                        onClick={() => setModal({ kind: "delete-mold", item: mold })}>
+                                        <Trash2 size={15} />
+                                      </button>
+                                    </div>
+                                  </td>
+                                )}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </TableScroll>
+                    ) : <Empty title="暂无模具" />
+                  ) : <MaterialTable
                     tableId="bom"
                     selection={labelSelection}
                     {...categoryProps("bom")}
@@ -3420,10 +3862,11 @@ function Workspace({
                             />
                           ),
                           notes: material.deleted_at ? (
-                            line.notes
+                            <TableTextCell value={line.notes} label="备注" />
                           ) : (
                             <InlineCell
                               label={material.name + " 备注"}
+                              note
                               value={line.notes}
                               save={(value) =>
                                 saveLine(line.id, "notes", value)
@@ -3473,7 +3916,7 @@ function Workspace({
                         }
                       />
                     }
-                  />
+                  />}
                 </>
               )}
               <div className="danger-footer">
@@ -3499,28 +3942,28 @@ function Workspace({
                   )
                 )}
               </div>
-            </>
+            </section>
           )}
-          {(view === "parts" || view === "inventory") && !detail && (
-            <>
+          {(materialView || view === "inventory") && !detail && (
+            <section className="material-workspace">
               <div className="page-heading">
                 <div>
                   <h1>
-                    {view === "parts" ? "物料库" : "库存查询"}{" "}
-                    <span className="heading-count">{state.parts.length}</span>
+                    {materialView ? "物料库" : "库存查询"}{" "}
+                    <span className="heading-count">{materialView ? catalogParts.length : state.parts.length}</span>
                   </h1>
                 </div>
-                {view === "parts" ? (
+                {materialView ? (
                   <div className="toolbar-controls">
-                    {!!state.deleted_parts.length && (
                       <Button
                         onClick={() => setModal({ kind: "deleted-parts" })}
                       >
                         <Archive size={15} />
                         已删除物料
+                        {state.deleted_parts.length > 0 && <span className="muted">{state.deleted_parts.length}</span>}
                       </Button>
-                    )}
-                    {canEditEngineering && <Button primary onClick={() => setModal({ kind: "part" })}>
+                    {(globalMaterials ? editableMaterialProjects.length > 0 : canEditEngineering) &&
+                    <Button primary onClick={() => globalMaterials ? chooseCatalogProject("part") : setModal({ kind: "part" })}>
                       <Plus size={17} />
                       新建物料
                     </Button>}
@@ -3539,7 +3982,7 @@ function Workspace({
                 )}
               </div>
               {view === "inventory" && (
-                <div className="stats-row">
+                <div className="stats-row inventory-stats">
                   <div>
                     <span className="stat-label">物料种类</span>
                     <strong>
@@ -3554,7 +3997,7 @@ function Workspace({
                       <small>种</small>
                     </strong>
                   </div>
-                  <div>
+                  <div data-stock-alert={low.length ? "" : undefined}>
                     <span className="stat-label">低于最低库存</span>
                     <strong>
                       {low.length}
@@ -3571,21 +4014,23 @@ function Workspace({
                   </div>
                 </div>
               )}
-              <div className="section-toolbar">
+              <div className="section-toolbar data-toolbar">
                 {levelTabs}
                 <div className="toolbar-controls">
-                  {view === "parts" && materialLevel === 2 && (
+                  {materialView && materialLevel === 2 &&
+                    (globalMaterials ? editableMaterialProjects.length > 0 : canEditEngineering) && (
                     <Button
                       small
                       onClick={() =>
-                        setModal({ kind: "electronic-import", extra: {} })
+                        globalMaterials ? chooseCatalogProject("electronic-import") :
+                          setModal({ kind: "electronic-import", extra: {} })
                       }
                     >
                       <Upload size={15} />
                       导入 Excel
                     </Button>
                   )}
-                  {materialLevel === 2 && (
+                  {!globalMaterials && materialLevel === 2 && (
                     <select
                       className="parent-filter"
                       aria-label="筛选关联一级物料"
@@ -3608,13 +4053,25 @@ function Workspace({
                       <Search size={16} />
                       <input
                         aria-label="搜索物料"
-                        placeholder="搜索物料"
+                        placeholder={materialView ? "料号、名称或所属项目" : "搜索物料"}
                         value={search}
                         onChange={(e) => setSearch(e.target.value)}
                       />
                     </div>
                     {displayFields(view, libraryColumns)}
                   </div>
+                  {globalMaterials && <details className="column-visibility">
+                    <summary className="btn small" aria-label="筛选所属项目">
+                      {projectFilter.length ? "所属项目（" + projectFilter.length + "）" : "全部项目"} <ChevronDown size={14} />
+                    </summary>
+                    <div className="column-visibility-menu">
+                      <div className="column-visibility-heading">
+                        <strong>所属项目</strong>
+                        <button type="button" className="text-link" onClick={() => setProjectFilter([])}>全部</button>
+                      </div>
+                      <ProjectChecklist projects={catalogProjects} selected={projectFilter} change={setProjectFilter} />
+                    </div>
+                  </details>}
                   {view === "inventory" && (
                     <>
                       <select className="stock-filter" aria-label="库存筛选" value={filter}
@@ -3629,16 +4086,19 @@ function Workspace({
                     </>
                   )}
                   {batchLabelButton(selectedVisibleParts)}
-                  <Button small onClick={() => setModal({ kind: "scan" })}>
+                  <Button small title="扫码识别物料" aria-label="扫码识别物料" onClick={() => setModal({ kind: "scan" })}>
                     <ScanLine size={16} />
                   </Button>
                   <Button
                     small
+                    title="导出物料库存"
+                    aria-label="导出物料库存"
                     onClick={() =>
                       exportCSV(
                         visibleParts.map((p) => ({
                           物料编码: p.code,
                           名称: p.name,
+                          ...(materialView ? { 所属项目: relatedProjects(p) } : {}),
                           级别: p.material_level,
                           规格型号: p.spec,
                           单位: p.unit,
@@ -3682,6 +4142,9 @@ function Workspace({
                         ) : (
                           <>
                             {materialEditButton(material)}
+                            {globalMaterials && canEditMaterialSource(material) && <button type="button"
+                              title="设置共用项目" aria-label={"设置 " + material.code + " 的共用项目"}
+                              onClick={() => setProjectAssignment(material)}><Layers size={15} /></button>}
                             <button
                               title="物料二维码"
                               onClick={() =>
@@ -3690,7 +4153,7 @@ function Workspace({
                             >
                               <QrCode size={15} />
                             </button>
-                            <button
+                            {!sharedPart(material) && <button
                               title="图片与附件"
                               aria-label={material.name + "的图片与附件"}
                               onClick={() =>
@@ -3701,7 +4164,7 @@ function Workspace({
                               }
                             >
                               <Paperclip size={15} />
-                            </button>
+                            </button>}
                           </>
                         )}
                       </div>
@@ -3710,9 +4173,62 @@ function Workspace({
                 }))}
                 empty={<Empty title="暂无物料" />}
               />
+            </section>
+          )}
+          {materialView && detail && part && sharedPart(part) && (
+            <>
+              <div className="detail-heading">
+                <button className="back-btn" aria-label="返回上一页" onClick={goBack}>
+                  <ArrowLeft size={18} />
+                </button>
+                <Thumb owner="parts" id={part.id} />
+                <div className="detail-title">
+                  <div className="inline">
+                    <h1>{part.name}</h1>
+                    <Badge>{part.deleted_at ? "已删除" : part.category}</Badge>
+                  </div>
+                  <p>{part.code} · {part.project_name}</p>
+                </div>
+                {projects.some((item) => item.id === part.project_id) && <Button
+                  onClick={() => navigate({ projectId: part.project_id, view: "parts", detail: part.id })}>打开所属项目</Button>}
+                {globalMaterials && canEditMaterialSource(part) && <Button type="button"
+                  onClick={() => setProjectAssignment(part)}>设置共用项目</Button>}
+              </div>
+              <div className="tabs page-tabs">
+                <button className={tab !== "activity" ? "selected" : ""} onClick={() => setTab("info")}>基本资料</button>
+                <button className={tab === "activity" ? "selected" : ""} onClick={() => setTab("activity")}>操作记录</button>
+              </div>
+              {tab === "activity" ? <ActivityPanel key={part.id} part={part.id} kind="material" /> : (
+                <section className="panel">
+                  <dl className="info-list">
+                    <dt>所属项目</dt><dd>{relatedProjects(part)}</dd>
+                    <dt>主归属项目</dt><dd>{part.project_name}</dd>
+                    <dt>物料管理员</dt><dd>{custodianName(part)}</dd>
+                    <dt>规格 / 封装</dt><dd>{part.spec || "—"}</dd>
+                    <dt>外部料号</dt><dd>{part.external_code || "—"}</dd>
+                    <dt>品牌</dt><dd>{part.brand || "—"}</dd>
+                    <dt>当前库存</dt><dd>{amount(part.stock)} {part.unit}</dd>
+                    <dt>参考单价</dt><dd>{money(part.price)}</dd>
+                    {part.secondary_cost != null && <>
+                      <dt>二级物料合计</dt><dd>{money(part.secondary_cost, 6)}</dd>
+                    </>}
+                    <dt>仓库位置</dt><dd>{part.location || "—"}</dd>
+                    <dt>备注</dt><dd>{part.notes || "—"}</dd>
+                  </dl>
+                </section>
+              )}
+              {globalMaterials && !part.deleted_at && canEditMaterialSource(part) && <div className="danger-footer">
+                <Button small onClick={() => setModal({ kind: "delete-part", item: part })}>
+                  <Trash2 size={14} />删除物料
+                </Button>
+                <span>删除后保留 30 天，期间可恢复；到期且无业务引用时自动永久删除。</span>
+              </div>}
+              {globalMaterials && part.deleted_at && canEditMaterialSource(part) && <div className="dialog-actions">
+                <Button onClick={() => setModal({ kind: "restore-part", item: part })}>恢复物料</Button>
+              </div>}
             </>
           )}
-          {view === "parts" && detail && part?.deleted_at && (
+          {view === "parts" && detail && part?.deleted_at && !sharedPart(part) && (
             <>
               <div className="detail-heading">
                 <button
@@ -3738,13 +4254,13 @@ function Workspace({
                   恢复物料
                 </Button>
               </div>
-              <ActivityPanel key={part.id} part={part.id} />
+              <ActivityPanel key={part.id} part={part.id} kind="material" />
               {movementTable(
                 state.movements.filter((row) => row.part_id === part.id),
               )}
             </>
           )}
-          {view === "parts" && detail && part && !part.deleted_at && (
+          {view === "parts" && detail && part && !part.deleted_at && !sharedPart(part) && (
             <>
               <div className="detail-heading">
                 <button className="back-btn" aria-label="返回上一页" onClick={goBack}>
@@ -3787,6 +4303,9 @@ function Workspace({
                 <div>
                   <span>参考单价</span>
                   <strong>{money(part.price)}</strong>
+                  {childLinks.length > 0 && <p className="secondary-material-total">
+                    二级物料合计 <b>{money(secondaryCost, 6)}</b>
+                  </p>}
                   <p>库位：{part.location || "未设置"}</p>
                 </div>
                 {canUseWarehouse && <div className="inventory-quick">
@@ -3915,7 +4434,8 @@ function Workspace({
                               save={(value) => saveLink("qty", value)}
                             />
                           ),
-                          price: money(child.price),
+                          price: money(child.price, 6),
+                          subtotal: money(child.price * link.qty, 6),
                           reference: child.deleted_at ? (
                             link.reference
                           ) : (
@@ -3926,10 +4446,11 @@ function Workspace({
                             />
                           ),
                           notes: child.deleted_at ? (
-                            link.notes
+                            <TableTextCell value={link.notes} label="备注" />
                           ) : (
                             <InlineCell
                               label={child.name + " 关联备注"}
+                              note
                               value={link.notes}
                               save={(value) => saveLink("notes", value)}
                             />
@@ -3996,7 +4517,7 @@ function Workspace({
                       选择关联
                     </Button>
                   </div>
-                  <div className="table-wrap">
+                  <TableScroll>
                     <table>
                       <thead>
                         <tr>
@@ -4033,7 +4554,7 @@ function Workspace({
                       </tbody>
                     </table>
                     {!parentLinks.length && <Empty title="未关联一级物料" />}
-                  </div>
+                  </TableScroll>
                 </>
               )}
               {tab === "info" && (
@@ -4157,7 +4678,7 @@ function Workspace({
                       </Button>
                     </div>
                   )}
-                  <div className="table-wrap">
+                  <TableScroll>
                     <table>
                       <thead>
                         <tr>
@@ -4199,11 +4720,11 @@ function Workspace({
                     {!partBomLines.length && (
                       <Empty title="未关联 BOM" />
                     )}
-                  </div>
+                  </TableScroll>
                 </>
               )}
               {tab === "purchases" && (
-                <div className="table-wrap">
+                <TableScroll>
                   <table>
                     <thead>
                       <tr>
@@ -4247,10 +4768,10 @@ function Workspace({
                   {!state.purchase_lines.some((l) => l.part_id === part.id) && (
                     <Empty text="该物料暂无采购记录。" />
                   )}
-                </div>
+                </TableScroll>
               )}
               {tab === "activity" && (
-                <ActivityPanel key={part.id} part={part.id} />
+                <ActivityPanel key={part.id} part={part.id} kind="material" />
               )}
               {tab === "history" &&
                 movementTable(
@@ -4265,7 +4786,7 @@ function Workspace({
                   删除物料
                 </Button>
                 <span>
-                  删除后可在「已删除物料」恢复。库存和历史记录会保留。
+                  删除后保留 30 天，期间可在「已删除物料」恢复；到期且无业务引用时自动永久删除。
                 </span>
               </div>
             </>
@@ -4297,7 +4818,7 @@ function Workspace({
                   />
                 </div>
               </div>
-              <div className="table-wrap">
+              <TableScroll>
                 <table>
                   <thead>
                     <tr>
@@ -4321,7 +4842,7 @@ function Workspace({
                             >
                               {s.name} <ArrowUpRight size={13} />
                             </button>
-                            <small>{s.notes}</small>
+                            {s.notes && <small className="table-note-column"><TableTextCell value={s.notes} label="备注" /></small>}
                           </td>
                           <td>{s.contact || "—"}</td>
                           <td>
@@ -4375,7 +4896,7 @@ function Workspace({
                     text="添加供应商后，即可关联报价和创建采购单。"
                   />
                 )}
-              </div>
+              </TableScroll>
             </>
           )}
           {view === "suppliers" && detail && supplier && (
@@ -4427,7 +4948,7 @@ function Workspace({
                   关联物料
                 </Button>
               </div>
-              <div className="table-wrap">
+              <TableScroll>
                 <table>
                   <thead>
                     <tr>
@@ -4469,7 +4990,7 @@ function Workspace({
                   </tbody>
                 </table>
                 {!suppliedMaterials.length && <Empty title="暂无关联物料" />}
-              </div>
+              </TableScroll>
             </>
           )}
           {view === "purchases" && !detail && (
@@ -4509,7 +5030,7 @@ function Workspace({
                   />
                 </div>
               </div>
-              <div className="table-wrap">
+              <TableScroll>
                 <table>
                   <thead>
                     <tr>
@@ -4646,7 +5167,7 @@ function Workspace({
                     text="创建采购单，或调整筛选条件。"
                   />
                 )}
-              </div>
+              </TableScroll>
             </>
           )}
           {view === "purchases" && detail && purchase && (
@@ -4693,7 +5214,7 @@ function Workspace({
                   导出明细
                 </Button>
               </div>
-              <div className="table-wrap">
+              <TableScroll>
                 <table>
                   <thead>
                     <tr>
@@ -4750,7 +5271,7 @@ function Workspace({
                       })}
                   </tbody>
                 </table>
-              </div>
+              </TableScroll>
               <h3 className="section-title">关联入库流水</h3>
               {movementTable(
                 state.movements.filter((m) =>
@@ -4864,9 +5385,11 @@ function Workspace({
                   ...(currentUser?.role === "admin"
                     ? [
                         ["users", "用户管理"],
+                        ["scanner-devices", "扫码枪"],
                         ["system-activity", "系统操作记录"],
                         ["assets", "素材库"],
                         ["shopify", "Shopify"],
+                        ["feishu", "飞书"],
                         ["backup", "备份与恢复"],
                       ]
                     : []),
@@ -4905,6 +5428,13 @@ function Workspace({
               )}
               {currentUser.role === "admin" && accountView === "assets" && <AssetLibrary onChanged={reloadProjects} />}
               {currentUser.role === "admin" && accountView === "shopify" && <ShopifySettingsPanel />}
+              {currentUser.role === "admin" && accountView === "feishu" && (
+                <Suspense fallback={<p className="muted">正在加载…</p>}>
+                  <FeishuSettings api={api}
+                    callbackUrl={window.location.origin + appBase + "api/feishu/events"} />
+                </Suspense>
+              )}
+              {currentUser.role === "admin" && accountView === "scanner-devices" && <ScannerDevicesPanel />}
               {currentUser?.role === "admin" && accountView === "backup" && (
                 <div className="settings-grid">
                   <BackupPanel onRestored={onRestore} />
@@ -4914,7 +5444,7 @@ function Workspace({
           )}
           {detail &&
             ((view === "products" && !product) ||
-              (view === "parts" && !part) ||
+              (materialView && !part) ||
               (view === "purchases" && !purchase) ||
               (view === "suppliers" && !supplier)) && (
               <Empty
@@ -4944,6 +5474,15 @@ function Workspace({
       {printMaterials && <Suspense fallback={null}>
         <MaterialLabelsDialog materials={printMaterials} close={() => setPrintMaterials(null)} />
       </Suspense>}
+      {catalogAction && <CatalogProjectDialog projects={editableMaterialProjects} action={catalogAction}
+        close={() => setCatalogAction(undefined)} choose={(id) => openCatalogAction(id, catalogAction)} />}
+      {projectAssignment && <MaterialProjectDialog part={projectAssignment} projects={catalogProjects}
+        close={() => setProjectAssignment(undefined)} save={async (ids) => {
+          await api("global-materials/" + projectAssignment.id + "/projects", "PUT", { project_ids: ids });
+          await refresh();
+          setProjectAssignment(undefined);
+          notify("共用项目已保存");
+        }} />}
       {!fatal && modal && (!projectArchived || readOnlyModal) && (
         <ChoiceContext.Provider value={projectArchived ? null : setChoice}>
           {((["product", "part", "supplier"].includes(modal.kind) &&
@@ -4966,6 +5505,7 @@ function Workspace({
             >
               <QuickCreateForm
                 images={modal.kind !== "supplier"}
+                bomQuantity={modal.kind === "bom-create"}
                 suppliers={canEditPurchase && ["part", "bom-create", "child-create"].includes(modal.kind) ? supplierOptions : undefined}
                 fields={
                   modal.kind === "product"
@@ -4978,6 +5518,7 @@ function Workspace({
                 }
                 initial={{
                   unit: "PCS",
+                  ...(modal.kind === "bom-create" ? { qty: "1" } : {}),
                   category:
                     modal.kind === "child-create" || materialLevel === 2
                       ? "电子物料"
@@ -5037,7 +5578,7 @@ function Workspace({
                   resource: "parts",
                   level: modal.kind === "material-parents" ? 1 : 2,
                 }}
-                records={state.parts.filter(
+                records={(modal.kind === "material-parents" ? state.parts : catalogParts).filter(
                   (p) =>
                     p.material_level ===
                     (modal.kind === "material-parents" ? 1 : 2),
@@ -5045,7 +5586,7 @@ function Workspace({
                 selected={state.material_links
                   .filter((l) =>
                     modal.kind === "material-parents"
-                      ? l.child_id === modal.item.id
+                      ? l.child_id === modal.item.id && l.project_id === projectId
                       : l.parent_id === modal.item.id,
                   )
                   .map((l) =>
@@ -5153,9 +5694,8 @@ function Workspace({
               onClose={() => setModal(null)}
             >
               <BomForm
-                parts={state.parts.filter(
-                  (p) => p.material_level === materialLevel,
-                )}
+                parts={catalogParts.filter((p) => p.material_level === materialLevel)
+                  .map((p) => ({ ...p, project_name: p.project_name || project?.name }))}
                 item={modal.item}
                 create={{
                   resource: "parts",
@@ -5169,6 +5709,37 @@ function Workspace({
                   )
                 }
                 onCancel={() => setModal(null)}
+              />
+            </Dialog>
+          )}
+          {modal.kind === "mold" && product && (
+            <Dialog title={modal.item ? "编辑模具" : "新增模具"} onClose={() => setModal(null)}>
+              <EntityForm
+                fields={[
+                  { name: "name", label: "模具名称", required: true },
+                  { name: "code", label: "模具编号" },
+                  { name: "supplier_id", label: "供应商", options: supplierOptions },
+                  { name: "cost", label: "模具费（元）", type: "number", step: "0.01" },
+                  { name: "moq", label: "MOQ（件）", type: "number", min: 1, step: "1" },
+                  {
+                    name: "amortization_qty", label: "均摊数量（件）", type: "number",
+                    min: 1, step: "1", placeholder: "留空时按 MOQ 计算",
+                  },
+                  {
+                    name: "part_ids",
+                    label: "关联一级物料",
+                    wide: true,
+                    records: [...state.parts, ...state.deleted_parts, ...state.shared_parts].filter((part) =>
+                      part.material_level === 1 && (!part.deleted_at || modal.item?.part_ids.includes(part.id))),
+                  },
+                  { name: "notes", label: "备注", type: "textarea", wide: true },
+                ]}
+                initial={modal.item || { product_id: product.id }}
+                onCancel={() => setModal(null)}
+                submit={(data) => mutate(
+                  modal.item ? "product-molds/" + modal.item.id : "product-molds",
+                  modal.item ? "PUT" : "POST", data, "模具已保存",
+                )}
               />
             </Dialog>
           )}
@@ -5379,10 +5950,10 @@ function Workspace({
             <Dialog title="扫码识别物料" onClose={() => setModal(null)}>
               <Scanner
                 aliases={state.material_code_aliases}
-                parts={state.parts}
+                parts={materialView ? catalogParts : state.parts}
                 onFound={(p) => {
                   setModal(null);
-                  go("parts", p.id);
+                  openMaterial(p.id);
                 }}
               />
             </Dialog>
@@ -5390,13 +5961,13 @@ function Workspace({
           {modal.kind === "preview" && (
             <Dialog title={modal.item.name} wide onClose={() => setModal(null)}>
               <div className="image-preview">
-                <img src={fileUrl(modal.item.id)} alt={modal.item.name} />
+                <img src={modal.item.url || fileUrl(modal.item.id)} alt={modal.item.name} />
               </div>
               <div className="dialog-actions">
                 <a
                   className="btn"
-                  href={fileUrl(modal.item.id)}
-                  download={modal.item.name}
+                  href={modal.item.url || fileUrl(modal.item.id)}
+                  download={modal.item.url ? true : modal.item.name}
                 >
                   <Download size={15} />
                   下载图片
@@ -5405,14 +5976,18 @@ function Workspace({
             </Dialog>
           )}
           {modal.kind === "deleted-parts" && (
-            <Dialog title="已删除物料" onClose={() => setModal(null)}>
-              <div className="table-wrap">
-                <table>
+            <Dialog title="已删除物料" wide onClose={() => setModal(null)}>
+              <p className="confirm-copy">删除后保留 30 天，每日自动清理到期且无业务引用的物料及其图片、附件。仍被引用或所属项目已归档的物料会保留。</p>
+              <TableScroll>
+                <table className="deleted-material-table">
                   <thead>
                     <tr>
                       <th>料号</th>
                       <th>名称</th>
+                      <th>所属项目</th>
                       <th>库存</th>
+                      <th>删除时间</th>
+                      <th>自动永久删除</th>
                       <th>操作</th>
                     </tr>
                   </thead>
@@ -5423,6 +5998,7 @@ function Workspace({
                         <td>
                           <button
                             className="text-link"
+                            disabled={globalMaterials && !projects.some((item) => item.id === material.project_id)}
                             onClick={() => {
                               setModal(null);
                               openMaterial(material.id);
@@ -5431,19 +6007,27 @@ function Workspace({
                             {material.name}
                           </button>
                         </td>
+                        <td>{material.project_name || project?.name || "—"}</td>
                         <td>
                           {amount(material.stock)} {material.unit}
                         </td>
+                        <td className="nowrap">{material.deleted_at ? new Date(material.deleted_at).toLocaleString() : "—"}</td>
+                        <td className="nowrap">{material.purge_blockers?.length
+                          ? "已保留：" + material.purge_blockers.join("、")
+                          : material.purge_after ? new Date(material.purge_after).toLocaleString() + " 后清理" : "时间未设置"}</td>
                         <td>
                           <Button
                             small
+                            disabled={!canEditMaterialSource(material)}
                             onClick={() =>
                               setModal({ kind: "restore-part", item: material })
                             }
                           >
                             恢复
                           </Button>
-                          {currentUser.role === "admin" && !archived && <Button small
+                          {currentUser.role === "admin" && canEditMaterialSource(material) && <Button small
+                            disabled={!!material.purge_blockers?.length}
+                            title={material.purge_blockers?.length ? "仍被引用：" + material.purge_blockers.join("、") : undefined}
                             onClick={() => setModal({ kind: "purge-part", item: material })}>
                             <Trash2 size={14} />永久删除
                           </Button>}
@@ -5452,7 +6036,8 @@ function Workspace({
                     ))}
                   </tbody>
                 </table>
-              </div>
+                {!state.deleted_parts.length && <Empty text="暂无已删除物料。" />}
+              </TableScroll>
             </Dialog>
           )}
           {modal.kind === "purge-part" && (
@@ -5461,7 +6046,7 @@ function Workspace({
                 确定永久删除「{modal.item.code} {modal.item.name}」及其图片和附件？此操作无法撤销。
               </p>
               <AsyncAction label="永久删除" onCancel={() => setModal({ kind: "deleted-parts" })} action={async () => {
-                await businessApi("deleted-parts/" + modal.item.id, "DELETE", { confirm: true });
+                await projectRequest(modal.item.project_id, "deleted-parts/" + modal.item.id, "DELETE", { confirm: true });
                 await refresh();
                 setModal({ kind: "deleted-parts" });
                 notify("物料已永久删除");
@@ -5476,14 +6061,12 @@ function Workspace({
               <AsyncAction
                 label="确认恢复"
                 onCancel={() => setModal(null)}
-                action={() =>
-                  mutate(
-                    "deleted-parts/" + modal.item.id,
-                    "PUT",
-                    {},
-                    "物料已恢复",
-                  )
-                }
+                action={async () => {
+                  await projectRequest(modal.item.project_id, "deleted-parts/" + modal.item.id, "PUT", {});
+                  await refresh();
+                  setModal({ kind: "deleted-parts" });
+                  notify("物料已恢复");
+                }}
               />
             </Dialog>
           )}
@@ -5491,7 +6074,7 @@ function Workspace({
             <Dialog title="删除产品" onClose={() => setModal(null)}>
               <p className="confirm-copy">
                 确定删除「{modal.item.name}」？该产品的
-                BOM、图片和附件将一并删除。物料库记录和料号会保留。
+                BOM、模具记录、图片和附件将一并删除。物料库记录和料号会保留。
               </p>
               <EntityForm
                 fields={[
@@ -5522,14 +6105,16 @@ function Workspace({
               <Dialog title="确认删除" onClose={() => setModal(null)}>
                 <p className="confirm-copy">
                   {modal.kind === "delete-part"
-                    ? `删除「${modal.item.name}」？物料将从常用列表移除，可在「已删除物料」恢复。库存和原有记录会保留。`
+                    ? `删除「${modal.item.name}」？物料将从常用列表移除，30 天内可在「已删除物料」恢复。超过 30 天且无业务引用时会自动永久删除，包括图片和附件；仍被引用的会保留。`
                     : modal.kind === "delete-line"
                       ? "将从当前 BOM 版本移除此物料，其他版本不会受影响。"
                       : modal.kind === "delete-quote"
                         ? "将解除此物料与供应商的关联。"
                         : modal.kind === "delete-file"
                           ? "将从服务器删除该图片或附件，所属产品或物料会保留。"
-                          : "确定删除「" +
+                          : modal.kind === "delete-mold"
+                            ? `确定删除模具「${modal.item.name}」？`
+                            : "确定删除「" +
                             modal.item.name +
                             "」？已有业务关联的记录将无法删除。"}
                 </p>
@@ -5537,8 +6122,17 @@ function Workspace({
                   onCancel={() => setModal(null)}
                   label="确认删除"
                   action={async () => {
+                    if (modal.kind === "delete-part") {
+                      await projectRequest(modal.item.project_id, "parts/" + modal.item.id, "DELETE");
+                      await refresh();
+                      setModal(null);
+                      notify("已删除，保留 30 天");
+                      go(globalMaterials ? "global-materials" : "parts");
+                      return;
+                    }
                     const map: any = {
                       "delete-line": "bom-lines",
+                      "delete-mold": "product-molds",
                       "delete-part": "parts",
                       "delete-supplier": "suppliers",
                       "delete-file": "files",
@@ -5550,7 +6144,6 @@ function Workspace({
                       undefined,
                       "已删除",
                     );
-                    if (modal.kind === "delete-part") go("parts");
                   }}
                 />
               </Dialog>
@@ -5669,7 +6262,7 @@ function BomForm({
   const matchedIds = new Set(
     parts
       .filter((p) =>
-        [p.code, p.name, p.spec].join(" ").toLowerCase().includes(query),
+        [p.code, p.name, p.spec, p.external_code, p.project_name].join(" ").toLowerCase().includes(query),
       )
       .map((p) => p.id),
   );
@@ -5679,7 +6272,7 @@ function BomForm({
         <Search size={16} />
         <input
           aria-label="搜索可选物料"
-          placeholder="搜索物料"
+          placeholder="料号、名称、规格或所属项目"
           value={q}
           onChange={(e) => setQ(e.target.value)}
         />
@@ -5696,7 +6289,7 @@ function BomForm({
             optionFilter: (id) => matchedIds.has(id),
             options: parts.map((p) => ({
               value: p.id,
-              label: p.code + " · " + p.name + " / " + p.spec,
+              label: [p.code, p.name, p.spec, p.project_name].filter(Boolean).join(" · "),
             })),
           },
           {
@@ -5999,7 +6592,7 @@ function firstMaterialPhotos(files: FileRecord[]) {
   return photos;
 }
 
-function QuantityHighlight({ value, tone = "blue", prefix = "", title }: {
+function QuantityHighlight({ value, tone = "green", prefix = "", title }: {
   value: number; tone?: OptionTone; prefix?: string; title?: string;
 }) {
   return <strong className={"option-tag quantity-highlight " + tone} title={title}>{prefix}{amount(value)}</strong>;
@@ -6007,7 +6600,7 @@ function QuantityHighlight({ value, tone = "blue", prefix = "", title }: {
 
 function InventoryQuantity({ part }: { part: Part }) {
   const status = part.stock === 0 ? "无库存" : part.stock < part.min_stock ? "低库存" : "库存";
-  const tone = status === "无库存" ? "rose" : status === "低库存" ? "amber" : "blue";
+  const tone = status === "无库存" ? "rose" : status === "低库存" ? "amber" : "green";
   return <QuantityHighlight value={part.stock} tone={tone} title={status} />;
 }
 
@@ -6750,7 +7343,7 @@ function QRPanel({ part }: { part: Part }) {
   const { id: projectId } = useContext(ProjectContext);
   const [image, setImage] = useState("");
   const [error, setError] = useState("");
-  const url = location.origin + appBase + workspaceHash({ projectId, view: "parts", detail: part.id });
+  const url = location.origin + appBase + workspaceHash({ projectId, view: projectId ? "parts" : "global-materials", detail: part.id });
   useEffect(() => {
     QRCode.toDataURL(url, {
       width: 600,
@@ -6795,7 +7388,6 @@ function Scanner({
   aliases: { code: string; part_id: string }[];
   onFound: (p: Part) => void;
 }) {
-  const { id: projectId } = useContext(ProjectContext);
   const [input, setInput] = useState("");
   const [camera, setCamera] = useState(false);
   const [error, setError] = useState("");
@@ -6808,7 +7400,8 @@ function Scanner({
       const u = new URL(value);
       if (u.hash.startsWith("#parts/")) id = u.hash.slice(7);
       const [top, project, view, detail] = u.hash.slice(1).split("/");
-      if (top === "projects" && project === projectId && view === "parts") id = detail;
+      if (top === "projects" && view === "parts") id = detail;
+      if (top === "global-materials") id = project;
     } catch {}
     const p = parts.find(
       (p) =>
@@ -6967,6 +7560,7 @@ function InlineCell({
   categoryOptions,
   createOptionLabel,
   readOnly,
+  note = false,
 }: {
   label: string;
   value: string | number;
@@ -6978,13 +7572,14 @@ function InlineCell({
   categoryOptions?: string[];
   createOptionLabel?: string;
   readOnly?: boolean;
+  note?: boolean;
 }) {
   const { archived } = useContext(ProjectContext);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(String(value ?? ""));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const input = useRef<HTMLInputElement | null>(null);
+  const input = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
   const committing = useRef(false);
   const cancelled = useRef(false);
   useEffect(() => {
@@ -7027,9 +7622,11 @@ function InlineCell({
   const content = display && (options || categoryOptions)
     ? <OptionTag label={display} tone={categoryOptions && materialCategoryTone(display, categoryOptions)} />
     : display || "—";
-  if (readOnly ?? archived) return <span>{content}</span>;
-  if (!editing)
-    return (
+  if (readOnly ?? archived) return note
+    ? <TableTextCell value={display} label="备注" />
+    : <span>{content}</span>;
+  if (!editing) {
+    const editButton = (
       <button
         className={"inline-cell " + (!String(value ?? "") ? "unset" : "")}
         aria-label={"编辑" + label}
@@ -7045,6 +7642,36 @@ function InlineCell({
         <Pencil size={11} />
       </button>
     );
+    return note ? (
+      <div className="inline-note">
+        {editButton}
+        <TableTextCell value={display} label="备注" iconOnly />
+      </div>
+    ) : editButton;
+  }
+  const textEditorProps = {
+    ref: (element: HTMLInputElement | HTMLTextAreaElement | null) => { input.current = element; },
+    "aria-label": label,
+    disabled: busy,
+    value: draft,
+    onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      setDraft(event.target.value);
+      setError("");
+    },
+    onBlur: () => { void commit(); },
+    onKeyDown: (event: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      if (event.nativeEvent.isComposing) return;
+      if (event.key === "Enter" && !(note && event.shiftKey)) {
+        event.preventDefault();
+        void commit();
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelled.current = true;
+        setEditing(false);
+      }
+    },
+  };
   return (
     <div className={"inline-editor" + (options ? " select-editor" : "")}>
       {categoryOptions ? <MaterialCategory label={label} value={draft} options={categoryOptions} disabled={busy}
@@ -7054,31 +7681,14 @@ function InlineCell({
           allowNew={!!createOptionLabel} searchLabel={createOptionLabel} searchPlaceholder={createOptionLabel}
           onDismiss={() => { if (!committing.current) setEditing(false); }}
           onChange={(value) => { setDraft(value); void commit(value); }} />
+      ) : note ? (
+        <textarea rows={2} {...textEditorProps} />
       ) : (
         <input
-          ref={input}
-          aria-label={label}
+          {...textEditorProps}
           type={type}
           step="any"
           min={type === "number" ? min : undefined}
-          disabled={busy}
-          value={draft}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            setError("");
-          }}
-          onBlur={() => commit()}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              e.preventDefault();
-              commit();
-            }
-            if (e.key === "Escape") {
-              e.preventDefault();
-              cancelled.current = true;
-              setEditing(false);
-            }
-          }}
         />
       )}
       <button
@@ -7210,6 +7820,7 @@ function ImagePasteArea({
 }
 function QuickCreateForm({
   images,
+  bomQuantity = false,
   fields,
   initial,
   parents,
@@ -7220,6 +7831,7 @@ function QuickCreateForm({
   onCancel,
 }: {
   images: boolean;
+  bomQuantity?: boolean;
   fields: Field[];
   initial: any;
   parents?: Part[];
@@ -7230,7 +7842,10 @@ function QuickCreateForm({
   onCancel: () => void;
 }) {
   const [name, setName] = useState("");
-  const [values, setValues] = useState<any>(initial);
+  const [values, setValues] = useState<any>(() => ({
+    ...(fields.some((field) => field.name === "min_stock") ? { min_stock: 50 } : {}),
+    ...initial,
+  }));
   const [parentIds, setParentIds] = useState<string[]>(
     initial.parent_ids || [],
   );
@@ -7303,6 +7918,12 @@ function QuickCreateForm({
           autoComplete="off"
         />
       </label>
+      {bomQuantity && <label className="form-label">
+        单套用量
+        <input type="number" required min={0.000001} max={1000000000} step={0.000001}
+          aria-label="单套用量" value={values.qty} disabled={busy || !!created.current}
+          onChange={(event) => setValues({ ...values, qty: event.target.value })} />
+      </label>}
       {suppliers && <SupplierLinksInput options={suppliers} draft={supplierDraft}
         onChange={setSupplierDraft} disabled={busy || !!created.current} />}
       {fields
@@ -7583,6 +8204,72 @@ async function readClipboardImages(): Promise<File[]> {
   if (!files.length) throw Error("剪贴板中没有图片");
   return files;
 }
+type CatalogProject = { id: string; name: string };
+
+function ProjectChecklist({ projects, selected, change, used, disabled }: {
+  projects: CatalogProject[];
+  selected: string[];
+  change: (ids: string[]) => void;
+  used?: Set<string>;
+  disabled?: boolean;
+}) {
+  return <div className="column-visibility-list material-project-checklist">
+    {projects.map(({ id, name }) => <label key={id}>
+      <input type="checkbox" checked={selected.includes(id)} disabled={disabled}
+        onChange={(event) => change(event.target.checked ? [...selected, id] : selected.filter((item) => item !== id))} />
+      <span>{name}</span>{used?.has(id) && <small className="muted">BOM 已调用</small>}
+    </label>)}
+  </div>;
+}
+
+function CatalogProjectDialog({ projects, action, close, choose }: {
+  projects: CatalogProject[];
+  action: "part" | "electronic-import";
+  close: () => void;
+  choose: (id: string) => void;
+}) {
+  const [project, setProject] = useState("");
+  return <Dialog title={action === "part" ? "新建物料" : "导入电子物料 BOM"} onClose={close}>
+    <form onSubmit={(event) => { event.preventDefault(); if (project) choose(project); }}>
+      <label className="form-label">主归属项目
+        <select value={project} required onChange={(event) => setProject(event.target.value)}>
+          <option value="">请选择</option>
+          {projects.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
+        </select>
+      </label>
+      <div className="dialog-actions">
+        <Button type="button" onClick={close}>取消</Button>
+        <Button type="submit" primary disabled={!project}>继续</Button>
+      </div>
+    </form>
+  </Dialog>;
+}
+
+function MaterialProjectDialog({ part, projects, close, save }: {
+  part: Part;
+  projects: CatalogProject[];
+  close: () => void;
+  save: (ids: string[]) => Promise<void>;
+}) {
+  const assignments = part.project_assignments || [];
+  const [selected, setSelected] = useState(() => assignments.filter((item) => item.assigned).map((item) => item.id));
+  const used = new Set(assignments.filter((item) => item.required).map((item) => item.id));
+  return <Dialog title={part.code + " · 设置共用项目"} onClose={close}>
+    <p><strong>主归属项目</strong>　{part.project_name}</p>
+    <p className="muted">已在 BOM 中调用该物料的项目会自动显示。还可以勾选其他共用项目。</p>
+    <ProjectChecklist projects={projects.filter((item) => item.id !== part.project_id)}
+      selected={selected} change={setSelected} used={used} />
+    <AsyncAction label="保存共用项目" onCancel={close} action={() => save(selected)} />
+  </Dialog>;
+}
+
+const electronicImportFields = [
+  ["name", "名称"], ["qty", "用量"], ["external_code", "外部料号"], ["price", "单价"],
+  ["spec", "规格 / 封装"], ["brand", "品牌"], ["reference", "位号"], ["unit", "单位"],
+  ["internal_code", "系统料号"], ["notes", "备注"], ["source_total", "原表总价"],
+] as const;
+type ElectronicColumns = Partial<Record<(typeof electronicImportFields)[number][0], number>>;
+
 function ElectronicImportForm({
   state,
   context,
@@ -7597,6 +8284,8 @@ function ElectronicImportForm({
   const { id: projectId } = useContext(ProjectContext);
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<any>(null);
+  const [columns, setColumns] = useState<ElectronicColumns>({});
+  const [showMapping, setShowMapping] = useState(false);
   const [rows, setRows] = useState<any[]>([]);
   const [parent, setParent] = useState(context.parent_id || "");
   const [includeExcluded, setIncludeExcluded] = useState(false);
@@ -7609,22 +8298,28 @@ function ElectronicImportForm({
   const reset = () => {
     requestId.current = randomUuid();
   };
-  async function readFile(f: File, sheet = "") {
+  async function readFile(f: File, sheet = "", header?: number, mapping?: ElectronicColumns) {
     const ticket = ++generation.current;
     setBusy(true);
     setError("");
-    setPreview(null);
-    setRows([]);
+    if (header === undefined) {
+      setPreview(null);
+      setRows([]);
+    }
     reset();
     try {
       if (f.size > 20 * 1024 * 1024) throw Error("文件不能超过 20 MB");
       const form = new FormData();
       form.append("file", f);
       if (sheet) form.append("sheet", sheet);
+      if (header !== undefined) form.append("header_row", String(header));
+      if (mapping !== undefined) form.append("column_mapping", JSON.stringify(mapping));
       const data = await projectRequest(projectId, "electronic-import/preview", "POST", form);
       if (ticket !== generation.current) return;
       setPreview(data);
-      setRows(data.rows);
+      setRows(data.rows.map((row: any) => ({ ...row, automatic_match_error: row.match_error || "" })));
+      setColumns(data.mapping);
+      if (data.mapping_required) setShowMapping(true);
       setIncludeExcluded(false);
     } catch (e) {
       if (ticket === generation.current) setError((e as Error).message);
@@ -7632,12 +8327,16 @@ function ElectronicImportForm({
       if (ticket === generation.current) setBusy(false);
     }
   }
+  const mappingDirty = !!preview && electronicImportFields.some(([key]) => columns[key] !== preview.mapping[key]);
+  const columnValues = Object.values(columns);
+  const canApplyMapping = columns.name !== undefined && columns.qty !== undefined &&
+    new Set(columnValues).size === columnValues.length;
   const eligible = rows.filter(
-    (r) => !r.errors.length && (!r.excluded || includeExcluded),
+    (r) => !r.errors.length && !r.match_error && (!r.excluded || includeExcluded),
   );
   const selected = rows.filter((r) => r.selected);
   const primary = state.parts.filter((p) => p.material_level === 1);
-  const secondary = state.parts.filter((p) => p.material_level === 2);
+  const secondary = [...state.parts, ...state.shared_parts].filter((p) => p.material_level === 2 && !p.deleted_at);
   function changeRow(index: number, patch: any) {
     reset();
     setRows((previous) =>
@@ -7668,6 +8367,7 @@ function ElectronicImportForm({
             e.target.value = "";
             if (picked) {
               setFile(picked);
+              setShowMapping(false);
               readFile(picked);
             }
           }}
@@ -7720,6 +8420,50 @@ function ElectronicImportForm({
         </div>
       )}
       {preview && (
+        <section className="import-column-mapping">
+          <div className="import-mapping-heading">
+            <span>第 {preview.header_row} 行为表头</span>
+            <Button small type="button" aria-expanded={showMapping} disabled={busy}
+              onClick={() => setShowMapping((value) => !value)}>匹配表格字段</Button>
+          </div>
+          {preview.mapping_required && <p className="row-error">请手动选择「名称」和「用量」对应的列。</p>}
+          {showMapping && <>
+            <label className="form-label">表头行
+              <select aria-label="表头行" disabled={busy} value={preview.header_row}
+                onChange={(event) => file && readFile(file, preview.sheet, Number(event.target.value))}>
+                {preview.header_rows.map(({ row, sample }: { row: number; sample: string }) =>
+                  <option key={row} value={row}>第 {row} 行{sample ? " · " + sample : ""}</option>)}
+              </select>
+            </label>
+            <div className="import-mapping-fields">
+              {electronicImportFields.map(([key, label]) => (
+                <label key={key}>{label}{key === "name" || key === "qty" ? " *" : ""}
+                  <select aria-label={"匹配" + label} disabled={busy} value={columns[key] ?? ""}
+                    onChange={(event) => {
+                      const value = event.target.value;
+                      setColumns((prior) => {
+                        const next = { ...prior };
+                        if (value === "") delete next[key];
+                        else next[key] = Number(value);
+                        return next;
+                      });
+                    }}>
+                    <option value="">{key === "name" || key === "qty" ? "请选择" : "不导入"}</option>
+                    {preview.columns.map(({ index, label, sample }: { index: number; label: string; sample: string }) =>
+                      <option key={index} value={index} disabled={index !== columns[key] && columnValues.includes(index)}>
+                        第 {index + 1} 列 · {label || "无列名"}{sample ? "（如 " + sample + "）" : ""}
+                      </option>)}
+                  </select>
+                </label>
+              ))}
+            </div>
+            <Button small type="button" disabled={busy || !canApplyMapping}
+              onClick={() => file && readFile(file, preview.sheet, preview.header_row, columns)}>应用匹配并预览</Button>
+            {mappingDirty && <p className="muted">应用列匹配后会重新生成预览。</p>}
+          </>}
+        </section>
+      )}
+      {preview && !preview.mapping_required && !mappingDirty && (
         <>
           <div className="import-options">
             <label>
@@ -7756,7 +8500,7 @@ function ElectronicImportForm({
                   reset();
                 }}
               />
-              更新已有物料单价
+              更新本项目已有物料单价
             </label>
           </div>
           <div className="import-preview-bar">
@@ -7774,7 +8518,7 @@ function ElectronicImportForm({
               />
             </div>
           </div>
-          <div className="table-wrap import-preview-table">
+          <TableScroll className="import-preview-table">
             <table>
               <thead>
                 <tr>
@@ -7791,7 +8535,7 @@ function ElectronicImportForm({
                         reset();
                         setRows((previous) =>
                           previous.map((r) =>
-                            !r.errors.length && (!r.excluded || includeExcluded)
+                            !r.errors.length && !r.match_error && (!r.excluded || includeExcluded)
                               ? { ...r, selected: checked }
                               : r,
                           ),
@@ -7820,7 +8564,7 @@ function ElectronicImportForm({
                       <input
                         type="checkbox"
                         aria-label={"选择第" + row.source_row + "行"}
-                        disabled={busy || row.errors.length > 0}
+                        disabled={busy || row.errors.length > 0 || !!row.match_error}
                         checked={row.selected}
                         onChange={(e) =>
                           changeRow(row.index, { selected: e.target.checked })
@@ -7848,21 +8592,21 @@ function ElectronicImportForm({
                     <td>{row.spec || "—"}</td>
                     <td>{row.brand || "—"}</td>
                     <td className="num">{row.price ?? "—"}</td>
-                    <td>{row.notes || "—"}</td>
+                    <td className="table-note-column"><TableTextCell value={row.notes} label="备注" /></td>
                     <td>
                       <select
                         aria-label={"匹配第" + row.source_row + "行物料"}
                         disabled={busy}
                         value={row.target_part_id || ""}
-                        onChange={(e) =>
+                        onChange={(e) => {
+                          const target = e.target.value;
+                          const matchError = target ? "" : row.automatic_match_error;
                           changeRow(row.index, {
-                            target_part_id: e.target.value,
-                            match_error: "",
-                            selected:
-                              row.selected ||
-                              (!row.excluded && !row.errors.length),
-                          })
-                        }
+                            target_part_id: target,
+                            match_error: matchError,
+                            selected: !matchError && !row.errors.length && (!row.excluded || includeExcluded),
+                          });
+                        }}
                       >
                         <option value="">
                           {row.match_id
@@ -7871,20 +8615,20 @@ function ElectronicImportForm({
                               ? "请选择匹配物料"
                               : "自动新建"}
                         </option>
-                        <option value="__new__">新建独立物料</option>
+                        {!row.reuse_match_ids?.length && <option value="__new__">新建独立物料</option>}
                         {secondary
                           .filter(
-                            (p) =>
+                            (p) => row.reuse_match_ids?.length ? row.reuse_match_ids.includes(p.id) :
                               p.id === row.match_id ||
                               p.name.toLowerCase() === row.name.toLowerCase() ||
                               (row.external_code &&
                                 p.external_code?.toLowerCase() ===
                                   row.external_code.toLowerCase()),
                           )
-                          .slice(0, 30)
+                          .slice(0, row.reuse_match_ids?.length || 30)
                           .map((p) => (
                             <option key={p.id} value={p.id}>
-                              {p.name} · {p.code}
+                              {[p.name, p.code, p.project_name || state.project?.name].filter(Boolean).join(" · ")}
                             </option>
                           ))}
                       </select>
@@ -7896,7 +8640,7 @@ function ElectronicImportForm({
                 ))}
               </tbody>
             </table>
-          </div>
+          </TableScroll>
           {shown.length > 500 && (
             <p className="table-note">显示前 500 行，可搜索其余记录。</p>
           )}
@@ -7913,7 +8657,7 @@ function ElectronicImportForm({
         </Button>
         <Button
           primary
-          disabled={busy || !selected.length}
+          disabled={busy || mappingDirty || !!preview?.mapping_required || !selected.length}
           onClick={async () => {
             setBusy(true);
             setError("");

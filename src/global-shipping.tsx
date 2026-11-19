@@ -1,3 +1,4 @@
+import { TableScroll } from "./table-scroll";
 import { Fragment, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronDown, ChevronRight, CornerDownRight, Download, Plus, Search, Trash2 } from "lucide-react";
 import { Dialog } from "./dialog";
@@ -16,7 +17,7 @@ import { DevicePicker } from "./shipping-devices";
 import { TableOptionPicker } from "./material-category";
 import { OptionTag } from "./option-tag";
 import { ShopifyOrderImport } from "./shopify-order-import";
-import { ShippingTextCell } from "./shipping-text-cell";
+import { TableTextCell } from "./table-text-cell";
 
 type Project = { id: string; name: string; archived_at: string | null };
 type RecordRow = {
@@ -113,7 +114,7 @@ function RecordCell({ column, row, projects, open }: {
       <OptionTag key={p.id} label={p.name} />)}</span>;
   }
   const value = key === "shipped_on" ? row.shipped_on : row.details?.[key];
-  if (key === "address" || key === "notes") return <ShippingTextCell value={value} label={column.label} />;
+  if (key === "address" || key === "notes") return <TableTextCell value={value} label={column.label} />;
   return <span title={String(value ?? "")}>{value === "" || value == null ? "—" : value}</span>;
 }
 
@@ -445,7 +446,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
     {notice && <p className="shipping-notice" role="status">{notice}</p>}
     {error && <p role="alert" className="form-error">{error} <button className="btn small" type="button"
       onClick={() => { resetFocus(); setRevision((value) => value + 1); }}>刷新</button></p>}
-    <div className="table-wrap shipping-table global-shipping-table" ref={grid} aria-label="全局发货订单" aria-busy={busy}>
+    <TableScroll className="shipping-table global-shipping-table" ref={grid} aria-label="全局发货订单" aria-busy={busy}>
       <div ref={top} className="shipping-scroll-sentinel" aria-hidden="true" />
       <table style={{ width: tableWidth }}>
         <ShippingTableHeader columns={displayed} index actionWidth={111} />
@@ -492,7 +493,7 @@ export default function GlobalShipping({ request, projectRequest, onDraftChange,
       </table>
       {!error && !data?.rows.length && <p className="shipping-empty">{busy ? "正在加载…" : "暂无发货订单"}</p>}
       <div ref={tail} className="shipping-scroll-sentinel" aria-hidden="true" />
-    </div>
+    </TableScroll>
     <div className="shipping-count global-shipping-paging">
       <span role="status">已显示 {data?.rows.length || 0} / {data?.total || 0} 个订单{loadingMore ? " · 加载中…" : ""}</span>
       {moreError && <button className="btn small" type="button" onClick={() => setMoreError("")}>加载失败，重试</button>}

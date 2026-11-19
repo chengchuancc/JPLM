@@ -39,6 +39,30 @@ class ElectronicParserTests(unittest.TestCase):
         rows=parse_electronic_file(data,'bom.csv')['rows']
         self.assertTrue(rows[0]['excluded']);self.assertFalse(rows[0]['selected']);self.assertTrue(rows[1]['excluded'])
         self.assertTrue(rows[2]['errors']);self.assertFalse(rows[2]['selected']);self.assertTrue(rows[3]['selected']);self.assertEqual(rows[3]['price'],0)
+    def test_jlcpcb_columns_prefer_comment_and_read_supplier_part_and_unit_price(self):
+        data = (b'Value,Quantity,Comment,Designator,Footprint,Manufacturer,Supplier Part,JLCPCB Price\n'
+                b',2,4.7uF,"C1,C2",C0805,Walsin,C123456,0.231\n')
+        parsed = parse_electronic_file(data, 'bom.csv', inspect_columns=True)
+        row = parsed['rows'][0]
+        self.assertEqual((row['name'], row['external_code'], row['price'], row['qty'], row['reference']),
+                         ('4.7uF', 'C123456', 0.231, 2, 'C1,C2'))
+        self.assertEqual(parsed['mapping']['price'], 7)
+
+    def test_manual_header_and_column_mapping_for_an_unrecognized_bom(self):
+        data = b'BOM data,,,,\nPart description,Count per assembly,Vendor ref,Cost each,Location\nFuse,3,X123,0.125,F1\n'
+        initial = parse_electronic_file(data, 'bom.csv', inspect_columns=True)
+        self.assertTrue(initial['mapping_required'])
+        self.assertEqual(initial['rows'], [])
+        self.assertEqual(initial['header_rows'][1]['row'], 2)
+        mapping = {'name': 0, 'qty': 1, 'external_code': 2, 'price': 3, 'reference': 4}
+        parsed = parse_electronic_file(data, 'bom.csv', header_row=2, column_mapping=mapping, inspect_columns=True)
+        self.assertFalse(parsed['mapping_required'])
+        row = parsed['rows'][0]
+        self.assertEqual((row['name'], row['qty'], row['external_code'], row['price'], row['reference']),
+                         ('Fuse', 3, 'X123', 0.125, 'F1'))
+        for invalid in ({**mapping, 'price': 1}, {**mapping, 'price': 42}):
+            with self.assertRaises(ElectronicBomError):
+                parse_electronic_file(data, 'bom.csv', header_row=2, column_mapping=invalid, inspect_columns=True)
     def test_missing_header_corrupt_xlsx_and_xml_entities_are_rejected(self):
         for name,data in [('test.csv',b'a,b\n1,2'),('test.xlsx',b'not a zip')]:
             with self.assertRaises(ElectronicBomError):parse_electronic_file(data,name)

@@ -1,3 +1,4 @@
+import { TableScroll } from "./table-scroll";
 import { useEffect, useRef, useState } from "react";
 import { Dialog } from "./dialog";
 import { formatTime } from "./record-details";
@@ -86,7 +87,7 @@ export function ShopifyOrderImport({ request, close, imported }: {
 
   return <Dialog title="导入 Shopify 订单" wide onClose={() => { if (!savingRef.current) close(); }}>
     <div className="global-shipping-form">
-      {!!rows.length && <div className="table-wrap shopify-order-preview" aria-label="Shopify 订单预览">
+      {!!rows.length && <TableScroll className="shopify-order-preview" aria-label="Shopify 订单预览">
         <table>
           <thead><tr><th scope="col">选择</th><th scope="col">订单号</th><th scope="col">下单时间</th>
             <th scope="col">收件人</th><th scope="col">发货状态</th><th scope="col">导入状态</th></tr></thead>
@@ -99,7 +100,7 @@ export function ShopifyOrderImport({ request, close, imported }: {
             <td>{fulfillment[row.fulfillment_status] || row.fulfillment_status}</td><td>{row.reason || "可导入"}</td>
           </tr>)}</tbody>
         </table>
-      </div>}
+      </TableScroll>}
       {loading && <p role="status" className="muted">正在读取 Shopify 订单…</p>}
       {!initial && !loading && !rows.length && <p className="muted">没有可显示的订单。</p>}
       {error && <p role="alert" className="form-error">{error}</p>}

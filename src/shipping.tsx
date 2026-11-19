@@ -1,3 +1,4 @@
+import { TableScroll } from "./table-scroll";
 import { Fragment, useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, CornerDownRight, ExternalLink, Link2, Pencil, Plus, Search, Trash2, Upload } from "lucide-react";
 import { Dialog } from "./dialog";
@@ -8,7 +9,7 @@ import { type Request, type Channel, type Order, type Shipment, type Page,
   path, contactFields, otherContactFields, orderFields, items, costs, isOrder, isShipped, CarrierTags, CountryTag, SourceTag,
   Status, Tracking, shipmentLabel, shipmentStatuses } from "./shipping-data";
 import { ShippingPicker } from "./shipping-options";
-import { ShippingTextCell } from "./shipping-text-cell";
+import { TableTextCell } from "./table-text-cell";
 import { canSaveItems, itemPayload, ShipmentItemEditor, ShipmentItems } from "./shipping-items";
 import type { ProductChoice, ShipmentItem } from "./shipping-data";
 import { ShippingTableHeader } from "./shipping-table-header";
@@ -283,7 +284,7 @@ function ShipmentCell({ row, column, edit, editItems, saving, orderLocked, open,
   if (key === "tracking") return <Tracking shipment={row} />;
   if (key === "source") return <SourceTag value={row.details.source} />;
   if (key === "country") return <CountryTag value={value} />;
-  if (key === "address") return <ShippingTextCell value={value} label="地址" />;
+  if (key === "address" || key === "notes") return <TableTextCell value={value} label={column.label} />;
   if (row.id && row.channel === "ks" && items.some(([field]) => field === key) && Number(value) > 0) {
     return <button type="button" className="text-link shipping-quantity" aria-label={"查看发货商品 " + column.label}
       onClick={openGoods}>{value}</button>;
@@ -845,7 +846,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
     {notice && <p className="shipping-notice" role="status">{notice}</p>}
     {saveError && <p className="form-error" role="alert">{saveError}</p>}
     {canPaste && <p className="shipping-paste-hint muted">复制飞书或 Excel 单元格，选中起始位置后粘贴。新增可粘贴带表头的数据。</p>}
-    <div className="table-wrap shipping-table" ref={grid} aria-busy={busy || saving}
+    <TableScroll className="shipping-table" ref={grid} aria-busy={busy || saving}
       aria-label={orders ? "KS 发货信息" : "发货台账"} tabIndex={0} onPaste={(event) => void pasteOrders(event)}
       onKeyDown={orderKeys}>
       <div ref={top} className="shipping-scroll-sentinel" aria-hidden="true" />
@@ -887,7 +888,7 @@ export default function ShippingManagement({ request, products, admin, readOnly,
         <button type="button" className="btn small" onClick={() => setRetry((value) => value + 1)}>重试</button>
       </div>}
       <div ref={tail} className="shipping-load-tail" style={{ width: tableWidth }}>{busy ? "正在加载…" : ""}</div>
-    </div>
+    </TableScroll>
     <div className="shipping-count" role="status">
       已加载 {rows.length} / {data?.total ?? rows.length} {grouped ? "组" : "条"}{loadingEarlier ? " · 加载中…" : ""}
     </div>

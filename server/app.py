@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
 """捷程未来PLM：仅依赖 Python 3.10+ 标准库。"""
-import argparse, hashlib, hmac, io, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil, tempfile, zipfile
+import argparse, hashlib, hmac, io, ipaddress, json, math, mimetypes, os, re, secrets, sqlite3, sys, time, threading, shutil, tempfile, zipfile
 import unicodedata
 from contextlib import ExitStack, contextmanager, nullcontext
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.parser import BytesParser
 from email.policy import default
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer as BaseThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse, unquote
-from electronic_import import parse_electronic_file, ElectronicBomError
+from electronic_import import parse_electronic_file, excluded_component, ElectronicBomError
 import inspection
 import permissions
+import scanner_devices
 import shipping
 import shopify_orders
+import feishu_bot
 from projects import (
-    VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES,
+    VERSION, PROJECT_VERSION, LEGACY_PROJECT_ID, BUSINESS_TABLES, PROJECT_BUSINESS_TABLES,
     SCOPED_TABLES, COVER_TABLE, MATERIAL_CATEGORIES_VERSION, MATERIAL_CODE_PREFIX_VERSION,
     RECORD_DELETION_VERSION, INVENTORY_TIME_VERSION, COVER_SIZE_VERSION, IMAGE_NAME_VERSION,
-    PROJECT_ROLE_VERSION, migrate_inventory, migrate_material_categories, migrate_projects,
+    PROJECT_ROLE_VERSION, SHARED_BOM_VERSION, MATERIAL_PROJECT_VERSION, MATERIAL_PROJECT_TABLE, SHARED_MATERIAL_LINK_VERSION,
+    PRODUCT_MOLD_VERSION, PRODUCT_MOLD_TABLE, MOLD_PART_VERSION, MOLD_PART_TABLE, MOLD_MOQ_VERSION,
+    MOLD_AMORTIZATION_VERSION,
+    migrate_inventory, migrate_material_categories, migrate_projects, migrate_shared_bom, migrate_shared_material_links,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -40,6 +45,7 @@ IMAGE_MIMES = {
 UPLOAD_ID = re.compile(r'[0-9a-f]{24}')
 CLEANUP_INTERVAL = 24 * 60 * 60
 ORPHAN_IMAGE_GRACE = 7 * CLEANUP_INTERVAL
+DELETED_PART_RETENTION_DAYS = 30
 QUOTES_SCHEMA = """CREATE TABLE IF NOT EXISTS quotes(
     id TEXT PRIMARY KEY,
     part_id TEXT NOT NULL REFERENCES parts(id),
@@ -92,6 +98,17 @@ def num(value, positive=False):
     rounded=round(n,6)
     if positive and rounded<=0: raise Problem('数量至少为 0.000001')
     return rounded
+
+def optional_mold_quantity(value, label):
+    if value in (None, ''):
+        return None
+    try:
+        quantity = float(value)
+    except (TypeError, ValueError, OverflowError):
+        raise Problem(f'{label}须为 1 至 10 亿之间的整数')
+    if isinstance(value, bool) or not 1 <= quantity <= 1e9 or not quantity.is_integer():
+        raise Problem(f'{label}须为 1 至 10 亿之间的整数')
+    return int(quantity)
 def required(v, label='名称'):
     s = str(v or '').strip()
     if not s: raise Problem(f'请填写{label}')
@@ -108,6 +125,8 @@ def init_db(directory=None, bootstrap=None):
             raise RuntimeError('数据库版本高于当前程序版本')
         if version == VERSION:
             db.execute(shipping.PENDING_SHOPIFY_SCHEMA)
+            scanner_devices.initialize(db)
+            feishu_bot.initialize(db)
             if bootstrap:
                 if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
                     raise Problem('管理员已初始化')
@@ -155,6 +174,31 @@ def init_db(directory=None, bootstrap=None):
                 db.execute("ALTER TABLE project_members ADD COLUMN roles TEXT CHECK(roles IS NULL OR json_valid(roles))")
             if 'shopify_import' not in {row['name'] for row in db.execute('PRAGMA table_info(users)')}:
                 db.execute('ALTER TABLE users ADD COLUMN shopify_import INTEGER NOT NULL DEFAULT 0 CHECK(shopify_import IN (0,1))')
+        if version < SHARED_BOM_VERSION:
+            migrate_shared_bom(db)
+        if version < SHARED_MATERIAL_LINK_VERSION:
+            migrate_shared_material_links(db)
+        if version < PRODUCT_MOLD_VERSION:
+            db.execute(PRODUCT_MOLD_TABLE)
+            db.execute('CREATE INDEX IF NOT EXISTS idx_product_molds_project_product ON product_molds(project_id,product_id)')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_product_molds_product ON product_molds(product_id)')
+            db.execute('CREATE INDEX IF NOT EXISTS idx_product_molds_supplier ON product_molds(supplier_id)')
+        if version < MOLD_PART_VERSION:
+            db.execute(MOLD_PART_TABLE)
+            db.execute('CREATE INDEX IF NOT EXISTS idx_product_mold_parts_part ON product_mold_parts(part_id)')
+        if version < MOLD_MOQ_VERSION and 'moq' not in {
+            row['name'] for row in db.execute('PRAGMA table_info(product_molds)')
+        }:
+            db.execute('ALTER TABLE product_molds ADD COLUMN moq INTEGER CHECK(moq BETWEEN 1 AND 1000000000)')
+        if version < MOLD_AMORTIZATION_VERSION and 'amortization_qty' not in {
+            row['name'] for row in db.execute('PRAGMA table_info(product_molds)')
+        }:
+            db.execute('''ALTER TABLE product_molds ADD COLUMN amortization_qty INTEGER
+                CHECK(amortization_qty IS NULL OR
+                      (typeof(amortization_qty)='integer' AND amortization_qty BETWEEN 1 AND 1000000000))''')
+        db.execute(MATERIAL_PROJECT_TABLE)
+        scanner_devices.initialize(db)
+        feishu_bot.initialize(db)
         db.execute(f'PRAGMA user_version={VERSION}')
         if bootstrap and version >= PROJECT_VERSION:
             if db.execute('SELECT 1 FROM users LIMIT 1').fetchone():
@@ -301,9 +345,10 @@ def insert_scoped(db, table, values, conflict=''):
     db.execute(f'INSERT INTO {table} ({columns}) VALUES ({placeholders}) {conflict}',
                (db.project_id, *values.values()))
 
-def insert_bom_line(db, version, part, qty, reference='', notes='', upsert=False):
+def insert_bom_line(db, version, part, qty, reference='', notes='', upsert=False, *, part_project=None):
     id = uid()
     insert_scoped(db, 'bom_lines', dict(id=id, version_id=version, part_id=part, qty=qty,
+                                        part_project_id=part_project or db.project_id,
                                         reference=reference, notes=notes),
                   'ON CONFLICT(version_id,part_id) DO UPDATE SET qty=excluded.qty,'
                   'reference=excluded.reference,notes=excluded.notes' if upsert else '')
@@ -317,9 +362,27 @@ def find_part_code(db, code):
     ).fetchone()
 
 
+def part_for_bom(db, id):
+    row = db.execute('''SELECT p.*, j.deleted_at AS source_deleted_at FROM parts p
+        JOIN projects j ON j.id=p.project_id WHERE p.id=?''', (id,)).fetchone()
+    if not row:
+        raise Problem('关联记录不存在', 404)
+    return dict(row)
+
+
+def available_bom_part(db, id):
+    part = part_for_bom(db, id)
+    if part['deleted_at'] or part['source_deleted_at']:
+        raise Problem('物料或所属项目已删除，请先恢复', 409)
+    return part
+
+
 def find_bom_import_part(db, product_id, code, external_code, name, spec, level, category):
     if code:
         found = find_part_code(db, code)
+        if not found:
+            found = db.execute('''SELECT id FROM parts WHERE code=?
+                UNION ALL SELECT part_id FROM material_code_aliases WHERE code=? LIMIT 1''', (code, code)).fetchone()
         if found:
             return found[0]
     if external_code:
@@ -355,9 +418,25 @@ def bom_import_price(value):
 
 
 def electronic_candidates(db):
-    return [dict(row) for row in db.execute(
-        'SELECT * FROM parts WHERE project_id=? AND material_level=2 AND deleted_at IS NULL',
-        (db.project_id,))]
+    local, by_code = [], {}
+    for row in db.execute('''SELECT p.* FROM parts p JOIN projects j ON j.id=p.project_id
+        WHERE p.material_level=2 AND p.deleted_at IS NULL AND j.deleted_at IS NULL ORDER BY p.code'''):
+        add_electronic_candidate(db.project_id, local, by_code, dict(row))
+    return local, by_code
+
+
+def add_electronic_candidate(project_id, local, by_code, part):
+    if part['project_id'] == project_id:
+        local.append(part)
+    external = part['external_code'].strip().casefold()
+    if external and not excluded_component(part['name'], part['notes']):
+        by_code.setdefault(external, []).append(part)
+
+
+def electronic_external_matches(row, by_code):
+    if excluded_component(row['name'], row['notes']):
+        return []
+    return by_code.get(row['external_code'].strip().casefold(), [])
 
 def image_mime(header):
     if header.startswith(b'\x89PNG\r\n\x1a\n'):
@@ -494,7 +573,88 @@ def run_image_cleanup(stop, interval=CLEANUP_INTERVAL):
                 print(f'已清理 {removed} 张无引用图片。', flush=True)
         except (OSError, sqlite3.Error) as exc:
             print(f'图片清理失败：{exc}', file=sys.stderr)
+        try:
+            removed = cleanup_deleted_parts()
+            if removed:
+                print(f'已自动永久删除 {removed} 个超过 30 天且无业务引用的物料。', flush=True)
+        except (OSError, sqlite3.Error) as exc:
+            print(f'已删除物料清理失败：{exc}', file=sys.stderr)
         stop.wait(interval)
+
+
+def part_purge_blockers(db, id):
+    blockers = [label for table, label in (
+        ('bom_lines', 'BOM'), ('purchase_lines', '采购明细'), ('movements', '库存流水'),
+        ('product_mold_parts', '模具'),
+    ) if db.execute(f'SELECT 1 FROM {table} WHERE part_id=? LIMIT 1', (id,)).fetchone()]
+    if db.execute('SELECT 1 FROM material_links WHERE parent_id=? OR child_id=? LIMIT 1', (id, id)).fetchone():
+        blockers.append('一级/二级物料关联')
+    return blockers
+
+
+def deleted_part_metadata(db, part):
+    try:
+        stamp = datetime.fromisoformat(part['deleted_at'].replace('Z', '+00:00'))
+        purge_after = (stamp + timedelta(days=DELETED_PART_RETENTION_DAYS)).isoformat()
+    except (ValueError, AttributeError, TypeError):
+        purge_after = None
+    blockers = part_purge_blockers(db, part['id'])
+    project = db.execute('SELECT archived_at,deleted_at FROM projects WHERE id=?', (part['project_id'],)).fetchone()
+    if project and (project['archived_at'] or project['deleted_at']):
+        blockers.append('所属项目已归档或删除')
+    return {**part, 'purge_after': purge_after, 'purge_blockers': blockers}
+
+
+def purge_part_record(db, files, part, actor, *, automatic=False):
+    if not part['deleted_at']:
+        raise Problem('请先将物料移至已删除物料', 409)
+    blockers = part_purge_blockers(db, part['id'])
+    if blockers:
+        raise Problem('物料仍被' + '、'.join(blockers) + '引用，无法永久删除', 409)
+    ids = [row[0] for row in db.execute(
+        "SELECT id FROM files WHERE owner_type='parts' AND owner_id=?", (part['id'],))]
+    if ids:
+        files.enter_context(stage_upload_deletion(ids))
+    db.execute("DELETE FROM files WHERE owner_type='parts' AND owner_id=?", (part['id'],))
+    db.execute('DELETE FROM quotes WHERE part_id=?', (part['id'],))
+    db.execute('DELETE FROM parts WHERE id=?', (part['id'],))
+    db.execute('DELETE FROM feishu_low_stock WHERE part_id=?', (part['id'],))
+    db.project_id = part['project_id']
+    log_activity(db, actor, '自动永久删除物料' if automatic else '永久删除物料', '',
+                 part['code'] + ' ' + part['name'],
+                 f'删除时间 {part["deleted_at"]} · 保留满 {DELETED_PART_RETENTION_DAYS} 天' if automatic else '')
+    touch_project(db)
+
+
+def cleanup_deleted_parts(*, current_time=None, limit=100):
+    current = current_time or datetime.now(timezone.utc)
+    cutoff = (current - timedelta(days=DELETED_PART_RETENTION_DAYS)).isoformat()
+    with connect() as db:
+        ids = [row[0] for row in db.execute('''SELECT p.id FROM parts p JOIN projects j ON j.id=p.project_id
+            WHERE p.deleted_at IS NOT NULL AND julianday(p.deleted_at)<julianday(?)
+            AND j.deleted_at IS NULL AND j.archived_at IS NULL
+            AND NOT EXISTS(SELECT 1 FROM bom_lines WHERE part_id=p.id)
+            AND NOT EXISTS(SELECT 1 FROM purchase_lines WHERE part_id=p.id)
+            AND NOT EXISTS(SELECT 1 FROM movements WHERE part_id=p.id)
+            AND NOT EXISTS(SELECT 1 FROM product_mold_parts WHERE part_id=p.id)
+            AND NOT EXISTS(SELECT 1 FROM material_links WHERE parent_id=p.id OR child_id=p.id)
+            ORDER BY p.deleted_at,p.id LIMIT ?''', (cutoff, limit))]
+    removed = 0
+    for id in ids:
+        try:
+            with FILE_LOCK, ExitStack() as files, transaction() as db:
+                # Recheck after acquiring the write lock: restoration and new references win the race.
+                part = db.execute('''SELECT p.* FROM parts p JOIN projects j ON j.id=p.project_id
+                    WHERE p.id=? AND julianday(p.deleted_at)<julianday(?)
+                    AND j.deleted_at IS NULL AND j.archived_at IS NULL''', (id, cutoff)).fetchone()
+                if not part or part_purge_blockers(db, id):
+                    continue
+                purge_part_record(db, files, dict(part), {'id': None, 'name': '系统'}, automatic=True)
+            removed += 1
+        except (OSError, sqlite3.Error) as exc:
+            print(f'自动永久删除物料 {id} 失败：{exc}', file=sys.stderr)
+    return removed
+
 
 def next_code(db, prefix):
     return prefix + '-' + datetime.now().strftime('%Y%m%d') + '-' + secrets.token_hex(3).upper()
@@ -554,6 +714,38 @@ def log_activity(db, actor, action, subject_id, subject, detail=''):
     if actor:
         db.execute('INSERT INTO activity(actor_id,actor_name,action,subject_id,subject,detail,created_at,project_id) VALUES(?,?,?,?,?,?,?,?)',
                    (actor['id'], actor['name'], action, subject_id, subject, detail, now(), db.project_id))
+
+
+BOM_MATERIAL_ACTIONS = ('BOM 新增物料', 'BOM 修改物料', 'BOM 移除物料')
+
+
+def log_bom_material(db, actor, version, part, qty, reference, *, previous=None, removed=False, source=''):
+    added, edited, removed_action = BOM_MATERIAL_ACTIONS
+    action = removed_action if removed else edited if previous else added
+    product = exists(db, 'products', version['product_id'])
+    project = exists(db, 'projects', db.project_id)
+    verb = '从 BOM 移除' if removed else '修改 BOM 明细' if previous else '加入 BOM'
+    quantity = f'{qty:g} {part["unit"]}'
+    if previous and previous['qty'] != qty:
+        quantity = f'{previous["qty"]:g} → {quantity}'
+    detail = [f'{verb}「{project["name"]} / {product["name"]}（{product["code"]}） / {version["name"]}」',
+              f'单套用量 {quantity}']
+    if previous and previous['reference'] != reference:
+        detail.append(f'位号 {previous["reference"] or "空"} → {reference or "空"}')
+    elif reference:
+        detail.append(f'位号 {reference}')
+    if source:
+        detail.append(source)
+    log_activity(db, actor, action, part['id'], f'{part["code"]} {part["name"]}', ' · '.join(detail))
+
+
+def save_bom_import_line(db, actor, version, part, qty, reference, notes, source):
+    previous = db.execute('SELECT * FROM bom_lines WHERE version_id=? AND part_id=?',
+                          (version['id'], part['id'])).fetchone()
+    if previous and (previous['qty'], previous['reference'], previous['notes']) == (qty, reference, notes):
+        return
+    insert_bom_line(db, version['id'], part['id'], qty, reference, notes, upsert=True, part_project=part['project_id'])
+    log_bom_material(db, actor, version, part, qty, reference, previous=previous, source=source)
 
 MOVEMENT_FIELDS = ('type', 'part_id', 'qty', 'product_id', 'purchase_line_id', 'original_id', 'reason', 'handler_id')
 
@@ -737,6 +929,8 @@ def record_movement(db, data, actor=None, *, movement_id=None):
     handler_name = exists(db, 'users', handler)['name'] if handler else ''
     log_activity(db, actor, kind, part['id'], f"{part['code']} {part['name']}",
                  f'{code} · {qty:g} {part["unit"]} · 结余 {balance:g} · 经办人 {handler_name}')
+    feishu_bot.enqueue_movement(db, DATA, {'id': mid, **values},
+                                {**part, 'stock': active_part(db, part['id'])['stock']}, handler_name)
     return mid
 
 
@@ -927,13 +1121,14 @@ def migrate_material_codes(db):
         db.execute('UPDATE parts SET code=? WHERE id=?', (code, part['id']))
 
 def link_material(db,parent_id,child_id,qty=1):
-    parent=active_part(db,parent_id);child=active_part(db,child_id)
+    parent=active_part(db,parent_id);child=available_bom_part(db,child_id)
     if parent['material_level']!=1 or child['material_level']!=2: raise Problem('只能将一级物料关联到二级物料')
     quantity=num(qty,True);id=uid()
     insert_scoped(db, 'material_links', dict(id=id, parent_id=parent_id, child_id=child_id,
+                                            child_project_id=child['project_id'],
                                             qty=quantity, created_at=now()),
                   'ON CONFLICT(parent_id,child_id) DO UPDATE SET qty=excluded.qty')
-    db.execute('UPDATE parts SET updated_at=? WHERE id IN (?,?)',(now(),parent_id,child_id))
+    db.execute('UPDATE parts SET updated_at=? WHERE project_id=? AND id IN (?,?)',(now(),db.project_id,parent_id,child_id))
     return db.execute('SELECT id FROM material_links WHERE parent_id=? AND child_id=?',(parent_id,child_id)).fetchone()[0]
 
 def set_material_parents(db,child_id,parent_ids):
@@ -943,7 +1138,8 @@ def set_material_parents(db,child_id,parent_ids):
     selected=list(dict.fromkeys(parent_ids))
     for parent_id in selected:
         if exists(db,'parts',parent_id)['material_level']!=1: raise Problem('请选择一级物料')
-    existing={r['parent_id']:dict(r) for r in db.execute('SELECT * FROM material_links WHERE child_id=?',(child_id,))}
+    existing={r['parent_id']:dict(r) for r in db.execute(
+        'SELECT * FROM material_links WHERE child_id=? AND project_id=?',(child_id,db.project_id))}
     for parent_id,link in existing.items():
         if parent_id not in selected and not exists(db, 'parts', parent_id)['deleted_at']: db.execute('DELETE FROM material_links WHERE id=?',(link['id'],))
     for parent_id in selected:
@@ -955,10 +1151,12 @@ def set_material_children(db,parent_id,child_ids):
     if not isinstance(child_ids,list) or len(child_ids)>1000 or any(not isinstance(c,str) for c in child_ids): raise Problem('关联记录格式错误')
     selected=list(dict.fromkeys(child_ids))
     for child_id in selected:
-        if exists(db,'parts',child_id)['material_level']!=2: raise Problem('请选择二级物料')
+        if part_for_bom(db, child_id)['material_level']!=2: raise Problem('请选择二级物料')
     existing={r['child_id']:dict(r) for r in db.execute('SELECT * FROM material_links WHERE parent_id=?',(parent_id,))}
     for child_id,link in existing.items():
-        if child_id not in selected and not exists(db, 'parts', child_id)['deleted_at']: db.execute('DELETE FROM material_links WHERE id=?',(link['id'],))
+        child = part_for_bom(db, child_id)
+        if child_id not in selected and not child['deleted_at'] and not child['source_deleted_at']:
+            db.execute('DELETE FROM material_links WHERE id=?',(link['id'],))
     for child_id in selected:
         if child_id not in existing: link_material(db,parent_id,child_id)
     db.execute('UPDATE parts SET updated_at=? WHERE id=?',(now(),parent_id))
@@ -969,7 +1167,7 @@ def automatic_version(db, product_id):
     while f'V{n}.0' in existing: n+=1
     return f'V{n}.0'
 
-TABLES = BUSINESS_TABLES
+TABLES = PROJECT_BUSINESS_TABLES
 
 def get_state(db):
     if not db.in_transaction:
@@ -977,6 +1175,19 @@ def get_state(db):
     state = {t: [{k:r[k] for k in r.keys() if k != 'sub_product_id'}
                  for r in db.execute(f'SELECT * FROM {t} WHERE project_id=? ORDER BY rowid',
                                      (db.project_id,))] for t in TABLES}
+    mold_parts = {mold['id']: [] for mold in state['product_molds']}
+    for link in db.execute('''SELECT link.mold_id,link.part_id FROM product_mold_parts link
+        JOIN product_molds mold ON mold.id=link.mold_id WHERE mold.project_id=? ORDER BY link.rowid''',
+        (db.project_id,)):
+        mold_parts[link['mold_id']].append(link['part_id'])
+    for mold in state['product_molds']:
+        mold['part_ids'] = mold_parts[mold['id']]
+    state['material_links'].extend(dict(row) for row in db.execute('''SELECT link.id,link.project_id,
+        link.parent_id,link.child_id,link.child_project_id,link.qty,link.created_at,'' AS reference,'' AS notes
+        FROM material_links link
+        JOIN parts parent ON parent.id=link.parent_id JOIN projects p ON p.id=link.project_id
+        WHERE link.child_project_id=? AND link.project_id<>? AND parent.deleted_at IS NULL AND p.deleted_at IS NULL''',
+        (db.project_id, db.project_id)))
     owners = {(table, row['id']): row
               for table in ('parts', 'products') for row in state[table]}
     positions = {}
@@ -987,7 +1198,7 @@ def get_state(db):
         if record:
             file['original_name'] = file['name']
             file['name'] = current_file_name(file, record['code'], record['name'], positions[owner])
-    state['deleted_parts'] = [p for p in state['parts'] if p['deleted_at']]
+    state['deleted_parts'] = [deleted_part_metadata(db, p) for p in state['parts'] if p['deleted_at']]
     state['parts'] = [p for p in state['parts'] if not p['deleted_at']]
     state['movements'] = [row for row in state['movements'] if not row['deleted_at']]
     state['purchases'] = [row for row in state['purchases'] if not row['deleted_at']]
@@ -1006,6 +1217,61 @@ def get_state(db):
     state['former_users'] = [dict(row) for id in responsible_ids - current_ids - {None}
                              if (row := db.execute('SELECT id,name FROM users WHERE id=?', (id,)).fetchone())]
     return state
+
+
+MATERIAL_PRIMARY_IMAGE = """(SELECT f.id FROM files f
+    WHERE f.project_id=p.project_id AND f.owner_type='parts' AND f.owner_id=p.id AND f.kind='image'
+    ORDER BY f.rowid LIMIT 1)"""
+
+
+def shared_materials(db):
+    columns = '''p.id,p.project_id,p.code,p.name,p.category,p.spec,p.unit,p.price,p.stock,
+        p.min_stock,p.location,p.external_code,p.brand,p.material_level,p.material_serial,
+        p.notes,p.created_at,p.updated_at,NULL AS custodian_id,
+        coalesce(p.deleted_at,j.deleted_at) AS deleted_at,j.name AS project_name'''
+    return [dict(row) for row in db.execute(f'''SELECT {columns}, u.name AS custodian_name,
+        (SELECT SUM(child.price * link.qty) FROM material_links link
+         JOIN parts child ON child.id=link.child_id AND child.project_id=link.child_project_id
+         WHERE link.project_id=p.project_id AND link.parent_id=p.id) AS secondary_cost,
+        CASE WHEN p.deleted_at IS NULL AND j.deleted_at IS NULL THEN {MATERIAL_PRIMARY_IMAGE} END AS shared_image_id
+        FROM parts p JOIN projects j ON j.id=p.project_id
+        LEFT JOIN users u ON u.id=p.custodian_id
+        WHERE (? IS NULL OR p.project_id<>?) AND ((p.deleted_at IS NULL AND j.deleted_at IS NULL) OR EXISTS (
+            SELECT 1 FROM bom_lines l WHERE l.project_id=? AND l.part_id=p.id
+            UNION ALL SELECT 1 FROM material_links l WHERE l.project_id=? AND l.child_id=p.id
+            UNION ALL SELECT 1 FROM product_mold_parts l JOIN product_molds m ON m.id=l.mold_id
+                WHERE m.project_id=? AND l.part_id=p.id
+        )) ORDER BY j.name,p.code''', (db.project_id, db.project_id, db.project_id, db.project_id, db.project_id))]
+
+
+def require_material_catalog(db, user):
+    if user['role'] != 'admin' and not db.execute('''SELECT 1 FROM project_members m
+        JOIN projects p ON p.id=m.project_id WHERE m.user_id=? AND p.deleted_at IS NULL LIMIT 1''',
+        (user['id'],)).fetchone():
+        raise Problem('请先加入一个项目', 403)
+
+
+def add_material_projects(db, parts):
+    projects = [dict(row) for row in db.execute(
+        'SELECT id,name FROM projects WHERE deleted_at IS NULL ORDER BY name,id')]
+    projects_by_id = {project['id']: project for project in projects}
+    order = {project_id: index for index, project_id in enumerate(projects_by_id)}
+    assigned, used = {}, {}
+    for data, query in (
+        (assigned, 'SELECT part_id,project_id FROM material_projects'),
+        (used, 'SELECT part_id,project_id FROM bom_lines UNION SELECT child_id,project_id FROM material_links'),
+    ):
+        for row in db.execute(query):
+            data.setdefault(row['part_id'], set()).add(row['project_id'])
+    for part in parts:
+        manual = assigned.get(part['id'], set())
+        related = used.get(part['id'], set()) | {part['project_id']}
+        part['project_assignments'] = [
+            {**projects_by_id[id], 'assigned': id in manual, 'required': id in related}
+            for id in sorted((manual | related) & projects_by_id.keys(),
+                             key=lambda id: (id != part['project_id'], order[id]))
+        ]
+    return projects
 
 def enter_project(db, project_id, user, write=False):
     project = db.execute('SELECT * FROM projects WHERE id=? AND deleted_at IS NULL', (project_id,)).fetchone()
@@ -1090,6 +1356,9 @@ def write_backup(output):
             with connect() as source:
                 source.backup(target)
             target.execute('DELETE FROM sessions')
+            target.execute('DELETE FROM scanner_sessions')
+            target.execute('PRAGMA secure_delete=ON')
+            target.execute('DELETE FROM scanner_updates')
             files = target.execute('SELECT id FROM files').fetchall()
         with zipfile.ZipFile(output, 'w', zipfile.ZIP_DEFLATED) as archive:
             archive.write(database, 'plm.sqlite3')
@@ -1133,13 +1402,18 @@ def stage_restore(archive_path, directory):
             if version >= 10:
                 project_tables += ('project_covers',)
             category_tables = ('material_categories',) if version >= MATERIAL_CATEGORIES_VERSION else ()
+            if version >= MATERIAL_PROJECT_VERSION:
+                category_tables += ('material_projects',)
             inspection_tables = inspection.TABLES if version >= 13 else inspection.INITIAL_TABLES if version == 12 else ()
             shipping_tables = (shipping.TABLES if version >= shipping.HANDLING_PROJECTS_VERSION else
                                shipping.PRODUCT_TABLES if version >= shipping.PRODUCTS_VERSION else
                                shipping.SOURCE_TABLES if version >= shipping.SOURCES_VERSION else
                                shipping.CARRIER_TABLES if version >= shipping.CREATED_AT_VERSION else
                                shipping.LEGACY_TABLES if version >= shipping.VERSION else ())
-            required_tables = set(TABLES) | {'settings', 'import_runs', *project_tables, *category_tables,
+            business_tables = TABLES if version >= PRODUCT_MOLD_VERSION else BUSINESS_TABLES
+            if version >= MOLD_PART_VERSION:
+                business_tables += ('product_mold_parts',)
+            required_tables = set(business_tables) | {'settings', 'import_runs', *project_tables, *category_tables,
                                              *inspection_tables, *shipping_tables}
             if version >= 7:
                 required_tables |= {'users', 'activity'}
@@ -1147,17 +1421,22 @@ def stage_restore(archive_path, directory):
                 raise Problem('备份缺少业务数据表')
             if project_tables and 'shipping_pending_shopify' in source_tables:
                 shipping_tables += ('shipping_pending_shopify',)
+            scanner_tables = scanner_devices.BACKUP_TABLES if project_tables and 'scanner_devices' in source_tables else ()
+            if not set(scanner_tables) <= source_tables:
+                raise Problem('备份缺少扫码枪数据表')
             (init_db if project_tables else init_legacy_db)(staged)
             with connect(staged) as db:
                 db.execute('BEGIN')
                 db.execute('PRAGMA defer_foreign_keys=ON')
-                for table in ('users', *project_tables, *category_tables, *TABLES, *inspection_tables, *shipping_tables,
-                              'settings', 'import_runs', 'activity'):
+                for table in ('users', *project_tables, *category_tables, *business_tables, *inspection_tables, *shipping_tables,
+                              *scanner_tables, 'settings', 'import_runs', 'activity'):
                     if table not in source_tables or (version == 6 and table in ('users', 'activity')):
                         continue
                     target_columns = [row['name'] for row in db.execute(f'PRAGMA table_info({table})')]
                     source_columns = {row['name'] for row in source.execute(f'PRAGMA table_info({table})')}
                     optional = {RESPONSIBILITIES.get(table)} if version == 6 else set()
+                    if table == 'scanner_devices':
+                        optional.update(('pending', 'enrolled_from'))
                     if table == 'parts' and version < 8:
                         optional.add('deleted_at')
                     if table == 'projects' and version < 11:
@@ -1170,6 +1449,22 @@ def stage_restore(archive_path, directory):
                         optional.add('occurred_at')
                     if table == 'files' and version < IMAGE_NAME_VERSION:
                         optional.add('display_name')
+                    if table == 'users' and version < PROJECT_ROLE_VERSION:
+                        optional.add('shopify_import')
+                    if table == 'project_members' and version < PROJECT_ROLE_VERSION:
+                        optional.add('roles')
+                    if table == 'product_molds' and version < MOLD_MOQ_VERSION:
+                        optional.add('moq')
+                    if table == 'product_molds' and version < MOLD_AMORTIZATION_VERSION:
+                        optional.add('amortization_qty')
+                    project_column = (
+                        'part_project_id' if table == 'bom_lines' and PROJECT_VERSION <= version < SHARED_BOM_VERSION
+                        else 'child_project_id' if table == 'material_links' and PROJECT_VERSION <= version < SHARED_MATERIAL_LINK_VERSION
+                        else None
+                    )
+                    legacy_project = project_column and project_column not in source_columns
+                    if legacy_project:
+                        optional.add(project_column)
                     if table == 'shipping_ks_orders' and version < shipping.CREATED_AT_VERSION:
                         optional.add('created_at')
                     if table == 'shipping_records' and version < shipping.RECORD_RELATIONS_VERSION:
@@ -1179,7 +1474,11 @@ def stage_restore(archive_path, directory):
                     if not set(target_columns) - optional <= source_columns:
                         raise Problem('备份数据结构不完整')
                     columns = ','.join(name for name in target_columns if name in source_columns)
-                    records = source.execute(f'SELECT {columns} FROM {table} ORDER BY rowid')
+                    selection = columns
+                    if legacy_project:
+                        columns += ',' + project_column
+                        selection += ',project_id AS ' + project_column
+                    records = source.execute(f'SELECT {selection} FROM {table} ORDER BY rowid')
                     db.executemany(f'INSERT INTO {table}({columns}) VALUES({",".join("?" for _ in columns.split(","))})', records)
                 if PROJECT_VERSION <= version < INVENTORY_TIME_VERSION:
                     db.execute("UPDATE movements SET occurred_at=created_at WHERE occurred_at=''")
@@ -1302,6 +1601,8 @@ class Handler(BaseHTTPRequestHandler):
             return None
 
     def authorized(self, db):
+        if getattr(self, 'warehouse_request', False) and self.headers.get('Authorization'):
+            return scanner_devices.operator_session(db, self.headers['Authorization'])
         return db.execute(
             f'SELECT {PUBLIC_USER} FROM users WHERE id=(SELECT user_id FROM sessions WHERE token=? AND expires>?)',
             (self.session_token(), time.time()),
@@ -1340,6 +1641,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_PUT(self): self.handle_request('PUT')
     def do_DELETE(self): self.handle_request('DELETE')
     def handle_request(self, method):
+        self.warehouse_request = False
         try:
             path = unquote(urlparse(self.path).path)
             if BASE_PATH:
@@ -1347,13 +1649,34 @@ class Handler(BaseHTTPRequestHandler):
                     raise Problem('路径不存在', 404)
                 path = path[len(BASE_PATH):]
             asset_path = re.fullmatch(r'/api/assets/(file|cover|avatar)/([0-9a-f]{24}|legacy)', path)
-            if method == 'HEAD' and not asset_path and not re.fullmatch(r'/files/[0-9a-f]{24}', path):
+            material_image = re.fullmatch(r'/api/projects/([a-zA-Z0-9_-]+)/shared-material-images/([0-9a-f]{24})/([0-9a-f]{24})', path)
+            catalog_image = re.fullmatch(r'/api/global-materials/([0-9a-f]{24})/image/([0-9a-f]{24})', path)
+            scanner_image = (
+                re.fullmatch(r'/files/([0-9a-f]{24})', path)
+                if method in ('GET', 'HEAD') and parse_qs(urlparse(self.path).query).get('scanner_thumb') == ['1']
+                else None
+            )
+            if method == 'HEAD' and not (asset_path or material_image or catalog_image or scanner_image or re.fullmatch(r'/files/[0-9a-f]{24}', path)):
                 raise Problem('接口不存在', 404)
             if method not in ('GET', 'HEAD'):
                 origin = self.headers.get('Origin')
                 if origin and urlparse(origin).netloc != self.headers.get('Host'): raise Problem('请求来源不被允许',403)
                 if self.headers.get('Sec-Fetch-Site') == 'cross-site': raise Problem('请求来源不被允许',403)
             if path == '/api/health': return self.send({'ok':True})
+            if path == '/api/feishu/events' and method == 'POST':
+                size = self.body_size()
+                if not 0 < size <= 64 * 1024:
+                    raise Problem('飞书事件大小无效', 413)
+                raw = self.rfile.read(size)
+                if len(raw) != size:
+                    raise Problem('上传不完整')
+                config = feishu_bot.load_settings(DATA)
+                event = feishu_bot.decode_event(raw, self.headers, config)
+                if event.get('type') == 'url_verification':
+                    return self.send(feishu_bot.accept_event(None, config, event))
+                with transaction() as db:
+                    result = feishu_bot.accept_event(db, config, event)
+                return self.send(result)
             if path == '/api/auth/status':
                 with connect() as db:
                     user = self.authorized(db)
@@ -1362,6 +1685,16 @@ class Handler(BaseHTTPRequestHandler):
                                   'user': dict(user) if user else None})
             if path in ('/api/auth/setup', '/api/auth/login') and method == 'POST':
                 return self.auth(path)
+            if (path, method) in (('/api/scanner/operators', 'POST'), ('/api/scanner/session', 'POST')):
+                return self.scanner_operator(path.endswith('/session'))
+            if method == 'GET' and path == '/api/scanner/update':
+                return self.scanner_update_check()
+            if method == 'GET' and (match := re.fullmatch(r'/api/scanner/update/([a-f0-9]{64})', path)):
+                return self.scanner_update_download(match[1])
+            movement_delete = re.fullmatch(r'/api/warehouse/movements/([a-f0-9]{24})', path) if method == 'DELETE' else None
+            self.warehouse_request = (
+                (path, method) in (('/api/warehouse/material', 'GET'), ('/api/warehouse/movements', 'GET'),
+                                   ('/api/warehouse/movements', 'POST')) or movement_delete is not None or scanner_image is not None)
             if path.startswith(('/api/', '/files/')):
                 with connect() as db:
                     self.user = self.authorized(db)
@@ -1376,15 +1709,72 @@ class Handler(BaseHTTPRequestHandler):
                 return self.warehouse_movement()
             if path == '/api/warehouse/movements' and method == 'GET':
                 return self.warehouse_history()
-            if method == 'DELETE' and (match := re.fullmatch(r'/api/warehouse/movements/([a-f0-9]{24})', path)):
-                return self.delete_warehouse_movement(match[1])
+            if movement_delete:
+                return self.delete_warehouse_movement(movement_delete[1])
+            if scanner_image:
+                return self.scanner_thumbnail(scanner_image[1])
+            if path == '/api/scanner-devices' and method in ('GET', 'POST'):
+                return self.scanner_directory(method)
+            if method in ('PUT', 'DELETE') and (match := re.fullmatch(r'/api/scanner-devices/([a-f0-9]{24})/firmware', path)):
+                return self.manage_scanner_update(method, match[1])
+            if method == 'PUT' and (match := re.fullmatch(r'/api/scanner-devices/([a-f0-9]{24})', path)):
+                return self.scanner_directory(method, match[1])
             if path == '/api/settings/shopify' and method in ('GET', 'PUT'):
                 self.require_admin()
                 if method == 'PUT':
                     return self.send(shopify_orders.save_settings(DATA, self.body()))
                 return self.send(shopify_orders.public_settings(shopify_orders.credentials(DATA)))
+            if path == '/api/settings/feishu' and method in ('GET', 'PUT'):
+                self.require_admin()
+                with connect() as db:
+                    if method == 'PUT':
+                        return self.send(feishu_bot.save_settings(DATA, self.body(), db))
+                    return self.send(feishu_bot.public_settings(feishu_bot.load_settings(DATA), db))
+            if path == '/api/account/feishu' and method in ('GET', 'POST', 'DELETE'):
+                with transaction() as db:
+                    user = self.authorized(db)
+                    if not user or user['must_change']:
+                        raise Problem('请先登录', 401)
+                    return self.send(feishu_bot.account_binding(
+                        db, feishu_bot.load_settings(DATA), user['id'], method))
+            if path == '/api/settings/feishu/verify' and method == 'POST':
+                self.require_admin()
+                config = feishu_bot.load_settings(DATA)
+                if not feishu_bot.configured(config):
+                    raise Problem('请先保存飞书应用凭据')
+                feishu_bot.Client().bot_id(config)
+                return self.send({'ok': True})
+            if path == '/api/settings/feishu/test' and method == 'POST':
+                self.require_admin()
+                config = feishu_bot.load_settings(DATA)
+                chat_id = self.body().get('chat_id')
+                with connect() as db:
+                    if not feishu_bot.configured(config) or not any(
+                        group['chat_id'] == chat_id for group in feishu_bot.notification_groups(config)
+                    ):
+                        raise Problem('请先保存有效的飞书通知群')
+                feishu_bot.Client().send(config, chat_id, '【PLM 连接测试】飞书机器人已连接。可以在群里 @机器人后发送「帮助」。', uid())
+                return self.send({'ok': True})
             if path.startswith('/api/global-shipping/'):
                 return self.global_shipping_request(path.removeprefix('/api/global-shipping/'), method)
+            if path == '/api/global-materials' and method == 'GET':
+                with connect() as db:
+                    db.execute('BEGIN')
+                    require_material_catalog(db, self.user)
+                    parts = shared_materials(db)
+                    deleted = [deleted_part_metadata(db, dict(row)) for row in db.execute('''SELECT p.*,j.name AS project_name
+                        FROM parts p JOIN projects j ON j.id=p.project_id
+                        WHERE p.deleted_at IS NOT NULL AND j.deleted_at IS NULL ORDER BY p.deleted_at DESC,p.code''')]
+                    return self.send({'parts': parts, 'deleted_parts': deleted,
+                                      'projects': add_material_projects(db, parts)})
+            if method == 'PUT' and (match := re.fullmatch(r'/api/global-materials/([0-9a-f]{24})/projects', path)):
+                return self.set_material_projects(match[1])
+            if method == 'GET' and (match := re.fullmatch(r'/api/global-materials/([0-9a-f]{24})/activity', path)):
+                return self.list_activity(material_id=match[1])
+            if material_image and method in ('GET', 'HEAD'):
+                return self.serve_file(material_image[3], shared_material=(material_image[1], material_image[2]))
+            if catalog_image and method in ('GET', 'HEAD'):
+                return self.serve_file(catalog_image[2], shared_material=(None, catalog_image[1]))
             if segments[:2] == ['api', 'projects']:
                 if len(segments) >= 4:
                     return self.project_request(segments[2], '/api/' + '/'.join(segments[3:]), method)
@@ -1396,10 +1786,18 @@ class Handler(BaseHTTPRequestHandler):
                 with connect() as db:
                     db.execute('BEGIN')
                     record = exists(db, table, id)
-                    enter_project(db, record['project_id'], self.user)
+                    project_id = record['project_id']
+                    if table == 'parts' and parse_qs(urlparse(self.path).query).get('catalog') == ['1']:
+                        allowed = list_projects(db, self.user)
+                        if project_id not in {project['id'] for project in allowed}:
+                            available_bom_part(db, id)
+                            if not allowed:
+                                raise Problem('请先加入一个项目', 404)
+                            project_id = allowed[0]['id']
+                    enter_project(db, project_id, self.user)
                     if table == 'purchases' and record['deleted_at']:
                         raise Problem('采购单已删除', 404)
-                    return self.send({'project_id': record['project_id']})
+                    return self.send({'project_id': project_id})
             if path == '/api/auth/logout' and method == 'POST':
                 with FILE_LOCK, transaction() as db:
                     result = db.execute('DELETE FROM sessions WHERE token=?', (self.session_token(),))
@@ -1461,6 +1859,7 @@ class Handler(BaseHTTPRequestHandler):
         except Problem as e: self.send({'error':e.message},e.status)
         except inspection.InspectionError as e: self.send({'error':str(e)},e.status)
         except shipping.ShippingError as e: self.send({'error':str(e)},e.status)
+        except feishu_bot.FeishuError as e: self.send({'error':str(e)},e.status)
         except sqlite3.IntegrityError as e:
             msg = '英文代号已使用' if 'products.english_code' in str(e) else '关联记录不匹配或仍被其他记录引用' if 'FOREIGN KEY' in str(e) else '编码或关联物料重复，请检查输入'
             self.send({'error':msg},409)
@@ -1586,7 +1985,9 @@ class Handler(BaseHTTPRequestHandler):
                             quote_row['price'] = None
                         for line in state['purchase_lines']:
                             line['price'] = None
-                    return self.send({**state, 'project': project})
+                    shared = shared_materials(db)
+                    add_material_projects(db, [*state['parts'], *shared])
+                    return self.send({**state, 'project': project, 'shared_parts': shared})
             raise Problem('接口不存在', 404)
         resource = path.split('/')[2]
         if resource in ('users', 'account', 'reset-password'):
@@ -1611,6 +2012,243 @@ class Handler(BaseHTTPRequestHandler):
                 remove_upload(fid)
         self.send(result)
 
+    def set_material_projects(self, part_id):
+        payload = self.body()
+        ids = payload.get('project_ids') if isinstance(payload, dict) else None
+        if not isinstance(ids, list) or any(not isinstance(id, str) for id in ids):
+            raise Problem('请选择共用项目')
+        with FILE_LOCK, transaction() as db:
+            part = available_bom_part(db, part_id)
+            self.project_writer(db, part['project_id'], 'engineering')
+            selected = set(ids) - {part['project_id']}
+            projects = {row['id']: row['name'] for row in db.execute(
+                'SELECT id,name FROM projects WHERE deleted_at IS NULL')}
+            if selected - projects.keys():
+                raise Problem('所选项目不存在，请刷新后重试', 404)
+            current = {row[0] for row in db.execute(
+                'SELECT project_id FROM material_projects WHERE part_id=?', (part_id,))} & projects.keys()
+            added, removed = selected - current, current - selected
+            db.executemany('INSERT INTO material_projects(part_id,project_id) VALUES(?,?)',
+                           ((part_id, id) for id in added))
+            db.executemany('DELETE FROM material_projects WHERE part_id=? AND project_id=?',
+                           ((part_id, id) for id in removed))
+            if added or removed:
+                detail = ' · '.join(
+                    f'{label}：' + '、'.join(sorted(projects[id] for id in changes))
+                    for label, changes in (('添加共用项目', added), ('移除共用项目', removed)) if changes
+                )
+                log_activity(db, self.user, '修改物料共用项目', part_id, part['code'] + ' ' + part['name'], detail)
+                touch_project(db)
+        return self.send({'ok': True})
+
+    def scanner_directory(self, method, device_id=None):
+        self.require_admin()
+        if method == 'GET':
+            with connect() as db:
+                return self.send(scanner_devices.list_devices(db))
+        data = self.body()
+        if not isinstance(data, dict):
+            raise Problem('扫码枪设置格式无效')
+        name = required(data.get('name'), '设备名称')
+        user_ids = data.get('user_ids')
+        enabled = data.get('enabled', True)
+        rotate = data.get('rotate', False)
+        approve = data.get('approve', False)
+        reject = data.get('reject', False)
+        if (len(name) > 80 or type(enabled) is not bool or type(rotate) is not bool
+                or type(approve) is not bool or type(reject) is not bool or (approve and reject)
+                or not isinstance(user_ids, list) or len(user_ids) > 200
+                or any(not isinstance(id, str) or not UPLOAD_ID.fullmatch(id) for id in user_ids)):
+            raise Problem('扫码枪设置格式无效')
+        key = secrets.token_hex(32) if not device_id or rotate else None
+        with FILE_LOCK, transaction() as db:
+            if device_id:
+                device = exists(db, 'scanner_devices', device_id)
+                if device['pending'] and enabled and not reject and (not approve or not user_ids):
+                    raise Problem('请核对设备识别码并分配经办人后再启用')
+                pending = device['pending'] and not (reject or enabled)
+                enabled = enabled and not reject
+                db.execute('UPDATE scanner_devices SET name=?,enabled=?,pending=? WHERE id=?',
+                           (name, enabled, pending, device_id))
+                if rotate:
+                    db.execute("UPDATE scanner_devices SET key_hash=?,mac='' WHERE id=?",
+                               (scanner_devices.digest(key), device_id))
+                if rotate or not enabled:
+                    db.execute('DELETE FROM scanner_sessions WHERE device_id=?', (device_id,))
+            else:
+                device_id = uid()
+                db.execute('INSERT INTO scanner_devices(id,name,key_hash,enabled,created_at) VALUES(?,?,?,?,?)',
+                           (device_id, name, scanner_devices.digest(key), enabled, now()))
+            selected = set() if reject else set(user_ids)
+            for id in selected:
+                exists(db, 'users', id)
+            existing = {row[0] for row in db.execute(
+                'SELECT user_id FROM scanner_device_users WHERE device_id=?', (device_id,))}
+            db.executemany('DELETE FROM scanner_device_users WHERE device_id=? AND user_id=?',
+                           ((device_id, id) for id in existing - selected))
+            db.executemany('INSERT INTO scanner_device_users VALUES(?,?)',
+                           ((device_id, id) for id in selected - existing))
+            detail = ('已拒绝登记' if reject else '已审核通过' if approve and enabled
+                      else '已更换配对密钥' if rotate else '')
+            log_activity(db, self.user, '更新扫码枪' if method == 'PUT' else '登记扫码枪', device_id, name, detail)
+        return self.send({'id': device_id, 'key': key})
+
+    def manage_scanner_update(self, method, device_id):
+        self.require_admin()
+        if method == 'PUT':
+            size = self.body_size()
+            if not 256 <= size <= scanner_devices.MAX_FIRMWARE_BYTES:
+                raise Problem('固件大小超出扫码枪分区容量或文件不完整', 413)
+            image = self.rfile.read(size)
+            version = scanner_devices.image_version(image) if len(image) == size else ''
+            target = scanner_devices.version_tuple(version)
+            if not target:
+                raise Problem('请上传仓库应用编译生成的 ESP32-S3 N16R8 firmware.bin')
+            sha256 = hashlib.sha256(image).hexdigest()
+        with FILE_LOCK, transaction() as db:
+            device = exists(db, 'scanner_devices', device_id)
+            if method == 'DELETE':
+                db.execute("DELETE FROM scanner_updates WHERE device_id=? AND status!='installed'", (device_id,))
+                log_activity(db, self.user, '取消扫码枪升级', device_id, device['name'])
+            else:
+                running = scanner_devices.version_tuple(device['firmware'].removeprefix('scanner/'))
+                if not device['enabled'] or device['pending'] or running < scanner_devices.OTA_MIN_VERSION:
+                    raise Problem('启用设备并先通过 USB 烧录支持远程升级的固件')
+                if target <= running:
+                    raise Problem('固件版本必须高于当前设备版本', 409)
+                db.execute('''INSERT INTO scanner_updates(device_id,version,sha256,size,image,status,updated_at)
+                    VALUES(?,?,?,?,?,'queued',?) ON CONFLICT(device_id) DO UPDATE SET version=excluded.version,
+                    sha256=excluded.sha256,size=excluded.size,image=excluded.image,status='queued',updated_at=excluded.updated_at''',
+                           (device_id, version, sha256, size, image, now()))
+                log_activity(db, self.user, '安排扫码枪升级', device_id, device['name'], version)
+        return self.send({'ok': True})
+
+    def scanner_update_check(self):
+        query = parse_qs(urlparse(self.path).query)
+        version = query.get('version', [''])[0]
+        failed = query.get('failed', [''])[0]
+        running = scanner_devices.version_tuple(version)
+        if not running or (failed and not re.fullmatch(r'[a-f0-9]{64}', failed)):
+            raise Problem('固件参数无效')
+        with FILE_LOCK, transaction() as db:
+            device = scanner_devices.by_key(db, self.headers.get('X-Scanner-Key'))
+            if not device:
+                raise Problem('扫码枪未获授权', 401)
+            current = datetime.now(timezone.utc)
+            firmware = 'scanner/' + version
+            if (device['firmware'] != firmware
+                    or (device['last_seen_at'] or '') < (current - timedelta(seconds=25)).isoformat()):
+                db.execute('UPDATE scanner_devices SET firmware=?,last_seen_at=? WHERE id=?',
+                           (firmware, current.isoformat(), device['id']))
+            update = db.execute('SELECT version,sha256,size,status FROM scanner_updates WHERE device_id=?',
+                                (device['id'],)).fetchone()
+            result = None
+            if update and update['status'] != 'installed':
+                if running >= scanner_devices.version_tuple(update['version']):
+                    status = 'installed' if version == update['version'] else 'superseded'
+                    db.execute('UPDATE scanner_updates SET image=NULL,status=?,updated_at=? WHERE device_id=?',
+                               (status, now(), device['id']))
+                elif update['status'] != 'superseded':
+                    if failed == update['sha256'] and update['status'] != 'retry':
+                        db.execute("UPDATE scanner_updates SET status='retry',updated_at=? WHERE device_id=?",
+                                   (now(), device['id']))
+                    result = {key: update[key] for key in ('version', 'sha256', 'size')}
+        return self.send({'update': result})
+
+    def scanner_update_download(self, sha256):
+        with FILE_LOCK, transaction() as db:
+            device = scanner_devices.by_key(db, self.headers.get('X-Scanner-Key'))
+            if not device:
+                raise Problem('扫码枪未获授权', 401)
+            update = db.execute('SELECT image FROM scanner_updates WHERE device_id=? AND sha256=? AND image IS NOT NULL',
+                                (device['id'], sha256)).fetchone()
+            if not update:
+                raise Problem('升级已取消或已替换', 404)
+            image = update['image']
+            db.execute("UPDATE scanner_updates SET status='downloading',updated_at=? WHERE device_id=?",
+                       (now(), device['id']))
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/octet-stream')
+        self.send_header('Content-Length', str(len(image)))
+        self.send_header('Cache-Control', 'private, no-store')
+        self.security_headers()
+        self.end_headers()
+        self.wfile.write(image)
+
+    def scanner_operator(self, select):
+        if self.body_size() > 1024:
+            raise Problem('扫码枪请求过长', 413)
+        data = self.body()
+        if not isinstance(data, dict):
+            raise Problem('扫码枪请求格式无效')
+        mac, ip, firmware = (data.get(field) for field in ('mac', 'ip', 'firmware'))
+        if (not isinstance(mac, str) or not re.fullmatch(r'(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}', mac)
+                or not isinstance(ip, str) or not isinstance(firmware, str) or len(firmware) > 40):
+            raise Problem('扫码枪网络信息无效')
+        try:
+            ip = str(ipaddress.IPv4Address(ip))
+        except ValueError:
+            raise Problem('扫码枪 IP 地址无效')
+        mac = mac.upper()
+        offset = data.get('offset', 0)
+        operator_id = data.get('user_id')
+        automatic = not select and data.get('register') is True
+        if type(offset) is not int or not 0 <= offset <= 200 or (select and (
+                not isinstance(operator_id, str) or not UPLOAD_ID.fullmatch(operator_id))):
+            raise Problem('扫码枪用户选择无效')
+        with FILE_LOCK, transaction() as db:
+            key = self.headers.get('X-Scanner-Key')
+            device = scanner_devices.by_key(db, key, include_inactive=automatic)
+            if not device and automatic and re.fullmatch(r'[a-f0-9]{64}', key or ''):
+                device = self.register_scanner(db, key, mac, ip, firmware)
+            if not device or (device['mac'] and device['mac'] != mac):
+                raise Problem('扫码枪未登记、已停用或配对密钥不匹配', 401)
+            current = datetime.now(timezone.utc)
+            if (select or (device['mac'], device['ip'], device['firmware']) != (mac, ip, firmware)
+                    or (device['last_seen_at'] or '') < (current - timedelta(seconds=25)).isoformat()):
+                db.execute('UPDATE scanner_devices SET mac=?,ip=?,firmware=?,last_seen_at=? WHERE id=?',
+                           (mac, ip, firmware, current.isoformat(), device['id']))
+            if select:
+                users = scanner_devices.operators(db, device['id'], user_id=operator_id)
+                if not users:
+                    raise Problem('该用户未获准使用此扫码枪或需先修改初始密码', 403)
+                user = dict(users[0])
+                token = scanner_devices.new_session(db, device['id'], user['id'])
+                db.execute('UPDATE scanner_devices SET last_user_id=? WHERE id=?',
+                           (user['id'], device['id']))
+                log_activity(db, user, '扫码枪登录', device['id'], device['name'])
+                result = {'token': token, 'user': user}
+            else:
+                state = 'pending' if device['pending'] else 'ready' if device['enabled'] else 'disabled'
+                users = scanner_devices.operators(db, device['id'], offset=offset, limit=7) if state == 'ready' else []
+                result = {'name': device['name'], 'users': [dict(row) for row in users[:6]],
+                          'has_more': len(users) > 6, 'server_time': int(current.timestamp())}
+                if automatic:
+                    result.update(state=state, verification=device['key_hash'][:8].upper())
+        return self.send(result)
+
+    def register_scanner(self, db, key, mac, ip, firmware):
+        source = self.client_address[0]
+        if source in ('127.0.0.1', '::1'):
+            try:
+                source = str(ipaddress.ip_address(self.headers.get('X-Real-IP', source)))
+            except ValueError:
+                pass
+        current = datetime.now(timezone.utc)
+        db.execute('DELETE FROM scanner_devices WHERE pending=1 AND created_at<?',
+                   ((current - timedelta(days=7)).isoformat(),))
+        pending = db.execute('SELECT count(*) FROM scanner_devices WHERE pending=1').fetchone()[0]
+        recent = db.execute('SELECT count(*) FROM scanner_devices WHERE enrolled_from=? AND created_at>?',
+                            (source, (current - timedelta(hours=1)).isoformat())).fetchone()[0]
+        if pending >= 160 or recent >= 12:
+            raise Problem('新设备登记过多，请稍后重试或联系管理员', 429)
+        id = uid()
+        db.execute('''INSERT INTO scanner_devices(id,name,key_hash,enabled,mac,ip,firmware,
+            created_at,last_seen_at,pending,enrolled_from) VALUES(?,?,?,0,?,?,?,?,?,1,?)''',
+                   (id, '扫码枪 ' + mac[-5:].replace(':', ''), scanner_devices.digest(key),
+                    mac, ip, firmware, current.isoformat(), current.isoformat(), source))
+        return exists(db, 'scanner_devices', id)
+
     def warehouse_material(self):
         query = parse_qs(urlparse(self.path).query)
         code = required(query.get('q', [''])[0], '物料编号')
@@ -1626,7 +2264,7 @@ class Handler(BaseHTTPRequestHandler):
             rows = db.execute(f"""
                 WITH matches AS (
                     SELECT p.id, p.code, p.name, p.spec, p.unit, p.stock, p.location, p.external_code,
-                           p.project_id, j.name AS project_name,
+                           p.project_id, j.name AS project_name, custodian.name AS custodian_name,
                            (SELECT f.id FROM files f WHERE f.project_id=p.project_id
                             AND f.owner_type='parts' AND f.owner_id=p.id AND f.kind='image'
                             ORDER BY f.rowid LIMIT 1) AS image_id,
@@ -1634,6 +2272,7 @@ class Handler(BaseHTTPRequestHandler):
                                SELECT 1 FROM material_code_aliases a WHERE a.project_id=p.project_id
                                AND a.part_id=p.id AND a.code=:code COLLATE NOCASE)) AS exact_code
                     FROM parts p JOIN projects j ON j.id=p.project_id
+                    LEFT JOIN users custodian ON custodian.id=p.custodian_id
                     WHERE p.deleted_at IS NULL AND j.deleted_at IS NULL AND j.archived_at IS NULL
                       AND (:admin OR EXISTS (SELECT 1 FROM project_members m
                                             WHERE m.project_id=j.id AND m.user_id=:user
@@ -1658,7 +2297,38 @@ class Handler(BaseHTTPRequestHandler):
             raise Problem('编号匹配到多条物料，请扫描物料二维码', 409)
         return self.send(dict(rows[0]))
 
+    def scanner_thumbnail(self, file_id):
+        if scanner_devices.Image is None:
+            raise Problem('扫码枪缩略图服务未开启', 404)
+        with connect() as db:
+            db.execute('BEGIN')
+            image = db.execute("""SELECT f.project_id,f.size FROM files f
+                JOIN parts p ON p.id=f.owner_id AND p.project_id=f.project_id
+                JOIN projects j ON j.id=f.project_id
+                WHERE f.id=? AND f.owner_type='parts' AND f.kind='image' AND p.deleted_at IS NULL
+                  AND j.deleted_at IS NULL AND j.archived_at IS NULL""", (file_id,)).fetchone()
+            if (not image or not permissions.can(db, image['project_id'], self.user, 'warehouse')
+                    or image['size'] > scanner_devices.MAX_IMAGE_BYTES):
+                raise Problem('未找到可显示的物料图片', 404)
+        path = DATA / 'uploads' / file_id
+        if not path.is_file():
+            raise Problem('未找到物料图片', 404)
+        revision = 'scanner-rgb565-v1-' + file_id
+        if self.command == 'HEAD':
+            return self.send_asset_headers('application/octet-stream', scanner_devices.THUMBNAIL_LENGTH, revision)
+        content = scanner_devices.thumbnail(path)
+        if content is None:
+            raise Problem('无法生成物料缩略图', 415)
+        if self.send_asset_headers('application/octet-stream', len(content), revision):
+            self.wfile.write(content)
+
     def warehouse_history(self):
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            limit = min(30, max(1, int(query.get('limit', ['30'])[0])))
+            offset = min(10000, max(0, int(query.get('offset', ['0'])[0])))
+        except ValueError:
+            raise Problem('历史记录页码无效')
         with connect() as db:
             rows = db.execute(f"""
                 SELECT m.*, p.code AS part_code, p.name AS part_name, p.unit, j.name AS project_name,
@@ -1670,8 +2340,8 @@ class Handler(BaseHTTPRequestHandler):
                   AND (? OR EXISTS (SELECT 1 FROM project_members pm
                                    WHERE pm.project_id=m.project_id AND pm.user_id=?
                                    AND {permissions.membership_allows('warehouse', 'pm')}))
-                ORDER BY m.created_at DESC, m.id DESC LIMIT 30
-            """, (self.user['id'], self.user['role'] == 'admin', self.user['id'])).fetchall()
+                ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?
+            """, (self.user['id'], self.user['role'] == 'admin', self.user['id'], limit, offset)).fetchall()
         fields = ('id', 'type', 'project_id', 'project_name', 'part_code', 'part_name',
                   'qty', 'unit', 'created_at', 'can_delete')
         return self.send([{
@@ -1684,6 +2354,9 @@ class Handler(BaseHTTPRequestHandler):
         if not isinstance(data, dict) or not isinstance(data.get('expected'), dict):
             raise Problem('请刷新流水记录后重试')
         with FILE_LOCK, transaction() as db:
+            self.user = self.authorized(db)
+            if not self.user or self.user['must_change']:
+                raise Problem('请先登录', 401)
             self.project_writer(db, required(data.get('project_id'), '项目'), 'warehouse')
             row = exists(db, 'movements', movement_id)
             if row['handler_id'] != self.user['id'] or row['type'] not in ('入库', '出库', '报废'):
@@ -1725,7 +2398,11 @@ class Handler(BaseHTTPRequestHandler):
                     'type': kind, 'part_id': part_id, 'qty': qty,
                     'reason': '仓库快速登记报废' if kind == '报废' else '',
                 }, self.user)
+                if 'scanner_id' in self.user.keys():
+                    db.execute('INSERT INTO scanner_movements VALUES(?,?)', (movement, self.user['scanner_id']))
                 result = {'id': movement, 'stock': active_part(db, part_id)['stock']}
+                if 'scanner_id' in self.user.keys():
+                    result['part_id'] = part_id
                 insert_scoped(db, 'import_runs', dict(id=key, fingerprint=fingerprint,
                                                      result=json.dumps(result), created_at=now()))
                 touch_project(db)
@@ -2318,22 +2995,35 @@ class Handler(BaseHTTPRequestHandler):
         if self.send_asset_headers(content_type, len(image), hashlib.sha256(image).hexdigest()):
             self.wfile.write(image)
 
-    def list_activity(self, project_id=None):
+    def list_activity(self, project_id=None, *, material_id=None):
         query = parse_qs(urlparse(self.path).query)
         before = int(query.get('before', ['0'])[0])
-        subject = query.get('part', [''])[0]
-        kind = query.get('kind', [''])[0]
+        subject = material_id or query.get('part', [''])[0]
+        kind = 'material' if material_id else query.get('kind', [''])[0]
         conditions = ["(?=0 OR a.id<?)", "(?='' OR a.subject_id=?)"]
         params = [before, before, subject, subject]
         with connect() as db:
             db.execute('BEGIN')
-            if project_id:
+            if material_id:
+                require_material_catalog(db, self.user)
+            elif project_id:
                 enter_project(db, project_id, self.user)
                 if kind in ('user', 'login'):
                     raise Problem('请在系统设置查看用户操作日志', 404)
             elif kind not in ('user', 'login'):
                 self.require_admin()
-            if kind == 'user':
+            if kind == 'material' and (project_id or material_id):
+                material = part_for_bom(db, subject)
+                owner = material['project_id']
+                admin = self.user['role'] == 'admin'
+                memberships = {row[0] for row in db.execute('SELECT project_id FROM project_members WHERE user_id=?',
+                                                           (self.user['id'],))}
+                source_access = admin or owner in memberships
+                marks = ','.join('?' for _ in BOM_MATERIAL_ACTIONS)
+                conditions.append(f"""((? AND a.project_id=?) OR (a.action IN ({marks}) AND
+                    (? OR EXISTS (SELECT 1 FROM project_members m WHERE m.project_id=a.project_id AND m.user_id=?))))""")
+                params.extend((source_access, owner, *BOM_MATERIAL_ACTIONS, source_access, self.user['id']))
+            elif kind == 'user':
                 if self.user['role'] != 'admin':
                     conditions.append("""((a.project_id IS NULL AND
                         (a.actor_id=? OR a.action IN ('登录','退出登录'))) OR
@@ -2475,7 +3165,7 @@ class Handler(BaseHTTPRequestHandler):
             and not permissions.can(db, db.project_id, self.user, 'engineering')
         ):
             require_project_role(db, db.project_id, self.user, 'warehouse')
-        elif resource in ('products', 'parts', 'material-cells', 'material-links', 'material-children', 'material-parents',
+        elif resource in ('products', 'product-molds', 'parts', 'material-cells', 'material-links', 'material-children', 'material-parents',
                           'bom-versions', 'bom-lines', 'bom-materials', 'bom-import', 'electronic-import', 'files', 'deleted-parts'):
             require_project_role(db, db.project_id, self.user, 'engineering')
         if resource=='electronic-import' and id=='commit' and method=='POST': return self.commit_electronic_import(db,d)
@@ -2506,16 +3196,48 @@ class Handler(BaseHTTPRequestHandler):
                    for t in ('products','parts','suppliers','purchases','movements')):
                 raise Problem('仅空项目可以载入示例')
             seed_demo(db); log_activity(db, self.user, '载入示例', '', '示例数据'); return {'ok':True}
+        if resource == 'product-molds':
+            if method == 'POST' and id is None:
+                product = exists(db, 'products', d.get('product_id'))
+                values = self.product_mold_values(db, d)
+                id = uid()
+                stamp = now()
+                insert_scoped(db, 'product_molds', dict(id=id, product_id=product['id'],
+                              created_at=stamp, updated_at=stamp, **values))
+                if 'part_ids' in d:
+                    self.set_mold_parts(db, id, d['part_ids'])
+                log_activity(db, self.user, '新增模具', id, values['name'], product['name'])
+                return {'id': id}
+            if method in ('PUT', 'DELETE') and id:
+                mold = exists(db, 'product_molds', id)
+                product = exists(db, 'products', mold['product_id'])
+                if method == 'DELETE':
+                    db.execute('DELETE FROM product_molds WHERE project_id=? AND id=?', (db.project_id, id))
+                    log_activity(db, self.user, '删除模具', id, mold['name'], product['name'])
+                else:
+                    values = self.product_mold_values(db, {**mold, **d})
+                    db.execute('''UPDATE product_molds SET name=:name,code=:code,supplier_id=:supplier_id,
+                        cost=:cost,moq=:moq,amortization_qty=:amortization_qty,notes=:notes,updated_at=:stamp
+                        WHERE project_id=:project_id AND id=:id''',
+                        dict(**values, stamp=now(), project_id=db.project_id, id=id))
+                    if 'part_ids' in d:
+                        self.set_mold_parts(db, id, d['part_ids'])
+                    log_activity(db, self.user, '修改模具', id, values['name'], product['name'])
+                return {'id': id}
+            raise Problem('不支持的操作', 405)
         if resource=='bom-versions' and method=='POST':
             exists(db,'products',d['product_id']); bid=uid()
             db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),d['product_id']))
             insert_scoped(db, 'bom_versions', dict(id=bid, product_id=d['product_id'], name=automatic_version(db,d['product_id']), notes=str(d.get('notes','')), created_at=now()))
+            version = exists(db, 'bom_versions', bid)
             if d.get('copy_from'):
                 v=exists(db,'bom_versions',d['copy_from'])
                 if v['product_id']!=d['product_id']: raise Problem('仅可复制本产品的 BOM')
                 for line in db.execute('SELECT * FROM bom_lines WHERE version_id=? ORDER BY rowid',(v['id'],)).fetchall():
-                    insert_bom_line(db, bid, line['part_id'], line['qty'], line['reference'], line['notes'])
-            version = exists(db, 'bom_versions', bid)
+                    insert_bom_line(db, bid, line['part_id'], line['qty'], line['reference'], line['notes'],
+                                    part_project=line['part_project_id'])
+                    log_bom_material(db, self.user, version, part_for_bom(db, line['part_id']), line['qty'],
+                                     line['reference'], source=f'复制版本 {v["name"]}')
             log_activity(db, self.user, '新建 BOM 版本', version['product_id'], version['name'])
             return {'id':bid}
         if resource=='bom-materials' and method=='POST':
@@ -2529,20 +3251,31 @@ class Handler(BaseHTTPRequestHandler):
                 version=exists(db,'bom_versions',line['version_id'])
                 db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
                 db.execute('DELETE FROM bom_lines WHERE id=?',(id,))
-                part = exists(db, 'parts', line['part_id'])
-                log_activity(db, self.user, 'BOM 移除物料', part['id'], f"{part['code']} {part['name']}", version['name'])
+                part = part_for_bom(db, line['part_id'])
+                log_bom_material(db, self.user, version, part, line['qty'], line['reference'], removed=True)
                 return {'ok':True}
             if method in ('POST','PUT'):
-                if method=='PUT': d={**exists(db,'bom_lines',id),**d}
-                version=exists(db,'bom_versions',d['version_id']); part=active_part(db,d['part_id'])
+                previous = exists(db, 'bom_lines', id) if method == 'PUT' else None
+                if previous:
+                    d = {**previous, **d}
+                version = exists(db, 'bom_versions', d['version_id'])
+                part = available_bom_part(db, d['part_id'])
                 db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
                 values=(d['version_id'],d['part_id'],num(d.get('qty'),True),str(d.get('reference','')),str(d.get('notes','')))
-                if method=='POST':
-                    id = insert_bom_line(db, *values)
+                if not previous:
+                    id = insert_bom_line(db, *values, part_project=part['project_id'])
                 else:
-                    exists(db,'bom_lines',id); db.execute('UPDATE bom_lines SET version_id=?,part_id=?,qty=?,reference=?,notes=? WHERE id=?',(*values,id))
-                log_activity(db, self.user, 'BOM 新增物料' if method=='POST' else 'BOM 修改物料',
-                             part['id'], f"{part['code']} {part['name']}", f"{version['name']} · 用量 {values[2]:g}")
+                    db.execute('UPDATE bom_lines SET version_id=?,part_id=?,qty=?,reference=?,notes=?,part_project_id=? WHERE id=?',
+                               (*values, part['project_id'], id))
+                    if (previous['version_id'], previous['part_id']) != values[:2]:
+                        old_version = exists(db, 'bom_versions', previous['version_id'])
+                        old_part = part_for_bom(db, previous['part_id'])
+                        log_bom_material(db, self.user, old_version, old_part, previous['qty'],
+                                         previous['reference'], removed=True)
+                        previous = None
+                    elif tuple(previous[key] for key in ('qty', 'reference', 'notes')) == values[2:]:
+                        return {'id': id}
+                log_bom_material(db, self.user, version, part, values[2], values[3], previous=previous)
                 return {'id':id}
         if resource=='bom-import' and method=='POST':
             version=exists(db,'bom_versions',d['version_id'])
@@ -2562,9 +3295,7 @@ class Handler(BaseHTTPRequestHandler):
                     level = material_level(row.get('material_level') or d.get('material_level') or 1)
                     category = str(row.get('category') or '').strip() or BUILTIN_MATERIAL_CATEGORIES[level - 1]
                     part_id = find_bom_import_part(db, version['product_id'], code, external, name, spec, level, category)
-                    if part_id:
-                        active_part(db, part_id)
-                    else:
+                    if not part_id:
                         if not name:
                             raise Problem('找不到对应物料，请填写物料名称以便自动新建')
                         part_id = self.mutate(db, '/api/parts', 'POST', {
@@ -2573,8 +3304,8 @@ class Handler(BaseHTTPRequestHandler):
                             'price': bom_import_price(row.get('price')),
                         })['id']
                         created += 1
-                    insert_bom_line(db, version['id'], part_id, qty, str(row.get('reference') or ''),
-                                    str(row.get('notes') or ''), upsert=True)
+                    save_bom_import_line(db, self.user, version, available_bom_part(db, part_id), qty,
+                                         str(row.get('reference') or ''), str(row.get('notes') or ''), 'CSV 导入')
                     count += 1
                 except Problem as exc:
                     raise Problem(f'第 {index} 行：{exc.message}', exc.status) from exc
@@ -2650,6 +3381,11 @@ class Handler(BaseHTTPRequestHandler):
                     ).fetchone()
                     if has_bom and d.get('delete_bom') is not True:
                         raise Problem('请确认一并删除该产品的所有 BOM 版本和明细', 409)
+                    for line in db.execute('''SELECT l.* FROM bom_lines l JOIN bom_versions v ON v.id=l.version_id
+                        WHERE v.product_id=?''', (id,)).fetchall():
+                        version = exists(db, 'bom_versions', line['version_id'])
+                        log_bom_material(db, self.user, version, part_for_bom(db, line['part_id']),
+                                         line['qty'], line['reference'], removed=True, source='删除产品')
                     db.execute('DELETE FROM bom_versions WHERE product_id=?', (id,))
                     # Clear the legacy numbering reference before removing the product.
                     db.execute('UPDATE parts SET numbering_product_id=NULL WHERE numbering_product_id=?', (id,))
@@ -2673,12 +3409,16 @@ class Handler(BaseHTTPRequestHandler):
                 level=material_level(d.get('material_level',1))
                 category=material_category(db, d.get('category'), level)
                 if old and old['material_level']!=level and db.execute('SELECT 1 FROM material_links WHERE parent_id=? OR child_id=?',(id,id)).fetchone(): raise Problem('请先解除一级、二级物料关联，再更改级别')
+                if old and old['material_level'] != level and db.execute(
+                    'SELECT 1 FROM product_mold_parts WHERE part_id=? LIMIT 1', (id,),
+                ).fetchone():
+                    raise Problem('请先解除模具关联，再更改物料级别', 409)
                 serial=old['material_serial'] if old else next_material_serial(db)
                 same_classification=old and (old['category'],old['material_level'])==(category,level)
                 code=old['code'] if same_classification else material_code(category,level,serial)
                 if old and code!=old['code']:
                     insert_scoped(db, 'material_code_aliases', dict(code=old['code'], part_id=id), 'ON CONFLICT(code) DO NOTHING')
-                values.update(code=code,material_serial=serial,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(d.get('min_stock') or 0),location=str(d.get('location') or '').strip(),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
+                values.update(code=code,material_serial=serial,material_level=level,category=category,spec=str(d.get('spec','')),external_code=str(d.get('external_code','')).strip(),brand=str(d.get('brand','')).strip(),unit=str(d.get('unit','') or '').strip() or 'PCS',price=num(d.get('price') or 0),min_stock=num(50 if d.get('min_stock') in (None, '') else d['min_stock']),location=str(d.get('location') or '').strip(),sub_product_id=None,notes=str(d.get('notes','')),updated_at=now())
             else: values.update({k:str(d.get(k,'')) for k in ('contact','phone','email','address','notes')})
             if resource in RESPONSIBILITIES:
                 column = RESPONSIBILITIES[resource]
@@ -2702,39 +3442,79 @@ class Handler(BaseHTTPRequestHandler):
             log_activity(db, self.user, ('新增' if method == 'POST' else '修改') + noun, id, subject)
             return {'id':id}
         raise Problem('接口不存在或不支持该操作',404)
+    def product_mold_values(self, db, data):
+        supplier_id = data.get('supplier_id') or None
+        if supplier_id:
+            exists(db, 'suppliers', supplier_id)
+        cost = data.get('cost')
+        return dict(name=required(data.get('name'), '模具名称'), code=str(data.get('code') or '').strip(),
+                    supplier_id=supplier_id, cost=None if cost in (None, '') else num(cost),
+                    moq=optional_mold_quantity(data.get('moq'), 'MOQ'),
+                    amortization_qty=optional_mold_quantity(data.get('amortization_qty'), '均摊数量'),
+                    notes=str(data.get('notes') or '').strip())
+
+    def set_mold_parts(self, db, mold_id, part_ids):
+        if not isinstance(part_ids, list) or any(not isinstance(id, str) or not id for id in part_ids):
+            raise Problem('请选择要关联的一级物料')
+        existing = {row[0] for row in db.execute(
+            'SELECT part_id FROM product_mold_parts WHERE mold_id=?', (mold_id,))}
+        selected = dict.fromkeys(part_ids)
+        for part_id in selected:
+            if part_id not in existing and available_bom_part(db, part_id)['material_level'] != 1:
+                raise Problem('模具只能关联一级物料')
+        db.executemany('DELETE FROM product_mold_parts WHERE mold_id=? AND part_id=?',
+                       ((mold_id, part_id) for part_id in existing - selected.keys()))
+        db.executemany('INSERT INTO product_mold_parts(mold_id,part_id) VALUES(?,?)',
+                       ((mold_id, part_id) for part_id in selected if part_id not in existing))
+
     def electronic_preview(self, project_id):
         fields,uploads=self.multipart()
         if len(uploads)!=1: raise Problem('请选择一个 XLSX 或 CSV 文件')
-        filename,mime,blob=uploads[0]
+        filename, _, blob = uploads[0]
         try:
-            result=parse_electronic_file(blob,filename,fields.get('sheet',''))
+            header_row = int(fields['header_row']) if fields.get('header_row') else None
+            mapping = json.loads(fields['column_mapping']) if 'column_mapping' in fields else None
+            result = parse_electronic_file(blob, filename, fields.get('sheet', ''), header_row=header_row,
+                                           column_mapping=mapping, inspect_columns=True)
         except (ElectronicBomError,ValueError,KeyError,RuntimeError) as exc: raise Problem(str(exc))
         with connect() as db:
             db.execute('BEGIN')
             self.project_writer(db, project_id, 'engineering')
-            candidates=electronic_candidates(db)
+            candidates, by_code = electronic_candidates(db)
             for row in result['rows']:
+                matches = electronic_external_matches(row, by_code)
+                row['reuse_match_ids'] = [part['id'] for part in matches]
                 try:
-                    material=self.match_electronic_material(db,row,candidates)
+                    material = self.match_electronic_material(db, row, matches, candidates)
                     row.update(match_id=material['id'] if material else None,match_code=material['code'] if material else '',match_price=material['price'] if material else None)
                     if material and material['unit'].casefold()!=row['unit'].casefold(): row['warnings'].append('现有单位不同，复用时保留现有单位')
                 except Problem as exc: row['match_error']=exc.message;row['selected']=False
         self.send(result)
-    def match_electronic_material(self,db,row,candidates=None):
-        if row.get('target_part_id')=='__new__': return None
-        if row.get('target_part_id'):
-            material=active_part(db,row['target_part_id'])
-            if material['material_level']!=2: raise Problem('只能复用二级物料')
+    def match_electronic_material(self, db, row, matches, candidates):
+        target = row.get('target_part_id')
+        if target == '__new__':
+            if matches:
+                raise Problem('外部料号已有匹配物料，请复用现有物料', 409)
+            return None
+        code = row.get('internal_code', '').strip()
+        if code and not target:
+            found = db.execute('''SELECT id FROM parts WHERE code=?
+                UNION ALL SELECT part_id FROM material_code_aliases WHERE code=? LIMIT 1''', (code, code)).fetchone()
+            if not found:
+                raise Problem('系统物料编号不存在：' + code)
+            target = found[0]
+        if target:
+            material = available_bom_part(db, target)
+            if material['material_level'] != 2:
+                raise Problem('只能复用二级物料')
+            if matches and not any(part['id'] == target for part in matches):
+                raise Problem('所选物料与表格外部料号不一致', 409)
             return material
-        code=str(row.get('internal_code','')).strip()
-        if code:
-            found=find_part_code(db, code)
-            if not found: raise Problem('系统物料编号不存在：'+code)
-            material=active_part(db,found[0])
-            if material['material_level']!=2: raise Problem('系统编号对应的不是二级物料')
-            return material
+        if matches:
+            if len(matches) != 1:
+                raise Problem('外部料号匹配到多个二级物料，请选择要复用的料号', 409)
+            return matches[0]
         key=lambda r: tuple(str(r.get(k) or '').strip().casefold() for k in ('external_code','name','spec','brand'))
-        if candidates is None: candidates=electronic_candidates(db)
         matches=[p for p in candidates if key(p)==key(row)]
         if len(matches)>1: raise Problem('有多个匹配物料，请手动选择复用记录')
         return matches[0] if matches else None
@@ -2753,7 +3533,7 @@ class Handler(BaseHTTPRequestHandler):
         parent=active_part(db,parent_id) if parent_id else None
         if parent and parent['material_level']!=1: raise Problem('关联目标必须是一级物料')
         version=exists(db,'bom_versions',version_id) if version_id else None
-        candidates=electronic_candidates(db)
+        candidates, by_code = electronic_candidates(db)
         groups={};created=0;created_ids=set();reused=set()
         for index,raw in enumerate(rows,1):
             if not isinstance(raw,dict): raise Problem('导入行格式错误')
@@ -2761,14 +3541,19 @@ class Handler(BaseHTTPRequestHandler):
             row['name']=required(row['name'],f'第 {index} 行名称')
             if any(len(v)>1000 for v in row.values()): raise Problem(f'第 {index} 行文本过长')
             row['qty']=num(raw.get('qty'),True)
-            row['price']=num(raw.get('price') if raw.get('price') is not None else 0)
-            material=self.match_electronic_material(db,row,candidates)
+            raw_price = raw.get('price')
+            row['price']=num(0 if raw_price in (None, '') else raw_price)
+            material = self.match_electronic_material(db, row, electronic_external_matches(row, by_code), candidates)
             if material is None:
                 saved=self.mutate(db,'/api/parts','POST',{**row,'material_level':2,'category':'电子物料','unit':row['unit'] or 'PCS'})
-                material=exists(db,'parts',saved['id']);candidates.append(material);created+=1;created_ids.add(material['id'])
+                material = exists(db, 'parts', saved['id'])
+                add_electronic_candidate(db.project_id, candidates, by_code, material)
+                created += 1
+                created_ids.add(material['id'])
             else:
                 if material['id'] not in created_ids: reused.add(material['id'])
-                if d.get('update_existing_prices'):
+                if (material['project_id'] == db.project_id and d.get('update_existing_prices')
+                        and raw_price not in (None, '')):
                     db.execute('UPDATE parts SET price=?,updated_at=? WHERE id=?',(row['price'],now(),material['id']))
             mid=material['id']
             if mid not in groups: groups[mid]={'qty':0,'reference':[],'notes':[]}
@@ -2781,9 +3566,10 @@ class Handler(BaseHTTPRequestHandler):
             if parent_id:
                 link_id=link_material(db,parent_id,mid,group['qty'])
                 db.execute('UPDATE material_links SET reference=?,notes=? WHERE id=?',(reference,notes,link_id))
-            if version_id:
-                insert_bom_line(db, version_id, mid, group['qty'], reference, notes, upsert=True)
-            total+=exists(db,'parts',mid)['price']*group['qty']
+            material = available_bom_part(db, mid)
+            if version:
+                save_bom_import_line(db, self.user, version, material, group['qty'], reference, notes, '电子物料导入')
+            total += material['price'] * group['qty']
         if version: db.execute('UPDATE products SET updated_at=? WHERE id=?',(now(),version['product_id']))
         result={'rows':len(rows),'materials':len(groups),'created':created,'reused':len(reused),'reference_total':round(total,6)}
         insert_scoped(db, 'import_runs', dict(id=request_id, fingerprint=fingerprint, result=json.dumps(result), created_at=now()))
@@ -2956,25 +3742,7 @@ class Handler(BaseHTTPRequestHandler):
                 raise Problem('需要管理员权限', 403)
             enter_project(db, project_id, user, write=True)
             part = exists(db, 'parts', id)
-            if not part['deleted_at']:
-                raise Problem('请先将物料移至已删除物料', 409)
-            blockers = [
-                label for table, label in (
-                    ('bom_lines', 'BOM'), ('purchase_lines', '采购明细'), ('movements', '库存流水'),
-                )
-                if db.execute(f'SELECT 1 FROM {table} WHERE part_id=? LIMIT 1', (id,)).fetchone()
-            ]
-            if blockers:
-                raise Problem('物料仍被' + '、'.join(blockers) + '引用，无法永久删除', 409)
-            ids = [row[0] for row in db.execute(
-                "SELECT id FROM files WHERE project_id=? AND owner_type='parts' AND owner_id=?", (project_id, id))]
-            if ids:
-                files.enter_context(stage_upload_deletion(ids))
-            db.execute("DELETE FROM files WHERE project_id=? AND owner_type='parts' AND owner_id=?", (project_id, id))
-            db.execute('DELETE FROM quotes WHERE part_id=?', (id,))
-            db.execute('DELETE FROM parts WHERE id=?', (id,))
-            log_activity(db, user, '永久删除物料', '', part['code'])
-            touch_project(db)
+            purge_part_record(db, files, part, user)
         self.send({'ok': True})
 
     def list_assets(self):
@@ -3027,7 +3795,7 @@ class Handler(BaseHTTPRequestHandler):
             """, (kind, kind, term, page_size + 1, (page - 1) * page_size)).fetchall()
         return self.send({'items': [dict(row) for row in rows[:page_size]], 'more': len(rows) > page_size})
 
-    def serve_file(self, id, *, admin_assets=False):
+    def serve_file(self, id, *, admin_assets=False, shared_material=None):
         with FILE_LOCK:
             with connect() as db:
                 db.execute('BEGIN')
@@ -3038,6 +3806,17 @@ class Handler(BaseHTTPRequestHandler):
                 if admin_assets:
                     if user['role'] != 'admin':
                         raise Problem('需要管理员权限', 403)
+                elif shared_material:
+                    project_id, part_id = shared_material
+                    if project_id:
+                        enter_project(db, project_id, user)
+                    else:
+                        require_material_catalog(db, user)
+                    first_image = db.execute(f'''SELECT {MATERIAL_PRIMARY_IMAGE} FROM parts p
+                        JOIN projects j ON j.id=p.project_id
+                        WHERE p.id=? AND p.deleted_at IS NULL AND j.deleted_at IS NULL''', (part_id,)).fetchone()
+                    if not first_image or first_image[0] != id:
+                        raise Problem('物料图片不存在', 404)
                 else:
                     enter_project(db, f['project_id'], user)
                 name = f['display_name'] or f['name']
@@ -3056,6 +3835,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise Problem('文件未找到', 404) from exc
         with source:
             image_type = image_mime(source.read(12)) if f['kind'] == 'image' else None
+            if shared_material and not image_type:
+                raise Problem('物料图片不存在', 404)
             source.seek(0)
             content_type = image_type or ('application/pdf' if f['mime'] == 'application/pdf' else 'application/octet-stream')
             stat = os.fstat(source.fileno())
@@ -3229,6 +4010,9 @@ if __name__=='__main__':
     print(f'捷程未来PLM  http://{args.host}:{args.port}  数据目录：{DATA}',flush=True)
     stop_cleanup = threading.Event()
     threading.Thread(target=run_image_cleanup, args=(stop_cleanup,), daemon=True).start()
+    threading.Thread(target=feishu_bot.run, args=(
+        DATA, connect, stop_cleanup, os.getenv('PLM_PUBLIC_URL', 'https://work.makagic.com/JPLM').rstrip('/'),
+    ), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:

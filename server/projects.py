@@ -8,14 +8,23 @@ INVENTORY_TIME_VERSION = 23
 COVER_SIZE_VERSION = 24
 IMAGE_NAME_VERSION = 25
 PROJECT_ROLE_VERSION = 26
-VERSION = PROJECT_ROLE_VERSION
+SHARED_BOM_VERSION = 27
+MATERIAL_PROJECT_VERSION = 28
+SHARED_MATERIAL_LINK_VERSION = 29
+PRODUCT_MOLD_VERSION = 30
+MOLD_PART_VERSION = 31
+MOLD_MOQ_VERSION = 32
+MOLD_AMORTIZATION_VERSION = 33
+VERSION = MOLD_AMORTIZATION_VERSION
 LEGACY_PROJECT_ID = 'legacy'
 BUSINESS_TABLES = (
     'products', 'parts', 'suppliers', 'quotes', 'bom_versions', 'bom_lines',
     'purchases', 'purchase_lines', 'movements', 'files', 'material_links',
     'material_code_aliases',
 )
-SCOPED_TABLES = (*BUSINESS_TABLES, 'import_runs')
+PROJECT_BUSINESS_TABLES = (*BUSINESS_TABLES, 'product_molds')
+SCOPED_TABLES = (*PROJECT_BUSINESS_TABLES, 'import_runs')
+LEGACY_SCOPED_TABLES = (*BUSINESS_TABLES, 'import_runs')
 RELATIONS = {
     'parts': (('sub_product_id', 'products'), ('numbering_product_id', 'products')),
     'quotes': (('part_id', 'parts'), ('supplier_id', 'suppliers')),
@@ -33,6 +42,30 @@ RELATIONS = {
 SYSTEM_ACTIONS = (
     '登录', '退出登录', '新增用户', '修改用户', '重置密码', '恢复备份',
 )
+
+PRODUCT_MOLD_TABLE = """
+CREATE TABLE IF NOT EXISTS product_molds (
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    id TEXT PRIMARY KEY,
+    product_id TEXT NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+    name TEXT NOT NULL CHECK(trim(name)<>''),
+    code TEXT NOT NULL DEFAULT '',
+    supplier_id TEXT REFERENCES suppliers(id) ON DELETE SET NULL,
+    cost REAL CHECK(cost>=0),
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(project_id,product_id) REFERENCES products(project_id,id),
+    FOREIGN KEY(project_id,supplier_id) REFERENCES suppliers(project_id,id)
+)
+"""
+MOLD_PART_TABLE = """
+CREATE TABLE IF NOT EXISTS product_mold_parts (
+    mold_id TEXT NOT NULL REFERENCES product_molds(id) ON DELETE CASCADE,
+    part_id TEXT NOT NULL REFERENCES parts(id),
+    PRIMARY KEY (mold_id,part_id)
+)
+"""
 
 PROJECT_TABLE = """
 CREATE TABLE projects (
@@ -61,6 +94,12 @@ MATERIAL_CATEGORY_TABLE = """CREATE TABLE IF NOT EXISTS material_categories (
     project_id TEXT NOT NULL REFERENCES projects(id),
     name_key TEXT NOT NULL, name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 64),
     PRIMARY KEY (project_id,name_key)
+)"""
+
+MATERIAL_PROJECT_TABLE = """CREATE TABLE IF NOT EXISTS material_projects (
+    part_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL REFERENCES projects(id),
+    PRIMARY KEY (part_id, project_id)
 )"""
 
 
@@ -123,6 +162,58 @@ def migrate_inventory(db):
         db.execute('PRAGMA foreign_keys=ON')
 
 
+def migrate_shared_bom(db):
+    if 'part_project_id' in {row['name'] for row in db.execute('PRAGMA table_info(bom_lines)')}:
+        return
+    db.execute('''CREATE TABLE bom_lines_shared (
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        id TEXT PRIMARY KEY,
+        version_id TEXT NOT NULL REFERENCES bom_versions(id) ON DELETE CASCADE,
+        part_id TEXT NOT NULL REFERENCES parts(id),
+        qty REAL NOT NULL CHECK(qty>0),
+        reference TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        part_project_id TEXT NOT NULL,
+        UNIQUE(version_id,part_id),
+        FOREIGN KEY(project_id,version_id) REFERENCES bom_versions(project_id,id),
+        FOREIGN KEY(part_project_id,part_id) REFERENCES parts(project_id,id)
+    )''')
+    db.execute('''INSERT INTO bom_lines_shared
+        SELECT project_id,id,version_id,part_id,qty,reference,notes,project_id FROM bom_lines ORDER BY rowid''')
+    db.execute('DROP TABLE bom_lines')
+    db.execute('ALTER TABLE bom_lines_shared RENAME TO bom_lines')
+    db.execute('CREATE INDEX idx_bom_lines_project ON bom_lines(project_id)')
+    db.execute('CREATE INDEX idx_bom_lines_part ON bom_lines(part_id)')
+
+
+def migrate_shared_material_links(db):
+    if 'child_project_id' in {row['name'] for row in db.execute('PRAGMA table_info(material_links)')}:
+        return
+    db.execute('''CREATE TABLE material_links_shared (
+        project_id TEXT NOT NULL REFERENCES projects(id),
+        id TEXT PRIMARY KEY,
+        parent_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
+        child_id TEXT NOT NULL REFERENCES parts(id) ON DELETE CASCADE,
+        qty REAL NOT NULL DEFAULT 1 CHECK(qty>0),
+        created_at TEXT NOT NULL,
+        reference TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        child_project_id TEXT NOT NULL,
+        UNIQUE(parent_id,child_id),
+        CHECK(parent_id<>child_id),
+        FOREIGN KEY(project_id,parent_id) REFERENCES parts(project_id,id),
+        FOREIGN KEY(child_project_id,child_id) REFERENCES parts(project_id,id)
+    )''')
+    db.execute('''INSERT INTO material_links_shared
+        SELECT project_id,id,parent_id,child_id,qty,created_at,reference,notes,project_id
+        FROM material_links ORDER BY rowid''')
+    db.execute('DROP TABLE material_links')
+    db.execute('ALTER TABLE material_links_shared RENAME TO material_links')
+    db.execute('CREATE INDEX idx_material_links_project ON material_links(project_id)')
+    db.execute('CREATE INDEX idx_material_links_child ON material_links(child_id)')
+    db.execute('CREATE INDEX idx_material_links_child_project ON material_links(child_project_id)')
+
+
 def _scoped_schema(table, legacy_sql):
     """Keep v8 columns and constraints and add ownership constraints."""
     start = legacy_sql.index('(')
@@ -162,7 +253,7 @@ def migrate_projects(db, stamp):
         placeholders = ','.join('?' for _ in SYSTEM_ACTIONS)
         business_log = f'action NOT IN ({placeholders})'
         has_data = any(db.execute(f'SELECT 1 FROM {table} LIMIT 1').fetchone()
-                       for table in SCOPED_TABLES)
+                       for table in LEGACY_SCOPED_TABLES)
         if has_data or db.execute(f'SELECT 1 FROM activity WHERE {business_log} LIMIT 1', SYSTEM_ACTIONS).fetchone():
             owner = db.execute("SELECT id FROM users WHERE role='admin' ORDER BY rowid LIMIT 1").fetchone()
             db.execute('INSERT INTO projects VALUES(?,?,?,?,?,?,?)',
@@ -171,13 +262,13 @@ def migrate_projects(db, stamp):
             db.execute('INSERT INTO project_members SELECT ?,id FROM users', (LEGACY_PROJECT_ID,))
             db.execute(f'UPDATE activity SET project_id=? WHERE {business_log}',
                        (LEGACY_PROJECT_ID, *SYSTEM_ACTIONS))
-        for table in SCOPED_TABLES:
+        for table in LEGACY_SCOPED_TABLES:
             sql = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()[0]
             db.execute(f'ALTER TABLE {table} RENAME TO old_{table}')
             db.execute(_scoped_schema(table, sql))
             db.execute(f'INSERT INTO {table} SELECT ?,old_{table}.* FROM old_{table} ORDER BY rowid',
                        (LEGACY_PROJECT_ID,))
-        for table in reversed(SCOPED_TABLES):
+        for table in reversed(LEGACY_SCOPED_TABLES):
             db.execute(f'DROP TABLE old_{table}')
         db.execute("CREATE UNIQUE INDEX idx_product_english_code ON products(project_id,english_code) WHERE english_code<>''")
         db.execute('CREATE UNIQUE INDEX idx_material_serial ON parts(material_serial)')
@@ -186,7 +277,7 @@ def migrate_projects(db, stamp):
         db.execute('CREATE INDEX idx_files_owner ON files(owner_type,owner_id)')
         db.execute('CREATE INDEX idx_purchase_lines_order ON purchase_lines(purchase_id)')
         db.execute('CREATE INDEX idx_project_activity ON activity(project_id,id)')
-        for table in SCOPED_TABLES:
+        for table in LEGACY_SCOPED_TABLES:
             db.execute(f'CREATE INDEX idx_{table}_project ON {table}(project_id)')
         # Files have two possible owner tables. Use the same ownership check on
         # writes as for a normal FK, while preserving historical file records.

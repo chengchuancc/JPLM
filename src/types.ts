@@ -9,8 +9,28 @@ export type Product = {
   created_at: string;
   updated_at: string;
 };
+export type ProductMold = {
+  id: string;
+  product_id: string;
+  name: string;
+  code: string;
+  supplier_id: string | null;
+  cost: number | null;
+  moq: number | null;
+  amortization_qty: number | null;
+  notes: string;
+  part_ids: string[];
+};
 export type Part = {
+  project_id: string;
+  project_name?: string;
+  shared_image_id?: string | null;
+  custodian_name?: string | null;
+  secondary_cost?: number | null;
+  project_assignments?: { id: string; name: string; assigned: boolean; required: boolean }[];
   deleted_at: string | null;
+  purge_after?: string | null;
+  purge_blockers?: string[];
   custodian_id: string | null;
   external_code: string;
   brand: string;
@@ -104,6 +124,7 @@ export type Quote = {
   url: string;
 };
 export type MaterialLink = {
+  project_id: string;
   reference: string;
   notes: string;
   id: string;
@@ -158,7 +179,9 @@ export type State = {
   material_links: MaterialLink[];
   material_code_aliases: CodeAlias[];
   products: Product[];
+  product_molds: ProductMold[];
   parts: Part[];
+  shared_parts: Part[];
   deleted_parts: Part[];
   suppliers: Supplier[];
   bom_versions: Version[];
@@ -176,7 +199,9 @@ export const emptyState: State = {
   material_links: [],
   material_code_aliases: [],
   products: [],
+  product_molds: [],
   parts: [],
+  shared_parts: [],
   deleted_parts: [],
   suppliers: [],
   bom_versions: [],

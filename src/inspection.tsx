@@ -1,3 +1,4 @@
+import { TableScroll } from "./table-scroll";
 import { randomUuid } from "./random-uuid";
 import { useEffect, useRef, useState, type RefObject } from "react";
 import { usePageState } from "./navigation";
@@ -6,6 +7,7 @@ import type { IScannerControls } from "@zxing/browser";
 import { DeviceShipmentLink, RelatedRecordDialog, formatTime, ResultLabel, sections,
   type DeviceShipment, type RelatedTarget } from "./record-details";
 import "./inspection.css";
+import { TableTextCell } from "./table-text-cell";
 
 type Value = string | number | string[];
 type Values = Record<string, Value>;
@@ -805,7 +807,7 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
         </div>
       </form>
       {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="table-wrap inspection-record-table" aria-busy={busy}>
+      <TableScroll className="inspection-record-table" aria-busy={busy}>
         <table>
           <thead><tr>
             {sortHeader("serial", "S/N")}{sortHeader("prefix", "产品编号")}{sortHeader("production_date", "生产日期")}
@@ -821,9 +823,12 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
               <td className="mono">{record.prefix}</td><td>{record.production_date || "—"}</td>
               <td><ResultLabel value={record.result} /></td>
               <td>{record.operator_name || "—"}</td>
-              {Array.from(columns, ([key]) => {
+              {Array.from(columns, ([key, label]) => {
                 const value = record.values[key];
-                return <td key={key}>{Array.isArray(value) ? value.join("、") : value ?? "—"}</td>;
+                const display = Array.isArray(value) ? value.join("、") : value;
+                return label === "备注"
+                  ? <td key={key} className="table-note-column"><TableTextCell value={display} label={label} /></td>
+                  : <td key={key}>{display ?? "—"}</td>;
               })}
               <td>{formatTime(record.updated_at)}</td>
               {admin && !readOnly && <td><button type="button" className="btn small"
@@ -833,7 +838,7 @@ function InspectionHistory({ template, request, baseUrl, readOnly, admin, prefix
         </table>
         {!busy && !error && !data?.records.length && <p className="inspection-no-records">
           {deleted ? "暂无已删除记录" : "暂无检测记录"}</p>}
-      </div>
+      </TableScroll>
       <div className="inspection-paging">
         <label>每页 <select aria-label="每页记录数" value={perPage} onChange={(event) => {
           setPerPage(Number(event.target.value));
@@ -889,7 +894,7 @@ function DeviceRegistry({ request, prefix, refresh, readOnly, open, register }: 
       </form>
       {activePrefix && <p className="muted">产品编号 {activePrefix}</p>}
       {error && <p className="form-error" role="alert">{error}</p>}
-      <div className="table-wrap" aria-busy={loading}>
+      <TableScroll aria-busy={loading}>
         <table>
           <thead><tr><th>S/N</th><th>产品编号</th><th>生产日期</th><th>检测状态</th><th>检测记录</th>
             <th>发货收件人 / 订单</th><th>登记人</th><th>登记时间</th><th>操作</th></tr></thead>
@@ -911,7 +916,7 @@ function DeviceRegistry({ request, prefix, refresh, readOnly, open, register }: 
           ))}</tbody>
         </table>
         {!loading && !error && !data?.devices.length && <p className="inspection-no-records">暂无设备</p>}
-      </div>
+      </TableScroll>
       {pages > 1 && <div className="inspection-paging">
         <button type="button" className="btn small" disabled={page <= 1 || loading} onClick={() => setPage(page - 1)}>上一页</button>
         <span>{page} / {pages}</span>

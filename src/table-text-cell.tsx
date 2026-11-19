@@ -1,9 +1,14 @@
 import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import { createPortal } from "react-dom";
-import { Copy } from "lucide-react";
+import { Copy, Expand } from "lucide-react";
+import "./table-text-cell.css";
 
-export function ShippingTextCell({ value, label }: { value: string | number | undefined; label: string }) {
-  const content = String(value ?? "").trim();
+export function TableTextCell({ value, label, iconOnly = false }: {
+  value: string | number | undefined;
+  label: string;
+  iconOnly?: boolean;
+}) {
+  const content = String(value ?? "");
   const id = useId();
   const anchor = useRef<HTMLButtonElement>(null);
   const popup = useRef<HTMLDivElement>(null);
@@ -63,18 +68,19 @@ export function ShippingTextCell({ value, label }: { value: string | number | un
         selection.removeAllRanges();
         selection.addRange(range);
       }
-      setNotice("请手动复制" + label);
+      setNotice("请手动复制");
     }
   }
 
-  if (!content) return <span>—</span>;
+  if (!content.trim()) return iconOnly ? null : <span>—</span>;
   return <>
-    <button ref={anchor} type="button" className="shipping-text-trigger" title={"展开" + label}
+    <button ref={anchor} type="button" className={iconOnly ? "table-text-icon" : "table-text-trigger"} title={"展开" + label}
+      aria-label={iconOnly ? "展开" + label : undefined}
       aria-haspopup="dialog" aria-expanded={open} aria-controls={open ? id : undefined} onClick={toggle}>
-      {content}
+      {iconOnly ? <Expand size={13} aria-hidden="true" /> : content}
     </button>
     {position && createPortal(<div ref={popup} id={id} role="dialog" aria-label={"完整" + label}
-      className="shipping-text-popup" style={position} onKeyDown={(event) => {
+      className="table-text-popup" style={position} onKeyDown={(event) => {
         if (event.key !== "Escape") return;
         event.stopPropagation();
         setPosition(undefined);

@@ -1,19 +1,21 @@
+import { TableScroll } from "./table-scroll";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { GripVertical, SlidersHorizontal } from "lucide-react";
 import { TableOptionPicker } from "./material-category";
 import { materialCategoryTone } from "./option-tag";
 
 const fields = {
-  code: ["料号", 110],
-  photo: ["图片", 74],
-  name: ["名称", 185],
+  code: ["料号", 100],
+  photo: ["图片", 56],
+  name: ["名称", 144],
+  source_project: ["所属项目", 140],
   parents: ["关联一级物料", 212],
   spec: ["规格 / 封装", 155],
   external_code: ["外部料号", 130],
   brand: ["品牌", 110],
-  unit: ["单位", 78],
+  unit: ["单位", 62],
   category: ["类别", 134],
-  qty: ["用量", 88],
+  qty: ["用量", 82],
   price: ["单价", 92],
   subtotal: ["小计", 100],
   stock: ["库存", 82],
@@ -24,20 +26,19 @@ const fields = {
   notes: ["备注", 168],
   level: ["级别", 112],
   children: ["二级物料", 108],
-  actions: ["操作", 112],
+  actions: ["操作", 116],
 } as const;
 
 export type Column = keyof typeof fields;
 type Row = { id: string; cells: Partial<Record<Column, ReactNode>>; selectionLabel?: string };
 type RowSelection = { selected: ReadonlySet<string>; change: (ids: string[], checked: boolean) => void };
-const selectionWidth = 38;
+const selectionWidth = 32;
 type Widths = Partial<Record<Column, number>>;
 const maximumWidth = 640;
 function minimumWidth(id: Column, actionsWidth: number) {
   if (id === "code") return 100;
   if (id === "actions") return actionsWidth;
-  if (id === "photo") return 62;
-  if (id === "unit") return 68;
+  if (id === "photo" || id === "unit") return 54;
   if (id === "category" || id === "parents") return 112;
   return 80;
 }
@@ -156,7 +157,7 @@ export function MaterialTable({
   selection?: RowSelection;
   empty: ReactNode;
 }) {
-  const actionsWidth = tableId === "inventory" ? 136 : fields.actions[1];
+  const actionsWidth = tableId === "inventory" || tableId === "global-materials" ? 140 : fields.actions[1];
   const storageKey = "plm-columns-" + tableId;
   const [order, setOrder] = useState<Column[]>(() => {
     try {
@@ -260,7 +261,7 @@ export function MaterialTable({
     ].join(" ");
 
   return (
-    <div className="table-wrap" ref={wrap}>
+    <TableScroll ref={wrap} tabIndex={0} role="region" aria-label="物料明细">
       <table
         className="editable-table configurable-table"
         style={{
@@ -427,7 +428,7 @@ export function MaterialTable({
         </thead>
         <tbody>
           {rows.map(({ id, cells, selectionLabel }) => (
-            <tr key={id}>
+            <tr key={id} data-selected={selection?.selected.has(id) ? "" : undefined}>
               {selection && <td className="row-selection">
                 <input
                   type="checkbox"
@@ -437,7 +438,7 @@ export function MaterialTable({
                 />
               </td>}
               {visible.map((column) => (
-                <td key={column} className={cellClass(column)}>
+                <td key={column} data-column={column} className={cellClass(column)}>
                   {cells[column]}
                 </td>
               ))}
@@ -449,6 +450,6 @@ export function MaterialTable({
         {announcement}
       </span>
       {rows.length === 0 && empty}
-    </div>
+    </TableScroll>
   );
 }

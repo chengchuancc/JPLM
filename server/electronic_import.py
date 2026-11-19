@@ -15,13 +15,13 @@ class ElectronicBomError(ValueError):
 ALIASES = {
     'name': ('名称', '物料名称', '零件名称', '品名', '元件名称', 'name', 'comment', 'value'),
     'qty': ('单机用量', '单套用量', '数量', '用量', 'qty', 'quantity'),
-    'external_code': ('物料编号', '外部料号', '供应商料号', '商品编号', '料号', 'lcsc', 'lcscpartnumber', 'supplierpartnumber'),
+    'external_code': ('物料编号', '外部料号', '供应商料号', '商品编号', '料号', 'lcsc', 'lcscpartnumber', 'supplierpartnumber', 'Supplier Part'),
     'internal_code': ('系统编号', '系统物料编号', '物料编码', 'code'),
     'spec': ('封装', '规格型号', '规格', '型号', 'package', 'footprint', 'spec'),
     'brand': ('品牌', '厂商', '制造商', 'manufacturer', 'brand'),
     'notes': ('备注', '说明', 'notes', 'remark', 'remarks'),
     'reference': ('位号', '标号', 'designator', 'designators', 'reference'),
-    'price': ('单价', '参考单价', '采购单价', 'unitprice', 'price'),
+    'price': ('单价', '参考单价', '采购单价', 'unitprice', 'JLCPCB Price', 'price'),
     'source_total': ('总价', '小计', '金额', 'total', 'totalprice'),
     'unit': ('单位', '计量单位', 'unit'),
 }
@@ -151,6 +151,11 @@ def clean(value):
     return '' if value is None else str(value).strip()
 
 
+def excluded_component(name, notes):
+    return bool(re.search(r'不贴|不焊|不装|不安装|测试点|\bDNP\b|\bDNI\b', notes, re.I)
+                or normalized(name) in ('nc', 'testpoint'))
+
+
 def numeric(value, label, required=False):
     if value is None or clean(value) == '':
         if required:
@@ -167,7 +172,7 @@ def numeric(value, label, required=False):
     return round(n, 6)
 
 
-def parse_electronic_file(blob, filename, sheet_name=''):
+def parse_electronic_file(blob, filename, sheet_name='', *, header_row=None, column_mapping=None, inspect_columns=False):
     if not blob or len(blob) > 20 * 1024 * 1024:
         raise ElectronicBomError('文件为空或超过 20 MB')
     if filename.lower().endswith('.xlsx'):
@@ -179,20 +184,60 @@ def parse_electronic_file(blob, filename, sheet_name=''):
         sheets, selected, grid = ['CSV'], 'CSV', read_csv(blob)
     else:
         raise ElectronicBomError('请选择 XLSX 或 CSV 文件')
-    lookup = {normalized(alias): key for key, aliases in ALIASES.items() for alias in aliases}
-    header = None
-    mapping = {}
-    for index, (number, values) in enumerate(grid[:50]):
-        candidate = {}
-        for col, v in enumerate(values):
-            key = lookup.get(normalized(v))
-            if key and key not in candidate:
-                candidate[key] = col
-        if 'name' in candidate and 'qty' in candidate:
-            mapping, header = candidate, index
-            break
-    if header is None:
+    if not grid:
+        raise ElectronicBomError('工作表为空')
+    lookup = {normalized(alias): (key, priority) for key, aliases in ALIASES.items()
+              for priority, alias in enumerate(aliases)}
+
+    def detect(values):
+        picks = {}
+        for column, value in enumerate(values):
+            if match := lookup.get(normalized(value)):
+                key, priority = match
+                if key not in picks or priority < picks[key][0]:
+                    picks[key] = (priority, column)
+        return {key: column for key, (_, column) in picks.items()}
+
+    if header_row is not None:
+        header = next((index for index, (number, _) in enumerate(grid) if number == header_row), None)
+        if header is None:
+            raise ElectronicBomError('所选表头行不存在')
+        mapping = detect(grid[header][1])
+    else:
+        candidates = [(index, detect(values)) for index, (_, values) in enumerate(grid[:50])
+                      if any(clean(value) for value in values)]
+        if not candidates:
+            raise ElectronicBomError('工作表前 50 行为空')
+        header, mapping = next(((index, fields) for index, fields in candidates
+                                if {'name', 'qty'} <= fields.keys()), candidates[0])
+    width = max(len(values) for _, values in grid[header:])
+    if column_mapping is not None:
+        if (not isinstance(column_mapping, dict) or not column_mapping.keys() <= ALIASES.keys()
+                or any(type(column) is not int or not 0 <= column < width for column in column_mapping.values())
+                or len(set(column_mapping.values())) != len(column_mapping)):
+            raise ElectronicBomError('列匹配无效，每个字段请选择不同的有效列')
+        mapping = column_mapping
+    needs_mapping = not {'name', 'qty'} <= mapping.keys()
+    if needs_mapping and (not inspect_columns or column_mapping is not None):
         raise ElectronicBomError('未找到“名称”和“单机用量 / 数量”表头')
+    preview = {'sheets': sheets, 'sheet': selected, 'header_row': grid[header][0], 'mapping': mapping,
+               'rows': [], 'skipped_rows': 0, 'mapping_required': needs_mapping}
+    if inspect_columns:
+        samples = grid[header + 1:header + 8]
+        header_values = grid[header][1]
+        column_ids = sorted(set(range(min(width, 100))) | set(mapping.values()))
+        preview['columns'] = [{
+            'index': column,
+            'label': clean(header_values[column])[:120] if column < len(header_values) else '',
+            'sample': next((clean(values[column])[:64] for _, values in samples
+                            if column < len(values) and clean(values[column])), ''),
+        } for column in column_ids]
+        preview['header_rows'] = [
+            {'row': number, 'sample': ' · '.join(clean(value)[:32] for value in values[:5] if clean(value))}
+            for number, values in grid[:50] if any(clean(value) for value in values)
+        ]
+        if needs_mapping:
+            return preview
     result = []
     skipped = 0
     for number, values in grid[header + 1:]:
@@ -217,7 +262,7 @@ def parse_electronic_file(blob, filename, sheet_name=''):
             except ElectronicBomError as exc:
                 row[key] = None
                 row['errors'].append(str(exc))
-        excluded = bool(re.search(r'不贴|不焊|不装|不安装|测试点|\bDNP\b|\bDNI\b', row['notes'], re.I) or normalized(name) in ('nc', 'testpoint'))
+        excluded = excluded_component(name, row['notes'])
         row['excluded'] = excluded
         if excluded:
             row['warnings'].append('不贴 / 不焊 / 测试点')
@@ -228,6 +273,6 @@ def parse_electronic_file(blob, filename, sheet_name=''):
         result.append(row)
         if len(result) > 5000:
             raise ElectronicBomError('每次最多导入 5000 条物料')
-    if not result:
+    if not result and not inspect_columns:
         raise ElectronicBomError('工作表中没有物料明细')
-    return {'sheets': sheets, 'sheet': selected, 'header_row': grid[header][0], 'rows': result, 'skipped_rows': skipped}
+    return {**preview, 'rows': result, 'skipped_rows': skipped}

@@ -1,5 +1,5 @@
 """真实 HTTP + 临时 SQLite 的业务集成测试，不写入正式 data 目录。"""
-import sys, base64, concurrent.futures, importlib.util, io, json, tempfile, threading, unittest, urllib.request, urllib.error, zipfile, os
+import sys, base64, concurrent.futures, hashlib, importlib.util, io, json, tempfile, threading, time, unittest, urllib.request, urllib.error, zipfile, os
 from pathlib import Path
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'server'))
@@ -19,6 +19,8 @@ class IntegrationTests(unittest.TestCase):
         cls.server.shutdown();cls.server.server_close();cls.thread.join();cls.tmp.cleanup()
     def setUp(self):
         with app.transaction() as db:
+            for table in ('scanner_sessions', *reversed(app.scanner_devices.BACKUP_TABLES)):
+                db.execute('DELETE FROM ' + table)
             db.execute('DELETE FROM shipping_pending_shopify')
             for table in reversed(app.shipping.TABLES): db.execute('DELETE FROM '+table)
             for table in reversed(app.inspection.TABLES): db.execute('DELETE FROM '+table)
@@ -64,6 +66,10 @@ class IntegrationTests(unittest.TestCase):
 
         qr = f'https://work.makagic.com/JPLM/#projects/{self.project_id}/parts/{self.part}'
         self.assertEqual(lookup(qr)['id'], self.part)
+        self.assertIsNone(lookup(qr)['custodian_name'])
+        manager = self.request('auth/status')['user']
+        self.request('parts/' + self.part, 'PUT', {'custodian_id': manager['id']})
+        self.assertEqual(lookup(qr)['custodian_name'], manager['name'])
         self.assertEqual(lookup(self.code.lower())['project_id'], self.project_id)
         self.assertEqual(lookup('https://old.example.test/#parts/' + self.part)['id'], self.part)
         with app.transaction() as db:
@@ -76,6 +82,7 @@ class IntegrationTests(unittest.TestCase):
         other_part = self.request('parts', 'POST', {'name': '测试物料配件'})['id']
         self.assertEqual({row['id'] for row in lookup('测试物料', fuzzy=True)['rows']}, {self.part, other_part})
         self.assertEqual(lookup(self.code, fuzzy=True)['rows'][0]['image_id'], image)
+        self.assertEqual(lookup(self.code, fuzzy=True)['rows'][0]['custodian_name'], manager['name'])
 
         path = 'warehouse/movements'
         payload = {'project_id': self.project_id, 'part_id': self.part}
@@ -115,6 +122,182 @@ class IntegrationTests(unittest.TestCase):
         self.cookie = member_cookie
         self.assertEqual(self.request(path, project=False), [])
         self.request(delete_path, 'DELETE', delete_body, 403, project=False)
+
+    def test_scanner_pairing_sessions_movement_history_and_revocation(self):
+        operator = self.request('users', 'POST', {
+            'name': '仓库甲', 'email': 'scanner-member@example.test', 'password': 'scanner-pass',
+        })['id']
+        admin_cookie = self.cookie
+        self.request('auth/login', 'POST', {'email': 'scanner-member@example.test', 'password': 'scanner-pass'})
+        self.request('account/password', 'POST', {'current_password': 'scanner-pass', 'password': 'scanner-pass'})
+        member_cookie = self.cookie
+        self.request('scanner-devices', status=403, project=False)
+        self.cookie = admin_cookie
+        self.request('projects/' + self.project_id, 'PUT', {'members': [operator]})
+        draft = {'name': '一号仓库扫码枪', 'user_ids': [operator], 'enabled': True}
+        device = self.request('scanner-devices', 'POST', draft, project=False)
+        device_path = 'scanner-devices/' + device['id']
+        metadata = {'mac': '10:22:33:44:55:66', 'ip': '192.168.100.150', 'firmware': 'test'}
+        credential = {'Cookie': '', 'X-Scanner-Key': device['key']}
+        self.request('scanner/operators', 'POST', metadata, 401, project=False)
+        roster = self.request('scanner/operators', 'POST', metadata, headers=credential, project=False)
+        self.assertEqual(roster['users'], [{'id': operator, 'name': '仓库甲'}])
+        self.request('scanner/operators', 'POST', {**metadata, 'mac': '10:22:33:44:55:77'}, 401,
+                     headers=credential, project=False)
+        self.request('scanner/session', 'POST', {**metadata, 'user_id': '0' * 24}, 403,
+                     headers=credential, project=False)
+        session = self.request('scanner/session', 'POST', {**metadata, 'user_id': operator},
+                               headers=credential, project=False)
+        bearer = {'Cookie': '', 'Authorization': 'Bearer ' + session['token']}
+        self.request('users', status=401, headers=bearer)
+        self.request('scanner-devices', status=401, headers=bearer, project=False)
+        material = self.request('warehouse/material?q=' + self.code, headers=bearer, project=False)
+        self.assertEqual(material['id'], self.part)
+        if app.scanner_devices.Image is not None:
+            picture = io.BytesIO()
+            app.scanner_devices.Image.new('RGB', (80, 80), (255, 0, 0)).save(picture, 'PNG')
+            file_id = self.upload('扫码枪红图.png', picture.getvalue())['ids'][0]
+            thumbnail = '/files/' + file_id + '?scanner_thumb=1'
+            for method in ('HEAD', 'GET'):
+                request = urllib.request.Request(self.base + thumbnail, headers=bearer, method=method)
+                with urllib.request.urlopen(request) as response:
+                    self.assertIn('scanner-rgb565-v1-', response.headers['ETag'])
+                    self.assertEqual(int(response.headers['Content-Length']), 12800)
+                    self.assertEqual(response.read(), b'' if method == 'HEAD' else b'\x00\xf8' * 6400)
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(self.base + thumbnail)
+            with denied.exception as response:
+                self.assertEqual(response.code, 401)
+            with self.assertRaises(urllib.error.HTTPError) as denied:
+                urllib.request.urlopen(urllib.request.Request(self.base + '/files/' + file_id, headers=bearer))
+            with denied.exception as response:
+                self.assertEqual(response.code, 401)
+        movement_path = 'warehouse/movements'
+        receipt = {'request_id': 'e' * 32, 'part_id': self.part, 'project_id': self.project_id,
+                   'type': '入库', 'qty': 4}
+        result = self.request(movement_path, 'POST', receipt, headers=bearer, project=False)
+        self.assertEqual(self.request(movement_path, 'POST', receipt, headers=bearer, project=False), result)
+        self.assertEqual(self.stock(), 4)
+        with app.connect() as db:
+            self.assertEqual(db.execute('SELECT device_id FROM scanner_movements WHERE movement_id=?',
+                                        (result['id'],)).fetchone()[0], device['id'])
+        history = self.request(movement_path + '?limit=6&offset=0', headers=bearer, project=False)
+        delete_path = movement_path + '/' + result['id']
+        delete_body = {'project_id': self.project_id, 'expected': history[0]['expected']}
+        self.request(delete_path, 'DELETE', {**delete_body, 'expected': {}}, 409,
+                     headers=bearer, project=False)
+        self.assertEqual(self.request(delete_path, 'DELETE', delete_body, headers=bearer, project=False)['stock'], 0)
+        self.assertEqual(self.request(delete_path, 'DELETE', delete_body, headers=bearer, project=False)['stock'], 0)
+        details = self.request('scanner-devices', project=False)[0]
+        self.assertEqual((details['ip'], details['last_user']), (metadata['ip'], '仓库甲'))
+        self.assertNotIn('key', details)
+        self.assertNotIn('key_hash', details)
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            backup = directory / 'backup.zip'
+            backup.write_bytes(self.request('backup', raw=True))
+            staged, _ = app.stage_restore(backup, directory)
+            with app.connect(staged) as db:
+                self.assertIsNone(app.scanner_devices.operator_session(db, bearer['Authorization']))
+                self.assertEqual(app.scanner_devices.by_key(db, device['key'])['id'], device['id'])
+        self.request(device_path, 'PUT', {**draft, 'user_ids': []}, project=False)
+        self.request(movement_path, status=401, headers=bearer, project=False)
+        rotated = self.request(device_path, 'PUT', {**draft, 'rotate': True}, project=False)
+        self.request('scanner/operators', 'POST', metadata, 401, headers=credential, project=False)
+        self.request('scanner/operators', 'POST', metadata, headers={**credential, 'X-Scanner-Key': rotated['key']}, project=False)
+        self.request(device_path, 'PUT', {**draft, 'enabled': False}, project=False)
+        self.request('scanner/operators', 'POST', metadata, 401,
+                     headers={**credential, 'X-Scanner-Key': rotated['key']}, project=False)
+        self.cookie = member_cookie
+        self.request('scanner-devices', status=403, project=False)
+
+    def test_scanner_auto_enrollment_needs_admin_approval_and_device_identity(self):
+        admin = self.request('auth/status')['user']['id']
+        metadata = {'mac': '10:22:33:44:66:77', 'ip': '192.168.100.144',
+                    'firmware': 'scanner/0.2.0', 'register': True}
+        identity = 'a' * 64
+        no_session = {'Cookie': '', 'X-Scanner-Key': identity}
+
+        def roster(headers=no_session, status=200, payload=metadata):
+            return self.request('scanner/operators', 'POST', payload, status, headers=headers, project=False)
+
+        def select(headers=no_session, status=200):
+            return self.request('scanner/session', 'POST', {**metadata, 'user_id': admin},
+                                status, headers=headers, project=False)
+
+        first = roster()
+        self.assertEqual((first['state'], first['users']), ('pending', []))
+        second_poll = roster()
+        self.assertAlmostEqual(first.pop('server_time'), time.time(), delta=5)
+        second_poll.pop('server_time')
+        self.assertEqual(second_poll, first)
+        select(status=401)
+        roster(status=401, payload={**metadata, 'mac': '10:22:33:44:66:78'})
+        self.assertEqual(len(self.request('scanner-devices', project=False)), 1)
+        device = self.request('scanner-devices', project=False)[0]
+        self.assertEqual((device['pending'], device['enabled'], device['verification']),
+                         (True, False, first['verification']))
+        self.assertNotEqual(device['verification'], identity)
+        path = 'scanner-devices/' + device['id']
+        settings = {'name': '仓库扫码枪', 'enabled': True, 'user_ids': [admin]}
+        self.request(path, 'PUT', settings, 400, project=False)
+        self.request(path, 'PUT', {**settings, 'approve': True}, project=False)
+        self.assertEqual(roster()['users'][0]['id'], admin)
+        token = select()['token']
+        self.assertEqual(self.request('warehouse/material?q=' + self.code, headers={
+            'Cookie': '', 'Authorization': 'Bearer ' + token,
+        }, project=False)['id'], self.part)
+
+        second_headers = {**no_session, 'X-Scanner-Key': 'b' * 64}
+        second = roster(headers=second_headers)
+        self.assertEqual((second['state'], second['users']), ('pending', []))
+        self.assertNotEqual(second['verification'], first['verification'])
+        select(headers=second_headers, status=401)
+        pending = next(device for device in self.request('scanner-devices', project=False) if device['pending'])
+        self.request('scanner-devices/' + pending['id'], 'PUT', {
+            'name': pending['name'], 'user_ids': [], 'reject': True,
+        }, project=False)
+        self.assertEqual(roster(headers=second_headers)['state'], 'disabled')
+        self.assertEqual(roster()['state'], 'ready')
+
+    def test_scanner_ota_only_delivers_to_target_and_confirms_after_reboot(self):
+        admin = self.request('auth/status')['user']['id']
+        target = self.request('scanner-devices', 'POST', {'name': '目标扫码枪', 'user_ids': [admin]}, project=False)
+        other = self.request('scanner-devices', 'POST', {'name': '另一把扫码枪', 'user_ids': [admin]}, project=False)
+        target_key = {'Cookie': '', 'X-Scanner-Key': target['key']}
+        other_key = {'Cookie': '', 'X-Scanner-Key': other['key']}
+        release = bytearray(256)
+        release[:2] = b'\xe9\x01'
+        release[12] = 9
+        release[32:36] = b'\x32\x54\xcd\xab'
+        release[96:125] = app.scanner_devices.FIRMWARE_MARKER + b'0.2.8\0'
+        release = bytes(release)
+        digest = hashlib.sha256(release).hexdigest()
+        upload = 'scanner-devices/' + target['id'] + '/firmware'
+        check = 'scanner/update?version=0.2.7'
+        download = 'scanner/update/' + digest
+
+        self.request(upload, 'PUT', release, 400, project=False)
+        self.request(check, headers=target_key, project=False)
+        self.request(check, headers=other_key, project=False)
+        self.request(upload, 'PUT', release, 401, headers=target_key, project=False)
+        self.request(upload, 'PUT', bytes(len(release)), 400, project=False)
+        self.request(upload, 'PUT', release, project=False)
+        manifest = self.request(check, headers=target_key, project=False)['update']
+        self.assertEqual(manifest, {'version': '0.2.8', 'sha256': digest, 'size': len(release)})
+        self.assertIsNone(self.request(check, headers=other_key, project=False)['update'])
+        self.request(download, status=404, headers=other_key, project=False)
+        self.assertEqual(self.request(download, headers=target_key, raw=True, project=False), release)
+        self.request(check + '&failed=' + digest, headers=target_key, project=False)
+        states = lambda: {row['id']: row for row in self.request('scanner-devices', project=False)}
+        self.assertEqual(states()[target['id']]['ota_status'], 'retry')
+        self.request(upload, 'DELETE', project=False)
+        self.request(download, status=404, headers=target_key, project=False)
+        self.request(upload, 'PUT', release, project=False)
+        self.assertIsNone(self.request('scanner/update?version=0.2.8', headers=target_key, project=False)['update'])
+        self.assertEqual(states()[target['id']]['ota_status'], 'installed')
+        self.assertEqual(states()[target['id']]['firmware'], 'scanner/0.2.8')
+        self.request(upload, 'PUT', release, 409, project=False)
 
     def test_custom_material_categories_are_reused_and_preserve_material_serial(self):
         category = '包装耗材'
@@ -1371,6 +1554,11 @@ class IntegrationTests(unittest.TestCase):
         state=self.state();material=next(p for p in state['parts'] if p['id']==created['id'])
         line=next(l for l in state['bom_lines'] if l['id']==created['line_id'])
         self.assertEqual(material['material_level'],2);self.assertEqual(material['unit'],'PCS');self.assertEqual(line['qty'],1)
+        self.assertEqual(material['min_stock'],50)
+        self.request('parts/' + created['id'], 'PUT', {'min_stock': 0})
+        self.request('parts/' + created['id'], 'PUT', {'notes': '更新资料'})
+        saved = next(part for part in self.state()['parts'] if part['id'] == created['id'])
+        self.assertEqual(saved['min_stock'], 0)
         self.assertEqual(line['part_id'],material['id'])
         self.request('bom-lines/'+line['id'],'PUT',{'qty':12})
         self.assertEqual(self.state()['bom_lines'][0]['qty'],12)
@@ -1382,6 +1570,68 @@ class IntegrationTests(unittest.TestCase):
         self.request('bom-versions','POST',{'product_id':p,'copy_from':v})
         self.request('bom-versions','POST',{'product_id':p,'copy_from':v})
         self.assertEqual([v['name'] for v in self.state()['bom_versions']],['V1.0','V2.0','V3.0'])
+
+    def test_product_molds_are_project_scoped_and_survive_backup_and_bom_versioning(self):
+        product = self.product()
+        supplier = self.supplier()
+        other = self.request('projects', 'POST', {'name': '外部项目'})['id']
+        other_supplier = self.request('suppliers', 'POST', {'name': '外部供应商'}, project=other)['id']
+        shared = self.request('parts', 'POST', {'name': '共用外壳'}, project=other)['id']
+        secondary = self.request('parts', 'POST', {'name': '螺钉', 'material_level': 2})['id']
+        data = {'product_id': product, 'name': '前壳模具', 'code': 'M-001',
+                'supplier_id': supplier, 'cost': '3500.50', 'moq': '1000', 'amortization_qty': '5000',
+                'notes': '试模', 'part_ids': [self.part, shared]}
+        self.request('product-molds', 'POST', data, 404, project=other)
+        self.request('product-molds', 'POST', {**data, 'supplier_id': other_supplier}, 404)
+        self.request('product-molds', 'POST', {**data, 'cost': -1}, 400)
+        self.request('product-molds', 'POST', {**data, 'moq': 2.5}, 400)
+        self.request('product-molds', 'POST', {**data, 'amortization_qty': 0}, 400)
+        self.request('product-molds', 'POST', {**data, 'part_ids': [self.part, secondary]}, 400)
+        mold = self.request('product-molds', 'POST', data)['id']
+        version = self.state()['bom_versions'][0]['id']
+        self.request('bom-versions', 'POST', {'product_id': product, 'copy_from': version})
+        path = 'product-molds/' + mold
+        self.request(path, 'PUT', {'notes': '已试模'}, 404, project=other)
+        self.request(path, 'PUT', {'notes': '已试模'})
+        self.request(path, 'PUT', {'notes': '无效改动', 'part_ids': [secondary]}, 400)
+        self.request('parts/' + shared, 'PUT', {'material_level': 2}, 409, project=other)
+        saved, = self.state()['product_molds']
+        self.assertEqual((saved['product_id'], saved['supplier_id'], saved['cost'], saved['notes']),
+                         (product, supplier, 3500.5, '已试模'))
+        self.assertEqual(saved['part_ids'], [self.part, shared])
+        self.assertEqual(saved['moq'], 1000)
+        self.assertEqual(saved['amortization_qty'], 5000)
+        self.assertEqual(self.request('state', project=other)['product_molds'], [])
+        with tempfile.TemporaryDirectory() as folder:
+            directory = Path(folder)
+            backup = directory / 'backup.zip'
+            backup.write_bytes(self.request('backup', raw=True))
+            staged, _ = app.stage_restore(backup, directory)
+            with app.connect(staged) as restored:
+                self.assertEqual(dict(restored.execute('SELECT * FROM product_molds').fetchone()),
+                                 {key: value for key, value in saved.items() if key != 'part_ids'})
+                self.assertEqual([row[0] for row in restored.execute(
+                    'SELECT part_id FROM product_mold_parts WHERE mold_id=? ORDER BY rowid', (mold,))],
+                    [self.part, shared])
+        self.request('parts/' + shared, 'DELETE', project=other)
+        self.request(path, 'PUT', {'part_ids': [self.part, shared]})
+        self.assertTrue(self.state()['shared_parts'][0]['deleted_at'])
+        self.request('deleted-parts/' + shared, 'DELETE', {'confirm': True}, 409, project=other)
+        self.request(path, 'PUT', {'part_ids': [self.part]})
+        self.assertEqual(self.state()['product_molds'][0]['part_ids'], [self.part])
+        self.request(path, 'PUT', {'moq': ''})
+        self.assertIsNone(self.state()['product_molds'][0]['moq'])
+        self.assertEqual(self.state()['product_molds'][0]['amortization_qty'], 5000)
+        self.request(path, 'PUT', {'amortization_qty': ''})
+        self.assertIsNone(self.state()['product_molds'][0]['amortization_qty'])
+        self.request('suppliers/' + supplier, 'DELETE')
+        self.assertIsNone(self.state()['product_molds'][0]['supplier_id'])
+        self.request(path, 'DELETE')
+        self.assertEqual(self.state()['product_molds'], [])
+        self.request('product-molds', 'POST', {'product_id': product, 'name': '后壳模具'})
+        self.request('products/' + product, 'DELETE', {'delete_bom': True, 'password': 'test-password-1234'})
+        self.assertEqual(self.state()['product_molds'], [])
+
     def test_fractional_quantity(self):
         self.move('入库',0.3);self.move('出库',0.1);self.move('出库',0.2);self.assertEqual(self.stock(),0)
     def test_concurrent_outbound_is_atomic(self):
@@ -1394,13 +1644,13 @@ class IntegrationTests(unittest.TestCase):
                 code=e.code;e.close();return code
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool: codes=list(pool.map(take,range(16)))
         self.assertEqual(codes.count(200),10);self.assertEqual(codes.count(400),6);self.assertEqual(self.stock(),0)
-    def upload(self,name,blob,replace=None,status=200):
-        boundary='plm-test-boundary';fields={'owner_type':'parts','owner_id':self.part}
+    def upload(self,name,blob,replace=None,status=200,*,part=None,project=None):
+        boundary='plm-test-boundary';fields={'owner_type':'parts','owner_id':part or self.part}
         if replace:fields['replace_id']=replace
         b=b''
         for k,v in fields.items():b+=f'--{boundary}\r\nContent-Disposition: form-data; name="{k}"\r\n\r\n{v}\r\n'.encode()
         b+=f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\nContent-Type: application/octet-stream\r\n\r\n'.encode()+blob+f'\r\n--{boundary}--\r\n'.encode()
-        return self.request('files','POST',b,status,{'Content-Type':'multipart/form-data; boundary='+boundary})
+        return self.request('files','POST',b,status,{'Content-Type':'multipart/form-data; boundary='+boundary},project=project)
     def test_files_replace_and_backup(self):
         fid=self.upload('spec.txt',b'hello')['ids'][0]
         fid2=self.upload('spec-v2.txt',b'updated',fid)['ids'][0]
@@ -1542,7 +1792,8 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaises(app.sqlite3.IntegrityError), app.transaction() as db:
             db.project_id = self.project_id
             app.insert_bom_line(db, version, other_part, 1)
-        self.request('bom-lines', 'POST', {'version_id': version, 'part_id': other_part, 'qty': 1}, 404)
+        self.request('bom-lines', 'POST', {'version_id': version, 'part_id': other_part, 'qty': 1})
+        self.assertEqual(self.state()['bom_lines'][0]['part_project_id'], other)
         supplier = self.supplier()
         self.request('quotes', 'POST', {'part_id': other_part, 'supplier_id': supplier}, 404, project=other)
         self.request('state', status=404, project=False)
@@ -1558,6 +1809,112 @@ class IntegrationTests(unittest.TestCase):
         self.request('parts/' + other_part, 'PUT', {'name': '禁止修改'}, 409, project=other)
         self.request('projects/' + other, 'PUT', {'archived': False})
         self.request('parts/' + other_part, 'PUT', {'name': '恢复后可改'}, project=other)
+
+    def test_shared_catalog_bom_reuses_original_material_and_audits_cross_project_usage(self):
+        source = self.request('projects', 'POST', {'name': '物料来源项目'})['id']
+        owner = self.request('auth/status')['user']
+        foreign_id = self.request('parts', 'POST', {
+            'name': '共用快插端子', 'spec': 'XH-2.54', 'custodian_id': owner['id'],
+        }, project=source)['id']
+        png = base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j0i8AAAAASUVORK5CYII=')
+        image = self.upload('part.png', png, project=source, part=foreign_id)['ids'][0]
+        attachment = self.upload('spec.txt', b'project private', project=source, part=foreign_id)['ids'][0]
+        self.request('movements', 'POST', {'type': '入库', 'part_id': foreign_id, 'qty': 12}, project=source)
+        source_part = self.request('state', project=source)['parts'][0]
+        account = {'name': 'BOM 测试员', 'email': 'bom-shared@example.test', 'password': 'temp-password-1234'}
+        member = self.request('users', 'POST', account)['id']
+        self.request('projects/' + self.project_id, 'PUT', {
+            'members': [member], 'member_roles': {member: ['engineering']},
+        })
+        admin = self.cookie
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': account['password'], 'password': 'bom-new-password-1234'})
+        engineer = self.cookie
+        self.assertEqual([p['id'] for p in self.request('projects')], [self.project_id])
+        state = self.state()
+        shared = next(p for p in state['shared_parts'] if p['id'] == foreign_id)
+        self.assertEqual((shared['project_name'], shared['code'], shared['stock']),
+                         ('物料来源项目', source_part['code'], 12))
+        self.assertEqual((shared['custodian_name'], shared['shared_image_id']), (owner['name'], image))
+        self.assertIsNone(shared['custodian_id'])
+        image_path = f'shared-material-images/{foreign_id}/{image}'
+        self.assertEqual(self.request(image_path, raw=True), png)
+        self.assertEqual(self.request(image_path, 'HEAD', raw=True), b'')
+        self.request(image_path, status=401, headers={'Cookie': ''})
+        self.request(image_path, status=404, project=source)
+        self.request(f'shared-material-images/{foreign_id}/{attachment}', status=404)
+        self.assertNotIn(foreign_id, {p['id'] for p in state['parts']})
+        self.assertEqual(self.request('resolve/parts/' + foreign_id + '?catalog=1')['project_id'], self.project_id)
+        self.request('state', status=404, project=source)
+        self.request('parts/' + foreign_id, 'PUT', {'name': '越权改名'}, 404)
+        product = self.request('products', 'POST', {'name': '净水终端'})['id']
+        version = next(row for row in self.state()['bom_versions'] if row['product_id'] == product)
+        line = self.request('bom-lines', 'POST', {
+            'version_id': version['id'], 'part_id': foreign_id, 'qty': 2, 'reference': 'J1',
+        })['id']
+        self.request('bom-lines/' + line, 'PUT', {'qty': 3, 'reference': 'J2'})
+        self.assertEqual(self.state()['bom_lines'][0]['part_project_id'], source)
+        imported = self.request('bom-import', 'POST', {
+            'version_id': version['id'], 'rows': [{'code': source_part['code'], 'qty': 4}],
+        })
+        self.assertEqual((imported['created'], imported['reused']), (0, 1))
+        copy_id = self.request('bom-versions', 'POST', {'product_id': product, 'copy_from': version['id']})['id']
+        copied = next(row for row in self.state()['bom_lines'] if row['version_id'] == copy_id)
+        self.assertEqual((copied['part_id'], copied['part_project_id'], copied['qty']), (foreign_id, source, 4))
+        self.request('bom-lines/' + line, 'DELETE', {})
+
+        activity = 'activity?kind=material&part=' + foreign_id
+        logs = self.request(activity)['items']
+        self.assertEqual([row['action'] for row in logs],
+                         ['BOM 移除物料', 'BOM 新增物料', 'BOM 修改物料', 'BOM 修改物料', 'BOM 新增物料'])
+        self.assertTrue(all(row['actor_name'] == account['name'] and '测试项目 / 净水终端' in row['detail'] for row in logs))
+        self.assertIn('单套用量 2 → 3 PCS · 位号 J1 → J2', logs[3]['detail'])
+        self.assertIn('加入 BOM', logs[-1]['detail'])
+        self.cookie = admin
+        self.assertIn('BOM 新增物料', {row['action'] for row in self.request(activity, project=source)['items']})
+        self.assertEqual(self.request('state', project=source)['parts'][0]['stock'], 12)
+        self.request('parts/' + foreign_id, 'DELETE', {}, project=source)
+        self.request('deleted-parts/' + foreign_id, 'DELETE', {'confirm': True}, 409, project=source)
+        self.cookie = engineer
+        self.assertTrue(self.state()['shared_parts'][0]['deleted_at'])
+        self.request(image_path, status=404)
+        self.request('bom-lines', 'POST', {'version_id': version['id'], 'part_id': foreign_id, 'qty': 1}, 409)
+        self.request('bom-lines/' + copied['id'], 'DELETE', {})
+
+    def test_global_material_catalog_combines_owner_bom_and_manual_projects(self):
+        path = 'global-materials'
+        usage = self.request('projects', 'POST', {'name': 'BOM 调用项目'})['id']
+        sharing = self.request('projects', 'POST', {'name': '手工共用项目'})['id']
+        p = self.request('products', 'POST', {'name': '跨项目产品'}, project=usage)['id']
+        v = self.request('state', project=usage)['bom_versions'][0]['id']
+        self.request('bom-lines', 'POST', {'version_id': v, 'part_id': self.part, 'qty': 2}, project=usage)
+        self.request('bom-versions', 'POST', {'product_id': p, 'copy_from': v}, project=usage)
+        assignments = path + '/' + self.part + '/projects'
+        self.request(assignments, 'PUT', {'project_ids': [self.project_id, sharing, sharing]}, project=False)
+        catalog = self.request(path, project=False)
+        self.assertEqual(len(catalog['parts']), 1)
+        self.assertEqual(catalog['parts'][0]['code'], self.code)
+        related = {entry['id']: (entry['required'], entry['assigned'])
+                   for entry in catalog['parts'][0]['project_assignments']}
+        self.assertEqual(related, {self.project_id: (True, False), usage: (True, False), sharing: (False, True)})
+        self.assertEqual(len(self.request('state', project=usage)['shared_parts'][0]['project_assignments']), 3)
+        self.request(assignments, 'PUT', {'project_ids': ['unknown']}, 404, project=False)
+        self.request(assignments, 'PUT', {'project_ids': []}, project=False)
+        self.assertEqual({item['id'] for item in self.request(path, project=False)['parts'][0]['project_assignments']},
+                         {self.project_id, usage})
+
+        account = {'name': '使用方', 'email': 'catalog-only@example.test', 'password': 'catalog-password-1234'}
+        member = self.request('users', 'POST', account)['id']
+        admin = self.cookie
+        self.request('auth/login', 'POST', account)
+        self.request('account/password', 'POST', {'current_password': account['password'], 'password': 'updated-password-1234'})
+        self.request(path, status=403, project=False)
+        member_cookie = self.cookie
+        self.cookie = admin
+        self.request('projects/' + usage, 'PUT', {'members': [member], 'member_roles': {member: ['engineering']}})
+        self.cookie = member_cookie
+        self.assertEqual(self.request(path, project=False)['parts'][0]['id'], self.part)
+        self.request(assignments, 'PUT', {'project_ids': [sharing]}, 404, project=False)
 
     def test_project_membership_protects_files_logs_and_old_links(self):
         other = self.request('projects', 'POST', {'name': '独立项目'})['id']
@@ -1828,14 +2185,20 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.state()['parts']),count)
     def test_primary_children_picker_and_unlink_keep_materials(self):
         parent=self.request('parts','POST',{'name':'一级板'})['id']
-        a=self.request('parts','POST',{'name':'电阻','material_level':2})['id']
-        b=self.request('parts','POST',{'name':'电容','material_level':2})['id']
+        a=self.request('parts','POST',{'name':'电阻','material_level':2,'price':0.0505})['id']
+        b=self.request('parts','POST',{'name':'电容','material_level':2,'price':0.125})['id']
         self.request('material-children/'+parent,'PUT',{'child_ids':[a,b]})
         self.assertEqual(len(self.state()['material_links']),2)
         self.request('material-children/'+parent,'PUT',{'child_ids':[a,'missing']},404)
         self.assertEqual(len(self.state()['material_links']),2)
         link=next(l for l in self.state()['material_links'] if l['child_id']==a)
+        self.request('material-links/'+link['id'], 'PUT', {'qty':2})
+        entry = next(p for p in self.request('global-materials', project=False)['parts'] if p['id'] == parent)
+        self.assertAlmostEqual(entry['secondary_cost'], 0.226)
+        self.assertEqual(entry['price'], 0)
         self.request('material-links/'+link['id'],'DELETE',{})
+        entry = next(p for p in self.request('global-materials', project=False)['parts'] if p['id'] == parent)
+        self.assertEqual(entry['secondary_cost'], 0.125)
         self.assertEqual(len(self.state()['material_links']),1)
         self.assertEqual(len(self.state()['parts']),4)
         self.request('parts/'+parent,'DELETE',{})
@@ -1844,12 +2207,13 @@ class IntegrationTests(unittest.TestCase):
     def test_optional_fields_survive_creation_inside_bom(self):
         parent=self.request('parts','POST',{'name':'电路板'})['id']
         product=self.product();version=self.state()['bom_versions'][0]['id']
-        child=self.request('bom-materials','POST',{'name':'电容','material_level':2,'version_id':version,'spec':'10uF','unit':'PCS','price':'0.12','location':'A-01','notes':'可选信息','parent_ids':[parent]})['id']
+        child=self.request('bom-materials','POST',{'name':'电容','material_level':2,'version_id':version,'spec':'10uF','unit':'PCS','price':'0.12','location':'A-01','notes':'可选信息','parent_ids':[parent],'qty':'2.5'})['id']
         material=next(p for p in self.state()['parts'] if p['id']==child)
         self.assertEqual(material['spec'],'10uF');self.assertEqual(material['price'],0.12)
         self.assertEqual(material['location'],'A-01');self.assertEqual(material['notes'],'可选信息')
         self.assertEqual(self.state()['material_links'][0]['child_id'],child)
         self.assertEqual(self.state()['bom_lines'][0]['part_id'],child)
+        self.assertEqual(self.state()['bom_lines'][0]['qty'], 2.5)
 
     def test_fixed_prefix_for_bom_and_child_materials(self):
         self.request('projects/' + self.project_id, 'PUT', {'name': '研发 Ｔａｎｏｓ'})
@@ -2093,5 +2457,56 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(next(p for p in self.state()['parts'] if p['id']==id)['price'],1.5)
         self.request('electronic-import/commit','POST',{**body,'request_id':'electronic-test-0008','update_existing_prices':True})
         self.assertEqual(next(p for p in self.state()['parts'] if p['id']==id)['price'],0.1)
+
+    def test_electronic_external_code_reuses_cross_project_material_and_blocks_duplicates(self):
+        source = self.request('projects', 'POST', {'name': '库存归属'})['id']
+        old = self.request('parts', 'POST', {'name': '系统电容', 'external_code': ' C15849 ',
+                           'material_level': 2, 'spec': 'C0603', 'price': 0.085}, project=source)['id']
+        self.request('movements', 'POST', {'type': '入库', 'part_id': old, 'qty': 9}, project=source)
+        csv = b'Supplier Part,Comment,Quantity,Footprint,JLCPCB Price\nc15849,Board capacitor,3,P0603,0.25\n'
+        preview = self.preview_import_file('reuse.csv', csv)['rows'][0]
+        self.assertTrue(preview['selected'])
+        self.assertEqual((preview['match_id'], preview['reuse_match_ids']), (old, [old]))
+
+        parent = self.request('parts', 'POST', {'name': '一级板'})['id']
+        self.product()
+        version = self.state()['bom_versions'][0]['id']
+        row = {'name': 'Board capacitor', 'external_code': 'c15849', 'qty': 3, 'spec': 'P0603', 'price': 0.25}
+        body = {'request_id': 'electronic-global-0001', 'parent_id': parent, 'version_id': version,
+                'rows': [row], 'update_existing_prices': True}
+        self.request('electronic-import/commit', 'POST', {**body, 'rows': [{**row, 'target_part_id': '__new__'}]}, 409)
+        result = self.request('electronic-import/commit', 'POST', body)
+        self.assertEqual((result['created'], result['reused']), (0, 1))
+        self.assertEqual(len(self.state()['parts']), 2)
+        line = self.state()['material_links'][0]
+        self.assertEqual((line['child_id'], line['child_project_id'], line['qty']), (old, source, 3))
+        self.assertEqual(self.state()['bom_lines'][0]['part_id'], old)
+        source_part = self.request('state', project=source)['parts'][0]
+        self.assertEqual((source_part['price'], source_part['stock']), (0.085, 9))
+        self.assertEqual(self.request('state', project=source)['material_links'][0]['parent_id'], parent)
+        costs = {entry['id']: entry for entry in self.request('global-materials', project=False)['parts']}
+        self.assertAlmostEqual(costs[parent]['secondary_cost'], 0.255)
+        self.assertEqual({project['id'] for project in costs[old]['project_assignments']}, {self.project_id, source})
+
+        duplicate = self.request('parts', 'POST', {'name': '历史重复物料', 'external_code': 'C15849', 'material_level': 2})['id']
+        ambiguous = self.preview_import_file('reuse.csv', csv)['rows'][0]
+        self.assertFalse(ambiguous['selected'])
+        self.assertEqual(set(ambiguous['reuse_match_ids']), {old, duplicate})
+        body['request_id'] = 'electronic-global-0002'
+        self.request('electronic-import/commit', 'POST', body, 409)
+        result = self.request('electronic-import/commit', 'POST', {**body, 'rows': [{**row, 'target_part_id': old, 'qty': 4}]})
+        self.assertEqual((result['created'], result['reused']), (0, 1))
+        self.assertEqual(self.state()['material_links'][0]['qty'], 4)
+
+    def test_electronic_external_code_reuses_current_project_when_description_changes(self):
+        old = self.request('parts', 'POST', {'name': '原名称', 'external_code': 'C-0123',
+                           'material_level': 2, 'brand': '原品牌', 'price': 2})['id']
+        new_row = {'name': '另一份 BOM 的名称', 'external_code': 'c-0123', 'brand': '另一品牌', 'qty': 2}
+        response = self.request('electronic-import/commit', 'POST', {
+            'request_id': 'electronic-global-0003', 'rows': [new_row], 'update_existing_prices': True,
+        })
+        self.assertEqual((response['created'], response['reused'], response['reference_total']), (0, 1, 4))
+        part = next(row for row in self.state()['parts'] if row['id'] == old)
+        self.assertEqual((part['name'], part['price']), ('原名称', 2))
 
 if __name__=='__main__':unittest.main()
